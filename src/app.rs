@@ -271,10 +271,7 @@ mod tests {
 
         // A queued native close request dispatched during shutdown must not
         // clear the terminal state.
-        assert_eq!(
-            controller.accept_window_close(),
-            LifecycleState::Exiting
-        );
+        assert_eq!(controller.accept_window_close(), LifecycleState::Exiting);
 
         // A later Show must remain a no-op: only the original exit action runs.
         assert_eq!(
