@@ -1,0 +1,144 @@
+name: Windows CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "feature/**"
+      - "fix/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  QUICKFOLDER_VERSION: 0.0.1
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  windows:
+    name: fmt, clippy, test, release, package
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable action commit
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      # Keep cache setup after the lockfile gate: cache actions may inspect Cargo
+      # metadata, which must not accidentally create a lockfile and bypass bootstrap.
+      - name: Bootstrap Cargo.lock when absent
+        id: lockfile
+        shell: pwsh
+        run: |
+          if (Test-Path "Cargo.lock") {
+            "generated=false" >> $env:GITHUB_OUTPUT
+          } else {
+            cargo generate-lockfile
+            "generated=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Upload bootstrapped Cargo.lock
+        if: steps.lockfile.outputs.generated == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cargo-lock-${{ github.sha }}
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Require checked-in Cargo.lock
+        if: steps.lockfile.outputs.generated == 'true'
+        shell: pwsh
+        run: |
+          throw "Cargo.lock was absent. Download the cargo-lock-${{ github.sha }} artifact, inspect it, add it in a new commit, and rerun CI."
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          shared-key: windows-x86_64-msvc
+          cache-on-failure: false
+
+      - name: Verify dependency lock is immutable
+        shell: pwsh
+        run: cargo metadata --frozen --format-version 1 --no-deps > $null
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Build release executable
+        run: cargo build --workspace --all-features --release --locked
+
+      - name: Verify release outputs and version helper
+        shell: pwsh
+        run: |
+          $app = "target\release\quickfolder.exe"
+          $versionTool = "target\release\quickfolder-version.exe"
+          if (-not (Test-Path $app -PathType Leaf)) { throw "Missing $app" }
+          if (-not (Test-Path $versionTool -PathType Leaf)) { throw "Missing $versionTool" }
+          $actual = (& $versionTool).Trim()
+          $expected = "QuickFolder $env:QUICKFOLDER_VERSION"
+          if ($actual -ne $expected) { throw "Version mismatch: expected '$expected', got '$actual'" }
+
+      - name: Install pinned dependency audit tools
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: cargo-deny@0.20.2,cargo-about@0.9.2
+          fallback: none
+          checksum: true
+
+      - name: Audit advisories, licenses, bans, and sources
+        run: cargo deny --locked check advisories bans licenses sources
+
+      - name: Generate third-party license inventory
+        run: cargo about generate --locked --fail --output-file THIRD_PARTY_LICENSES.html about.hbs
+
+      - name: Sanity-check third-party license inventory
+        shell: pwsh
+        run: |
+          $notice = Get-Content "THIRD_PARTY_LICENSES.html" -Raw
+          if ($notice -notmatch 'QuickFolder Third-Party Licenses') { throw "License inventory header is missing" }
+          if ($notice -notmatch 'slint') { throw "Slint is missing from the license inventory" }
+
+      - name: Build portable development artifact
+        shell: pwsh
+        run: |
+          $dist = "dist\QuickFolder-$env:QUICKFOLDER_VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          Copy-Item "target\release\quickfolder.exe" "$dist\QuickFolder.exe"
+          Copy-Item "README.md", "LICENSE", "THIRD_PARTY_LICENSES.html" $dist
+          New-Item -ItemType Directory -Path "$dist\licenses\slint" -Force | Out-Null
+          Copy-Item "third-party\slint\LicenseRef-Slint-Royalty-free-2.0.md" "$dist\licenses\slint"
+          $zip = "$dist.zip"
+          Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() + "  " + (Split-Path $zip -Leaf) |
+            Set-Content "$zip.sha256" -Encoding ascii
+
+      - name: Upload portable development artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: QuickFolder-${{ env.QUICKFOLDER_VERSION }}-windows-x86_64-${{ github.sha }}
+          path: |
+            dist/QuickFolder-${{ env.QUICKFOLDER_VERSION }}-windows-x86_64.zip
+            dist/QuickFolder-${{ env.QUICKFOLDER_VERSION }}-windows-x86_64.zip.sha256
+          if-no-files-found: error
+          retention-days: 14

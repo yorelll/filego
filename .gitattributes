@@ -1,0 +1,14 @@
+# Keep source and automation files stable across Windows and GitHub runners.
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.slint text eol=lf
+*.md text eol=lf
+*.png binary
+*.ico binary
+*.hbs text eol=lf
+*.svg text eol=lf
+*.png binary
+*.ico binary

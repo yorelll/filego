@@ -1,0 +1,70 @@
+import { AboutSlint, LineEdit, VerticalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "QuickFolder";
+    icon: @image-url("../assets/icons/quickfolder.png");
+    background: #f7f8fa;
+    preferred-width: 600px;
+    min-width: 480px;
+    max-width: 760px;
+    preferred-height: 148px;
+    no-frame: true;
+    always-on-top: true;
+
+    callback hide-requested();
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+
+        Rectangle {
+            height: 56px;
+            border-radius: 14px;
+            background: #ffffff;
+            border-color: #e2e5ea;
+            border-width: 1px;
+
+            LineEdit {
+                x: 16px;
+                y: 8px;
+                width: parent.width - 32px;
+                height: 40px;
+                placeholder-text: "搜索文件夹、标签或路径";
+                font-size: 16px;
+            }
+        }
+
+        Text {
+            text: "QuickFolder 0.0.1 · M00 architecture shell";
+            color: #626975;
+            font-size: 12px;
+            horizontal-alignment: center;
+        }
+
+        AboutSlint {}
+    }
+}
+
+export component AppTray inherits SystemTrayIcon {
+    icon: @image-url("../assets/icons/quickfolder-tray.png");
+    title: "QuickFolder";
+    tooltip: "QuickFolder";
+
+    callback toggle-window();
+    callback open-window();
+    callback quit-requested();
+
+    clicked => { root.toggle-window(); }
+
+    Menu {
+        MenuItem {
+            title: "打开 QuickFolder";
+            activated => { root.open-window(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: "退出";
+            activated => { root.quit-requested(); }
+        }
+    }
+}
