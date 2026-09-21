@@ -110,14 +110,14 @@ jobs:
         run: cargo deny --locked check advisories bans licenses sources
 
       - name: Generate third-party license inventory
-        run: cargo about generate --locked --fail --output-file THIRD_PARTY_LICENSES.html about.hbs
+        run: cargo about generate --locked --fail --all-features --target x86_64-pc-windows-msvc --output-file THIRD_PARTY_LICENSES.html about.hbs
 
       - name: Sanity-check third-party license inventory
         shell: pwsh
         run: |
           $notice = Get-Content "THIRD_PARTY_LICENSES.html" -Raw
-          if ($notice -notmatch 'QuickFolder Third-Party Licenses') { throw "License inventory header is missing" }
-          if ($notice -notmatch 'slint') { throw "Slint is missing from the license inventory" }
+          if ([string]::IsNullOrWhiteSpace($notice)) { throw "License inventory is empty" }
+          if ($notice -notmatch '<title>QuickFolder Third-Party Licenses</title>') { throw "License inventory title is missing" }
 
       - name: Build portable development artifact
         shell: pwsh
@@ -128,6 +128,8 @@ jobs:
           Copy-Item "README.md", "LICENSE", "THIRD_PARTY_LICENSES.html" $dist
           New-Item -ItemType Directory -Path "$dist\licenses\slint" -Force | Out-Null
           Copy-Item "third-party\slint\LicenseRef-Slint-Royalty-free-2.0.md" "$dist\licenses\slint"
+          if (-not (Test-Path "third-party\slint\LicenseRef-Slint-Royalty-free-2.0.md" -PathType Leaf)) { throw "Slint license source is missing" }
+          if (-not (Test-Path "$dist\licenses\slint\LicenseRef-Slint-Royalty-free-2.0.md" -PathType Leaf)) { throw "Slint license notice was not copied into the artifact" }
           $zip = "$dist.zip"
           Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
           (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() + "  " + (Split-Path $zip -Leaf) |
