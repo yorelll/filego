@@ -10,7 +10,7 @@ CI downloads pinned, checksummed release binaries for `cargo-deny` and `cargo-ab
 cargo deny --locked check advisories bans licenses sources
 ```
 
-`deny.toml` denies wildcards and unknown registries/Git sources. The allow-list contains permissive licenses used by the dependency graph plus Slint's desktop royalty-free license reference. A changed dependency graph must pass this gate and receive independent review.
+`deny.toml` denies wildcards and unknown registries/Git sources. The allow-list contains permissive licenses used by the Windows x86-64 release dependency graph plus Slint's desktop royalty-free license reference. The audit explicitly targets `x86_64-pc-windows-msvc`: Cargo.lock can retain platform-conditional crates for other systems, but their presence is not evidence that they ship in the only supported `0.0.1` artifact. Adding another release target requires extending this target list and independently re-auditing its graph. A changed dependency graph must pass this gate and receive independent review.
 
 ## Slint licensing decision
 
@@ -20,7 +20,7 @@ Slint's exact v1.18.0 royalty-free license text is vendored at `third-party/slin
 
 ## Inventory generation
 
-CI uses the pinned `cargo-about` release and `about.toml`/`about.hbs` to render `THIRD_PARTY_LICENSES.html` with `--locked --fail`. The ordered acceptance list places Slint's royalty-free license first so `OR` expressions select the project's documented desktop-license basis. The generator must resolve the checked-in `Cargo.lock`; it must not silently update dependencies. Resolution diagnostics fail the job where supported; CI and independent review must additionally verify that every locked package appears with usable notice text because tool limitations can still report some missing metadata as warnings. Generated inventory is uploaded with CI artifacts and reviewed before a release.
+CI uses the pinned `cargo-about` release and `about.toml`/`about.hbs` to render `THIRD_PARTY_LICENSES.html` with `--locked --fail`. The ordered acceptance list places Slint's royalty-free license first so `OR` expressions select the project's documented desktop-license basis. The generator must resolve the checked-in `Cargo.lock`; it must not silently update dependencies. Resolution diagnostics fail the job where supported; CI and independent review must additionally verify that every package in the configured Windows x86-64 release dependency graph appears with usable notice text because tool limitations can still report some missing metadata as warnings. Generated inventory is uploaded with CI artifacts and reviewed before a release.
 
 ## Human checks
 
