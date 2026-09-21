@@ -44,7 +44,7 @@ Inspection of Slint 1.18.0's Windows source shows direct `Shell_NotifyIconW` use
 
 - CI: Slint compiler and Windows linker must accept `SystemTrayIcon`, the generated RGBA PNG icon, menu, callbacks, and selected features.
 - Desktop: tests C1–C3, C8–C9 from the manual acceptance checklist.
-- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging. Real Windows desktop behavior and the release-candidate workflow remain unverified.
+- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging; the release-candidate workflow run `35565687100` at candidate `9081bf4` also passed. Real Windows desktop behavior remains unverified.
 
 ## References
 

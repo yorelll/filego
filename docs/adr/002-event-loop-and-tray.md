@@ -43,7 +43,7 @@ Slint 1.18 provides `SystemTrayIcon`. Its Windows backend creates a message-only
 
 - Automated: lifecycle state/port tests; Windows build; version smoke.
 - Desktop: hidden startup, repeated show/hide, menu actions, clean Exit, and idle CPU.
-- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging. Real Windows desktop behavior and the release-candidate workflow remain unverified.
+- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging; the release-candidate workflow run `35565687100` at candidate `9081bf4` also passed. Real Windows desktop behavior remains unverified.
 
 ## References
 

@@ -48,7 +48,7 @@ Slint 1.18.0 requires Rust 1.92 and contains the `SystemTrayIcon` implementation
 
 - Automated: Windows CI must compile the UI and embedded desktop resources, run clippy/tests, and build Release with only selected features.
 - Desktop: inspect text/IME, 100–200% DPI, high contrast, and idle CPU on Windows 10/11.
-- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging. Real Windows desktop behavior and the release-candidate workflow remain unverified. No local Rust verification is permitted.
+- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging; the release-candidate workflow run `35565687100` at candidate `9081bf4` also passed. Real Windows desktop behavior remains unverified. No local Rust verification is permitted.
 
 ## References
 

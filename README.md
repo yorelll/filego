@@ -4,7 +4,7 @@
 
 QuickFolder 是面向 Windows 的轻量级文件夹快捷启动工具。它常驻系统托盘；用户通过全局快捷键唤出搜索窗口，输入名称、路径、分类或标签，并用键盘快速打开已添加的文件夹。
 
-> 当前状态：`0.0.1` 开发中。M00 工程与 CI 骨架已经建立。Windows CI run `35562858225`（head `08bfb527`）已通过格式、Clippy、测试、Release 构建与打包；真实 Windows 桌面行为和 release-candidate workflow 仍待验证。
+> 当前状态：`0.0.1` 开发中。M00 工程与 CI 骨架已经建立。Windows CI（例如 run `35562858225`，head `08bfb527`）已通过格式、Clippy、测试、Release 构建与打包；release-candidate workflow（run `35565687100`，candidate `9081bf4`）亦验证成功；真实 Windows 桌面行为仍待验证。
 
 ## 产品目标
 
