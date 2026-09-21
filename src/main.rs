@@ -50,7 +50,10 @@ mod tests {
         let platform_error =
             event_loop_error_as_platform_error(slint::EventLoopError::EventLoopTerminated);
 
-        assert_eq!(platform_error.to_string(), "The event loop was already terminated");
+        assert_eq!(
+            platform_error.to_string(),
+            "The event loop was already terminated"
+        );
     }
 }
 
@@ -132,8 +135,7 @@ fn report_platform_error(result: Result<quickfolder::app::LifecycleState, slint:
 
 fn main() {
     if std::env::args_os().skip(1).any(|argument| {
-        argument == std::ffi::OsStr::new("--version")
-            || argument == std::ffi::OsStr::new("-V")
+        argument == std::ffi::OsStr::new("--version") || argument == std::ffi::OsStr::new("-V")
     }) {
         println!("{}", version::display());
         return;
