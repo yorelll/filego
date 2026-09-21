@@ -43,7 +43,7 @@ Slint 1.18 provides `SystemTrayIcon`. Its Windows backend creates a message-only
 
 - Automated: lifecycle state/port tests; Windows build; version smoke.
 - Desktop: hidden startup, repeated show/hide, menu actions, clean Exit, and idle CPU.
-- Current status: FileGo rename, GNU/MSVC policy, and explicit MSVC target paths passed Windows CI run `35587340136` (head `c42f5728`). The renamed release-candidate workflow package paths still require a FileGo candidate run. Real Windows desktop behavior remains unverified.
+- Current status: FileGo rename, GNU/MSVC policy, and explicit MSVC target paths passed Windows CI run `35587340136` (head `c42f5728`); FileGo release-candidate workflow run `35590444471` at candidate `3c42413c` also passed. Real Windows desktop behavior remains unverified.
 
 ## References
 

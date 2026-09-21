@@ -47,7 +47,7 @@ Slint exposes `Window::on_close_requested`, `CloseRequestResponse::HideWindow`, 
 - Automated: state transition tests with a fake port, including error rollback and close-to-hidden.
 - CI: build generated callbacks and close handler.
 - Desktop: hidden startup, no taskbar entry, focus after Open, repeated close/reopen, and graceful Exit.
-- Current status: FileGo rename, GNU/MSVC policy, and explicit MSVC target paths passed Windows CI run `35587340136` (head `c42f5728`). The renamed release-candidate workflow package paths still require a FileGo candidate run. Real Windows desktop behavior remains unverified.
+- Current status: FileGo rename, GNU/MSVC policy, and explicit MSVC target paths passed Windows CI run `35587340136` (head `c42f5728`); FileGo release-candidate workflow run `35590444471` at candidate `3c42413c` also passed. Real Windows desktop behavior remains unverified.
 
 ## References
 
