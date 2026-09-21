@@ -41,22 +41,6 @@ fn event_loop_error_as_platform_error(error: slint::EventLoopError) -> slint::Pl
     slint::PlatformError::from(error.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn event_loop_errors_are_converted_for_the_shared_window_port() {
-        let platform_error =
-            event_loop_error_as_platform_error(slint::EventLoopError::EventLoopTerminated);
-
-        assert_eq!(
-            platform_error.to_string(),
-            "The event loop was already terminated"
-        );
-    }
-}
-
 fn run() -> Result<(), slint::PlatformError> {
     let app = AppWindow::new()?;
     let tray = AppTray::new()?;
@@ -144,5 +128,21 @@ fn main() {
     if run().is_err() {
         eprintln!("QuickFolder could not initialize its user interface");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_loop_errors_are_converted_for_the_shared_window_port() {
+        let platform_error =
+            event_loop_error_as_platform_error(slint::EventLoopError::EventLoopTerminated);
+
+        assert_eq!(
+            platform_error.to_string(),
+            "The event loop was already terminated"
+        );
     }
 }
