@@ -1,6 +1,6 @@
 # ADR-002: One Slint-owned event loop
 
-- Status: Accepted; CI and desktop verification pending
+- Status: Accepted; Windows CI verified, desktop verification pending
 - Date: 2026-09-20
 - Owners: QuickFolder maintainers
 - Requirements: REQ-LIFE-001, REQ-LIFE-002, REQ-LIFE-003, REQ-LIFE-014
@@ -43,7 +43,7 @@ Slint 1.18 provides `SystemTrayIcon`. Its Windows backend creates a message-only
 
 - Automated: lifecycle state/port tests; Windows build; version smoke.
 - Desktop: hidden startup, repeated show/hide, menu actions, clean Exit, and idle CPU.
-- Current status: source implementation complete; no GitHub Actions run or desktop test yet.
+- Current status: Windows CI run `35561214563` (head `a71e2e1`; current lifecycle fix pending revalidation) passed format, Clippy, tests, Release build, and packaging. Real Windows desktop behavior and the release-candidate workflow remain unverified.
 
 ## References
 

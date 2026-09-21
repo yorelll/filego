@@ -1,6 +1,6 @@
 # ADR-004: Hidden startup and close-to-tray lifecycle
 
-- Status: Accepted; desktop verification pending
+- Status: Accepted; Windows CI verified, desktop verification pending
 - Date: 2026-09-20
 - Owners: QuickFolder maintainers
 - Requirements: REQ-LIFE-001, REQ-LIFE-002, REQ-LIFE-003, REQ-WINDOW-006
@@ -47,7 +47,7 @@ Slint exposes `Window::on_close_requested`, `CloseRequestResponse::HideWindow`, 
 - Automated: state transition tests with a fake port, including error rollback and close-to-hidden.
 - CI: build generated callbacks and close handler.
 - Desktop: hidden startup, no taskbar entry, focus after Open, repeated close/reopen, and graceful Exit.
-- Current status: pure tests written but not executed; platform behavior unverified.
+- Current status: Windows CI run `35561214563` (head `a71e2e1`; current lifecycle fix pending revalidation) passed format, Clippy, tests, and Release build with the lifecycle tests. Real Windows desktop behavior and the release-candidate workflow remain unverified.
 
 ## References
 

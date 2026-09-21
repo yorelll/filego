@@ -1,6 +1,6 @@
 # ADR-001: Slint backend and renderer
 
-- Status: Accepted; build and desktop verification pending
+- Status: Accepted; Windows CI verified, desktop verification pending
 - Date: 2026-09-20
 - Owners: QuickFolder maintainers
 - Requirements: REQ-REL-001, REQ-REL-002, REQ-UI-006, REQ-WINDOW-014
@@ -48,7 +48,7 @@ Slint 1.18.0 requires Rust 1.92 and contains the `SystemTrayIcon` implementation
 
 - Automated: Windows CI must compile the UI and embedded desktop resources, run clippy/tests, and build Release with only selected features.
 - Desktop: inspect text/IME, 100–200% DPI, high contrast, and idle CPU on Windows 10/11.
-- Current status: not run. No local Rust verification is permitted.
+- Current status: Windows CI run `35561214563` (head `a71e2e1`; current lifecycle fix pending revalidation) passed format, Clippy, tests, Release build, and packaging. Real Windows desktop behavior and the release-candidate workflow remain unverified. No local Rust verification is permitted.
 
 ## References
 

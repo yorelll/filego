@@ -1,6 +1,6 @@
 # ADR-003: Built-in Slint SystemTrayIcon
 
-- Status: Accepted; desktop verification pending
+- Status: Accepted; Windows CI verified, desktop verification pending
 - Date: 2026-09-20
 - Owners: QuickFolder maintainers
 - Requirements: REQ-LIFE-001, REQ-LIFE-003, REQ-LIFE-006, REQ-LIFE-009
@@ -44,7 +44,7 @@ Inspection of Slint 1.18.0's Windows source shows direct `Shell_NotifyIconW` use
 
 - CI: Slint compiler and Windows linker must accept `SystemTrayIcon`, the generated RGBA PNG icon, menu, callbacks, and selected features.
 - Desktop: tests C1–C3, C8–C9 from the manual acceptance checklist.
-- Current status: not verified by GitHub Actions or a real desktop.
+- Current status: Windows CI run `35561214563` (head `a71e2e1`; current lifecycle fix pending revalidation) passed format, Clippy, tests, Release build, and packaging. Real Windows desktop behavior and the release-candidate workflow remain unverified.
 
 ## References
 

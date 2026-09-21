@@ -46,8 +46,13 @@ impl LifecycleController {
 
     /// Records the native close response. Slint performs the actual hide after
     /// the callback returns `CloseRequestResponse::HideWindow`.
+    ///
+    /// `Exiting` is terminal: a queued close dispatched during shutdown must not
+    /// overwrite the exit state.
     pub fn accept_window_close(&mut self) -> LifecycleState {
-        self.state = LifecycleState::Hidden;
+        if self.state != LifecycleState::Exiting {
+            self.state = LifecycleState::Hidden;
+        }
         self.state
     }
 
@@ -250,6 +255,32 @@ mod tests {
         controller
             .handle(LifecycleCommand::ExitFromTray, &mut window)
             .unwrap();
+        assert_eq!(controller.state(), LifecycleState::Exiting);
+        assert_eq!(window.actions, ["quit"]);
+    }
+
+    #[test]
+    fn native_close_after_exit_preserves_terminal_state() {
+        let mut controller = LifecycleController::new();
+        let mut window = FakeWindow::default();
+
+        controller
+            .handle(LifecycleCommand::ExitFromTray, &mut window)
+            .unwrap();
+        assert_eq!(controller.state(), LifecycleState::Exiting);
+
+        // A queued native close request dispatched during shutdown must not
+        // clear the terminal state.
+        assert_eq!(
+            controller.accept_window_close(),
+            LifecycleState::Exiting
+        );
+
+        // A later Show must remain a no-op: only the original exit action runs.
+        assert_eq!(
+            controller.handle(LifecycleCommand::Show, &mut window),
+            Ok(LifecycleState::Exiting)
+        );
         assert_eq!(controller.state(), LifecycleState::Exiting);
         assert_eq!(window.actions, ["quit"]);
     }
