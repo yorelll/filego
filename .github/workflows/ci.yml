@@ -18,7 +18,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  QUICKFOLDER_VERSION: 0.0.1
+  FILEGO_VERSION: 0.0.1
   TARGET: x86_64-pc-windows-msvc
 
 jobs:
@@ -80,23 +80,23 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy with warnings denied
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-features --locked
+        run: cargo test --workspace --all-features --locked --target x86_64-pc-windows-msvc
 
       - name: Build release executable
-        run: cargo build --workspace --all-features --release --locked
+        run: cargo build --workspace --all-features --release --locked --target x86_64-pc-windows-msvc
 
       - name: Verify release outputs and version helper
         shell: pwsh
         run: |
-          $app = "target\release\quickfolder.exe"
-          $versionTool = "target\release\quickfolder-version.exe"
+          $app = "target\x86_64-pc-windows-msvc\release\filego.exe"
+          $versionTool = "target\x86_64-pc-windows-msvc\release\filego-version.exe"
           if (-not (Test-Path $app -PathType Leaf)) { throw "Missing $app" }
           if (-not (Test-Path $versionTool -PathType Leaf)) { throw "Missing $versionTool" }
           $actual = (& $versionTool).Trim()
-          $expected = "QuickFolder $env:QUICKFOLDER_VERSION"
+          $expected = "FileGo $env:FILEGO_VERSION"
           if ($actual -ne $expected) { throw "Version mismatch: expected '$expected', got '$actual'" }
 
       - name: Install pinned dependency audit tools
@@ -117,14 +117,14 @@ jobs:
         run: |
           $notice = Get-Content "THIRD_PARTY_LICENSES.html" -Raw
           if ([string]::IsNullOrWhiteSpace($notice)) { throw "License inventory is empty" }
-          if ($notice -notmatch '<title>QuickFolder Third-Party Licenses</title>') { throw "License inventory title is missing" }
+          if ($notice -notmatch '<title>FileGo Third-Party Licenses</title>') { throw "License inventory title is missing" }
 
       - name: Build portable development artifact
         shell: pwsh
         run: |
-          $dist = "dist\QuickFolder-$env:QUICKFOLDER_VERSION-windows-x86_64"
+          $dist = "dist\FileGo-$env:FILEGO_VERSION-windows-x86_64"
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
-          Copy-Item "target\release\quickfolder.exe" "$dist\QuickFolder.exe"
+          Copy-Item "target\x86_64-pc-windows-msvc\release\filego.exe" "$dist\FileGo.exe"
           Copy-Item "README.md", "LICENSE", "THIRD_PARTY_LICENSES.html" $dist
           New-Item -ItemType Directory -Path "$dist\licenses\slint" -Force | Out-Null
           Copy-Item "third-party\slint\LicenseRef-Slint-Royalty-free-2.0.md" "$dist\licenses\slint"
@@ -138,9 +138,9 @@ jobs:
       - name: Upload portable development artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: QuickFolder-${{ env.QUICKFOLDER_VERSION }}-windows-x86_64-${{ github.sha }}
+          name: FileGo-${{ env.FILEGO_VERSION }}-windows-x86_64-${{ github.sha }}
           path: |
-            dist/QuickFolder-${{ env.QUICKFOLDER_VERSION }}-windows-x86_64.zip
-            dist/QuickFolder-${{ env.QUICKFOLDER_VERSION }}-windows-x86_64.zip.sha256
+            dist/FileGo-${{ env.FILEGO_VERSION }}-windows-x86_64.zip
+            dist/FileGo-${{ env.FILEGO_VERSION }}-windows-x86_64.zip.sha256
           if-no-files-found: error
           retention-days: 14

@@ -2,7 +2,7 @@
 
 - Status: Accepted; Windows CI verified, desktop verification pending
 - Date: 2026-09-20
-- Owners: QuickFolder maintainers
+- Owners: FileGo maintainers
 - Requirements: REQ-LIFE-001, REQ-LIFE-003, REQ-LIFE-006, REQ-LIFE-009
 
 ## Context
@@ -16,14 +16,14 @@ Inspection of Slint 1.18.0's Windows source shows direct `Shell_NotifyIconW` use
 - Implement `AppTray` as Slint's built-in `SystemTrayIcon`.
 - Use the project-owner-provided tray artwork processed into a transparent 32×32 RGBA PNG. Preserve the unchanged source and reproducible processing details under `assets/source/`, `tools/process_icons.py`, and `docs/assets.md`. The owner confirmed public-project and release distribution authorization on 2026-09-21.
 - Expose three callbacks: `toggle-window`, `open-window`, and `quit-requested`.
-- Map left click to toggle. The context menu contains “打开 QuickFolder”, a separator, and “退出”.
+- Map left click to toggle. The context menu contains “打开 FileGo”, a separator, and “退出”.
 - Rely on Slint 1.18's same-thread Windows backend and `TaskbarCreated` recovery instead of adding another tray dependency.
 - Keep the tray component strongly alive for the complete event-loop lifetime.
 
 ## Alternatives considered
 
 - `tray-icon`: mature and portable, but rejected because it introduces another event integration and overlapping Windows bindings.
-- Direct QuickFolder `Shell_NotifyIconW`: rejected because it repeats substantial unsafe resource management and recovery code.
+- Direct FileGo `Shell_NotifyIconW`: rejected because it repeats substantial unsafe resource management and recovery code.
 - No M00 tray: rejected because it would leave the highest architecture risk unresolved.
 
 ## Consequences
@@ -44,7 +44,7 @@ Inspection of Slint 1.18.0's Windows source shows direct `Shell_NotifyIconW` use
 
 - CI: Slint compiler and Windows linker must accept `SystemTrayIcon`, the generated RGBA PNG icon, menu, callbacks, and selected features.
 - Desktop: tests C1–C3, C8–C9 from the manual acceptance checklist.
-- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging; the release-candidate workflow run `35565687100` at candidate `9081bf4` also passed. Real Windows desktop behavior remains unverified.
+- Current status: Historical QuickFolder CI run `35562858225` and release-candidate workflow `35565687100` passed. The current FileGo rename, GNU/MSVC dual-toolchain policy, and explicit MSVC target-path changes require fresh remote MSVC CI and release-candidate workflow validation; real Windows desktop behavior also remains unverified.
 
 ## References
 

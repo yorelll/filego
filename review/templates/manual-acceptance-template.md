@@ -1,4 +1,4 @@
-# QuickFolder 0.0.1 Manual Acceptance
+# FileGo 0.0.1 Manual Acceptance
 
 ## Candidate identity
 

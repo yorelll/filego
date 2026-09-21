@@ -3423,7 +3423,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quickfolder"
+name = "filego"
 version = "0.0.1"
 dependencies = [
  "slint",

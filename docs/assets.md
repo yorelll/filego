@@ -14,7 +14,7 @@ Source SHA-256 values:
 
 Both source files are RGB images whose visible checkerboard is baked into the pixels; it is not a real alpha channel. The source artwork is retained byte-for-byte under normalized names for traceability and is not referenced by the application binary.
 
-These files are owner-provided project assets. On 2026-09-21, the project owner confirmed ownership and authorized their inclusion and distribution in the public QuickFolder project and its release artifacts. The generated derivatives are therefore approved project assets; this provenance record is retained separately from third-party dependency notices.
+These files are owner-provided project assets. On 2026-09-21, the project owner confirmed ownership and authorized their inclusion and distribution in the public FileGo project and its release artifacts. The generated derivatives are therefore approved project assets; this provenance record is retained separately from third-party dependency notices.
 
 ## Generated assets
 
@@ -22,9 +22,9 @@ These files are owner-provided project assets. On 2026-09-21, the project owner 
 
 | File | Purpose | Format |
 |---|---|---|
-| `assets/icons/quickfolder.png` | Main window/application artwork | 512×512 RGBA PNG |
-| `assets/icons/quickfolder-tray.png` | Slint `SystemTrayIcon` image | 32×32 RGBA PNG |
-| `assets/icons/quickfolder.ico` | Embedded Windows executable/file icon resource | Multi-resolution ICO: 16, 20, 24, 32, 48, 64, 128, 256 px |
+| `assets/icons/filego.png` | Main window/application artwork | 512×512 RGBA PNG |
+| `assets/icons/filego-tray.png` | Slint `SystemTrayIcon` image | 32×32 RGBA PNG |
+| `assets/icons/filego.ico` | Embedded Windows executable/file icon resource | Multi-resolution ICO: 16, 20, 24, 32, 48, 64, 128, 256 px |
 
 The script:
 

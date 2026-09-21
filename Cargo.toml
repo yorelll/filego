@@ -1,11 +1,11 @@
 [package]
-name = "quickfolder"
+name = "filego"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.92"
 description = "A lightweight Windows folder launcher"
 license = "MIT"
-repository = "https://github.com/yorelll/quickfolder"
+repository = "https://github.com/yorelll/filego"
 readme = "README.md"
 publish = false
 build = "build.rs"

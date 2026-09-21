@@ -1,4 +1,4 @@
-# QuickFolder Agent 开发规则
+# FileGo Agent 开发规则
 
 本文件约束所有在本仓库中工作的主 agent 与子 agent。除非用户明确修改规则，否则不得跳过。产品范围与默认行为见 `README.md`；详细实施清单见本地 `task/` 目录。
 
@@ -24,30 +24,54 @@
 - implementation agent 必须提供变更范围、测试证据、已知限制和待人工验证项，供 reviewer 独立检查。
 - reviewer 不得只阅读 response 后直接批准；必须重新查看相应代码、diff、测试和 CI 证据。
 
-## 3. 强制要求一：仅通过 GitHub Actions 验证 Rust
+## 3. 强制要求一：本地 GNU 快速验证与远程 MSVC 发布验证
 
-### 3.1 禁止本地 Rust 验证
+### 3.1 本地 Rust 验证（已授权的 MinGW64 GNU 工具链）
 
-本机没有 Rust 环境。任何 agent：
+本机已配置 Rust `1.92.0-x86_64-pc-windows-gnu`（MinGW64）。在工具链、target、`rustfmt` 与 `clippy` 均已安装时，agent **可以**在本地执行 Rust 语法、静态检查、测试和 GNU Release 构建，以缩短反馈周期。
 
-- 不得安装 Rust、rustup、cargo、clippy、rustfmt 或本地交叉编译工具链，除非用户另行明确授权。
-- 不得声称本地执行过 `cargo build/test/check/clippy/fmt`。
-- 不得用“代码看起来可以编译”代替 CI 结果。
-- 可在本地编辑文件、检查 Git diff、处理文档，以及运行与 Rust 编译无关的仓库操作。
+每次本地 Rust 验证前必须先禁止 Rustup 自动下载，并记录预检结果：
 
-### 3.2 GitHub Actions 必备门禁
+```powershell
+$env:RUSTUP_AUTO_INSTALL = '0'
+$env:RUSTUP_TOOLCHAIN = '1.92.0-x86_64-pc-windows-gnu'
+rustc --version
+cargo --version
+rustup target list --installed
+rustup component list --installed
+```
+
+只有预检确认已安装 `x86_64-pc-windows-gnu`、`rustfmt` 和 `clippy` 时，才可执行下列本地命令：
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu -- -D warnings
+cargo test --workspace --all-features --locked --target x86_64-pc-windows-gnu
+cargo build --workspace --all-features --release --locked --target x86_64-pc-windows-gnu
+```
+
+规则：
+
+- agent 不得通过 `rustup`、安装包管理器或其他方式自动安装、更新、切换或下载 Rust toolchain、target 或 component；预检失败时应停止本地 Rust 验证并报告缺失项。
+- 本地 GNU 结果是快速反馈证据，必须记录 toolchain、target、命令、commit/工作树状态和结果。
+- GNU 与 MSVC ABI、linker、Windows SDK 和依赖行为不同；本地通过绝不替代远程 MSVC CI，也不得据此宣称发布物已验证。
+- 本地构建产物只用于开发检查，不得作为 release artifact、Actions artifact 或发布哈希来源。
+
+### 3.2 GitHub Actions 必备 MSVC 门禁
+
+远程 Windows CI 和所有候选/发布构建必须使用 `x86_64-pc-windows-msvc` toolchain/target。workflow 中 Rust 检查、测试、Release build、EXE 路径和打包步骤必须显式保持 MSVC target 一致；主 agent 在每次推送、workflow 修改和 release-candidate 前都必须检查该约束。
 
 项目建立后必须维护 Windows CI。至少包括：
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-3. `cargo test --workspace --all-features --locked`
-4. `cargo build --workspace --all-features --release --locked`
-5. 对生成的 Release EXE 做可执行文件存在性和打包检查
+2. `cargo clippy --workspace --all-targets --all-features --locked --target x86_64-pc-windows-msvc -- -D warnings`
+3. `cargo test --workspace --all-features --locked --target x86_64-pc-windows-msvc`
+4. `cargo build --workspace --all-features --release --locked --target x86_64-pc-windows-msvc`
+5. 对 MSVC Release EXE 做可执行文件存在性和打包检查
 
 发布 workflow 还必须：
 
-- 只从通过质量门禁的目标提交构建 x86-64 Release 产物；
+- 只从通过 MSVC 质量门禁的目标提交构建 x86-64 Release 产物；
 - 生成 portable EXE、ZIP 和 SHA-256 校验文件；
 - 上传 Actions artifact；
 - 发布前验证版本号、tag 与产物名称一致；

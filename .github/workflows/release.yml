@@ -84,8 +84,8 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           $metadata = cargo metadata --frozen --format-version 1 --no-deps | ConvertFrom-Json
-          $package = $metadata.packages | Where-Object { $_.name -eq "quickfolder" }
-          if ($null -eq $package) { throw "quickfolder package was not found" }
+          $package = $metadata.packages | Where-Object { $_.name -eq "filego" }
+          if ($null -eq $package) { throw "filego package was not found" }
           if ($package.version -ne $env:VERSION) {
             throw "Cargo version '$($package.version)' does not match requested '$env:VERSION'"
           }
@@ -94,21 +94,21 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy with warnings denied
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-features --locked
+        run: cargo test --workspace --all-features --locked --target x86_64-pc-windows-msvc
 
       - name: Build release executable
-        run: cargo build --workspace --all-features --release --locked
+        run: cargo build --workspace --all-features --release --locked --target x86_64-pc-windows-msvc
 
       - name: Verify version helper
         shell: pwsh
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          $actual = (& "target\release\quickfolder-version.exe").Trim()
-          if ($actual -ne "QuickFolder $env:VERSION") {
+          $actual = (& "target\x86_64-pc-windows-msvc\release\filego-version.exe").Trim()
+          if ($actual -ne "FileGo $env:VERSION") {
             throw "Version mismatch: '$actual'"
           }
 
@@ -130,39 +130,39 @@ jobs:
         run: |
           $notice = Get-Content "THIRD_PARTY_LICENSES.html" -Raw
           if ([string]::IsNullOrWhiteSpace($notice)) { throw "License inventory is empty" }
-          if ($notice -notmatch '<title>QuickFolder Third-Party Licenses</title>') { throw "License inventory title is missing" }
+          if ($notice -notmatch '<title>FileGo Third-Party Licenses</title>') { throw "License inventory title is missing" }
 
       - name: Package unsigned candidate
         shell: pwsh
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          $exe = "QuickFolder-$env:VERSION-windows-x86_64.exe"
-          $folder = "dist\QuickFolder-$env:VERSION-windows-x86_64"
+          $exe = "FileGo-$env:VERSION-windows-x86_64.exe"
+          $folder = "dist\FileGo-$env:VERSION-windows-x86_64"
           New-Item -ItemType Directory -Path $folder -Force | Out-Null
-          Copy-Item "target\release\quickfolder.exe" "dist\$exe"
-          Copy-Item "dist\$exe" "$folder\QuickFolder.exe"
+          Copy-Item "target\x86_64-pc-windows-msvc\release\filego.exe" "dist\$exe"
+          Copy-Item "dist\$exe" "$folder\FileGo.exe"
           Copy-Item "README.md", "LICENSE", "THIRD_PARTY_LICENSES.html" $folder
           New-Item -ItemType Directory -Path "$folder\licenses\slint" -Force | Out-Null
           Copy-Item "third-party\slint\LicenseRef-Slint-Royalty-free-2.0.md" "$folder\licenses\slint"
           if (-not (Test-Path "third-party\slint\LicenseRef-Slint-Royalty-free-2.0.md" -PathType Leaf)) { throw "Slint license source is missing" }
           if (-not (Test-Path "$folder\licenses\slint\LicenseRef-Slint-Royalty-free-2.0.md" -PathType Leaf)) { throw "Slint license notice was not copied into the candidate" }
-          $zip = "dist\QuickFolder-$env:VERSION-windows-x86_64.zip"
+          $zip = "dist\FileGo-$env:VERSION-windows-x86_64.zip"
           Compress-Archive -Path "$folder\*" -DestinationPath $zip -CompressionLevel Optimal
           $assets = @("dist\$exe", $zip)
           $lines = foreach ($asset in $assets) {
             (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant() + "  " + (Split-Path $asset -Leaf)
           }
-          $lines | Set-Content "dist\QuickFolder-$env:VERSION-SHA256SUMS.txt" -Encoding ascii
+          $lines | Set-Content "dist\FileGo-$env:VERSION-SHA256SUMS.txt" -Encoding ascii
 
       - name: Upload unsigned candidate only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: QuickFolder-${{ inputs.version }}-unsigned-candidate-${{ inputs.candidate_sha }}
+          name: FileGo-${{ inputs.version }}-unsigned-candidate-${{ inputs.candidate_sha }}
           path: |
-            dist/QuickFolder-${{ inputs.version }}-windows-x86_64.exe
-            dist/QuickFolder-${{ inputs.version }}-windows-x86_64.zip
-            dist/QuickFolder-${{ inputs.version }}-SHA256SUMS.txt
+            dist/FileGo-${{ inputs.version }}-windows-x86_64.exe
+            dist/FileGo-${{ inputs.version }}-windows-x86_64.zip
+            dist/FileGo-${{ inputs.version }}-SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 

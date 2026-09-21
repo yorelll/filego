@@ -2,12 +2,12 @@
 
 - Status: Accepted; Windows CI verified, desktop verification pending
 - Date: 2026-09-20
-- Owners: QuickFolder maintainers
+- Owners: FileGo maintainers
 - Requirements: REQ-REL-001, REQ-REL-002, REQ-UI-006, REQ-WINDOW-014
 
 ## Context
 
-QuickFolder targets Windows 10 22H2 and Windows 11, needs Unicode/IME, high-DPI, accessibility, a native tray icon, and low idle resource use. It must not embed a browser engine. The local development machine has no Rust toolchain, so dependency/API validity must be established by Windows CI.
+FileGo targets Windows 10 22H2 and Windows 11, needs Unicode/IME, high-DPI, accessibility, a native tray icon, and low idle resource use. It must not embed a browser engine. The local MinGW64 GNU toolchain provides fast development feedback; Windows MSVC CI remains the compatibility and release-validation authority.
 
 Slint 1.18.0 requires Rust 1.92 and contains the `SystemTrayIcon` implementation introduced in 1.17. The application must choose compile-time features deliberately rather than accepting every default renderer and backend.
 
@@ -25,7 +25,7 @@ Slint 1.18.0 requires Rust 1.92 and contains the `SystemTrayIcon` implementation
 
 - Slint default features: rejected because they enable a broader backend/renderer surface than this Windows application requires.
 - Skia plus software fallback: deferred because Skia increases binary size and dependency surface before measurements show it is needed.
-- FemtoVG: deferred for the same reason and because QuickFolder's UI has modest rendering needs.
+- FemtoVG: deferred for the same reason and because FileGo's UI has modest rendering needs.
 - Browser UI frameworks: rejected by the product's native/lightweight constraint.
 
 ## Consequences
@@ -46,9 +46,9 @@ Slint 1.18.0 requires Rust 1.92 and contains the `SystemTrayIcon` implementation
 
 ## Verification
 
-- Automated: Windows CI must compile the UI and embedded desktop resources, run clippy/tests, and build Release with only selected features.
+- Automated: local GNU checks provide fast feedback; Windows MSVC CI must compile the UI and embedded desktop resources, run clippy/tests, and build Release with only selected features.
 - Desktop: inspect text/IME, 100–200% DPI, high contrast, and idle CPU on Windows 10/11.
-- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging; the release-candidate workflow run `35565687100` at candidate `9081bf4` also passed. Real Windows desktop behavior remains unverified. No local Rust verification is permitted.
+- Current status: Historical QuickFolder CI run `35562858225` and release-candidate workflow `35565687100` passed. The current FileGo rename, GNU/MSVC dual-toolchain policy, and explicit MSVC target-path changes require fresh remote MSVC CI and release-candidate workflow validation; real Windows desktop behavior also remains unverified. Local GNU validation is permitted only under the repository policy and cannot replace MSVC evidence.
 
 ## References
 

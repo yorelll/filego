@@ -2,7 +2,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use quickfolder::{
+use filego::{
     AppTray, AppWindow,
     app::{LifecycleCommand, LifecycleController, WindowPort},
     version,
@@ -110,10 +110,10 @@ fn run() -> Result<(), slint::PlatformError> {
     slint::run_event_loop()
 }
 
-fn report_platform_error(result: Result<quickfolder::app::LifecycleState, slint::PlatformError>) {
+fn report_platform_error(result: Result<filego::app::LifecycleState, slint::PlatformError>) {
     if result.is_err() {
         // Do not print native details: later platform errors can contain user paths.
-        eprintln!("QuickFolder could not complete a window operation");
+        eprintln!("FileGo could not complete a window operation");
     }
 }
 
@@ -126,7 +126,7 @@ fn main() {
     }
 
     if run().is_err() {
-        eprintln!("QuickFolder could not initialize its user interface");
+        eprintln!("FileGo could not initialize its user interface");
         std::process::exit(1);
     }
 }

@@ -2,12 +2,12 @@
 
 - Status: Accepted; Windows CI verified, desktop verification pending
 - Date: 2026-09-20
-- Owners: QuickFolder maintainers
+- Owners: FileGo maintainers
 - Requirements: REQ-LIFE-001, REQ-LIFE-002, REQ-LIFE-003, REQ-WINDOW-006
 
 ## Context
 
-QuickFolder is tray-first. It must start silently, reuse one search window, hide on native close, and terminate only through the tray Exit command. Window visibility state must be testable without a live desktop.
+FileGo is tray-first. It must start silently, reuse one search window, hide on native close, and terminate only through the tray Exit command. Window visibility state must be testable without a live desktop.
 
 Slint exposes `Window::on_close_requested`, `CloseRequestResponse::HideWindow`, `show`, `hide`, and `is_visible`. It does not expose a stable declarative skip-taskbar property or a portable native activation API.
 
@@ -47,7 +47,7 @@ Slint exposes `Window::on_close_requested`, `CloseRequestResponse::HideWindow`, 
 - Automated: state transition tests with a fake port, including error rollback and close-to-hidden.
 - CI: build generated callbacks and close handler.
 - Desktop: hidden startup, no taskbar entry, focus after Open, repeated close/reopen, and graceful Exit.
-- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, and Release build with the lifecycle tests; the release-candidate workflow run `35565687100` at candidate `9081bf4` also passed. Real Windows desktop behavior remains unverified.
+- Current status: Historical QuickFolder CI run `35562858225` and release-candidate workflow `35565687100` passed. The current FileGo rename, GNU/MSVC dual-toolchain policy, and explicit MSVC target-path changes require fresh remote MSVC CI and release-candidate workflow validation; real Windows desktop behavior also remains unverified.
 
 ## References
 

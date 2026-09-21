@@ -1,10 +1,10 @@
-# QuickFolder
+# FileGo
 
 [![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/v1.18.0/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev/)
 
-QuickFolder 是面向 Windows 的轻量级文件夹快捷启动工具。它常驻系统托盘；用户通过全局快捷键唤出搜索窗口，输入名称、路径、分类或标签，并用键盘快速打开已添加的文件夹。
+FileGo 是面向 Windows 的轻量级文件夹快捷启动工具。它常驻系统托盘；用户通过全局快捷键唤出搜索窗口，输入名称、路径、分类或标签，并用键盘快速打开已添加的文件夹。
 
-> 当前状态：`0.0.1` 开发中。M00 工程与 CI 骨架已经建立。Windows CI（例如 run `35562858225`，head `08bfb527`）已通过格式、Clippy、测试、Release 构建与打包；release-candidate workflow（run `35565687100`，candidate `9081bf4`）亦验证成功；真实 Windows 桌面行为仍待验证。
+> 当前状态：`0.0.1` 开发中。历史 QuickFolder M00 已有通过的 Windows CI 与 release-candidate workflow 审计证据。当前 FileGo 更名、GNU/MSVC 双工具链规则及 MSVC target 路径变更仍待新的远程 MSVC CI 与 release-candidate workflow 验证；真实 Windows 桌面行为亦待验证。
 
 ## 产品目标
 
@@ -46,19 +46,19 @@ QuickFolder 是面向 Windows 的轻量级文件夹快捷启动工具。它常�
 - 打开文件夹后隐藏窗口并清空搜索内容
 - 空搜索框显示置顶项和最近使用项
 
-删除操作只会移除 QuickFolder 中的快捷记录，绝不会删除磁盘中的真实文件夹。
+删除操作只会移除 FileGo 中的快捷记录，绝不会删除磁盘中的真实文件夹。
 
 ## 开发与验证
 
-本项目的开发流程和强制质量门禁见 [`CLAUDE.md`](CLAUDE.md)。本地环境不提供 Rust 工具链，因此 Rust 编译、格式检查、静态检查和测试均以 GitHub Actions 的 Windows CI 结果为准。
+本项目的开发流程和强制质量门禁见 [`CLAUDE.md`](CLAUDE.md)。已安装的本地 MinGW64 GNU Rust toolchain 可用于快速格式、Clippy、测试和开发构建反馈；远程 GitHub Actions Windows MSVC CI 仍是兼容性、候选产物和发布的强制验证依据。
 
-交互类能力（托盘、全局快捷键、中文输入、多显示器等）需使用 CI 生成的便携版在真实 Windows 桌面上完成发布前手工验收。
+交互类能力（托盘、全局快捷键、中文输入、多显示器等）需使用 MSVC CI 生成的便携版在真实 Windows 桌面上完成发布前手工验收。
 
 当前 M00 只提供架构验证壳：静默托盘启动、最小搜索窗口、显示/隐藏及退出。搜索、持久化、快捷键、单实例和完整设置尚未实现，不能视为可发布版本。
 
 ### 获取开发构建
 
-代码推送后，GitHub Actions 的 `Windows CI` workflow 会执行格式、Clippy、测试、Release 构建、依赖审计和打包。成功 run 的 artifact 名为 `QuickFolder-0.0.1-windows-x86_64-<commit>`。本地没有 Rust 工具链，不提供本地构建结果。
+代码推送后，GitHub Actions 的 `Windows CI` workflow 会使用 MSVC toolchain 执行格式、Clippy、测试、Release 构建、依赖审计和打包。成功 run 的 artifact 名为 `FileGo-0.0.1-windows-x86_64-<commit>`。本地 GNU 验证仅用于开发反馈，不能替代此 MSVC 证据。
 
 首次 CI 是特殊 bootstrap：如果仓库尚无 `Cargo.lock`，workflow 会生成并上传 `cargo-lock-<commit>`，随后故意失败。维护者必须下载、检查并将该 lockfile 提交；之后 CI 才允许继续。这避免长期构建静默更新依赖。
 
@@ -72,4 +72,4 @@ QuickFolder 是面向 Windows 的轻量级文件夹快捷启动工具。它常�
 
 ## 许可证
 
-QuickFolder 项目源代码使用 [MIT License](LICENSE)。Slint 采用其桌面 Royalty-free 2.0 许可选项，因此应用保留可访问的 “Made with Slint” attribution；各依赖仍适用各自许可证。正式发布物必须包含 CI 生成并经审查的第三方许可证清单，以及仓库中固定保存的 Slint 许可证文本。
+FileGo 项目源代码使用 [MIT License](LICENSE)。Slint 采用其桌面 Royalty-free 2.0 许可选项，因此应用保留可访问的 “Made with Slint” attribution；各依赖仍适用各自许可证。正式发布物必须包含 CI 生成并经审查的第三方许可证清单，以及仓库中固定保存的 Slint 许可证文本。

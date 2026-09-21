@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-20
-- Owners: QuickFolder maintainers
+- Owners: FileGo maintainers
 - Requirements: REQ-REL-002, REQ-LIFE-014, REQ-FOLDER-024
 
 ## Context
@@ -20,7 +20,7 @@ M00 can avoid project-owned native calls because Slint provides window and tray 
 - Unsafe blocks must be as small as possible and document handle ownership, thread affinity, pointer validity, and callback lifetime.
 - Every fallible Win32 operation must inspect its documented return convention and convert errors to typed internal categories. User UI receives localizable categories, not raw codes or paths.
 - Never open user paths by constructing `cmd.exe` or PowerShell command strings. Use Shell APIs directly.
-- No platform adapter may expose recursive file/directory deletion; QuickFolder only removes records.
+- No platform adapter may expose recursive file/directory deletion; FileGo only removes records.
 
 ## Alternatives considered
 

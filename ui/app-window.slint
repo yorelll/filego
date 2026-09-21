@@ -1,8 +1,8 @@
 import { AboutSlint, LineEdit, VerticalBox } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
-    title: "QuickFolder";
-    icon: @image-url("../assets/icons/quickfolder.png");
+    title: "FileGo";
+    icon: @image-url("../assets/icons/filego.png");
     background: #f7f8fa;
     preferred-width: 600px;
     min-width: 480px;
@@ -35,7 +35,7 @@ export component AppWindow inherits Window {
         }
 
         Text {
-            text: "QuickFolder 0.0.1 · M00 architecture shell";
+            text: "FileGo 0.0.1 · M00 architecture shell";
             color: #626975;
             font-size: 12px;
             horizontal-alignment: center;
@@ -46,9 +46,9 @@ export component AppWindow inherits Window {
 }
 
 export component AppTray inherits SystemTrayIcon {
-    icon: @image-url("../assets/icons/quickfolder-tray.png");
-    title: "QuickFolder";
-    tooltip: "QuickFolder";
+    icon: @image-url("../assets/icons/filego-tray.png");
+    title: "FileGo";
+    tooltip: "FileGo";
 
     callback toggle-window();
     callback open-window();
@@ -58,7 +58,7 @@ export component AppTray inherits SystemTrayIcon {
 
     Menu {
         MenuItem {
-            title: "打开 QuickFolder";
+            title: "打开 FileGo";
             activated => { root.open-window(); }
         }
         MenuSeparator {}

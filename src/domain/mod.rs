@@ -1,4 +1,4 @@
-//! Platform-independent QuickFolder business rules.
+//! Platform-independent FileGo business rules.
 //!
 //! Folder records, settings, and search models are introduced in M01 and M02.
 

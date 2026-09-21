@@ -2,7 +2,7 @@
 
 - Status: Accepted; Windows CI verified, desktop verification pending
 - Date: 2026-09-20
-- Owners: QuickFolder maintainers
+- Owners: FileGo maintainers
 - Requirements: REQ-LIFE-001, REQ-LIFE-002, REQ-LIFE-003, REQ-LIFE-014
 
 ## Context
@@ -43,7 +43,7 @@ Slint 1.18 provides `SystemTrayIcon`. Its Windows backend creates a message-only
 
 - Automated: lifecycle state/port tests; Windows build; version smoke.
 - Desktop: hidden startup, repeated show/hide, menu actions, clean Exit, and idle CPU.
-- Current status: Windows CI run `35562858225` (head `08bfb527`) passed format, Clippy, tests, Release build, and packaging; the release-candidate workflow run `35565687100` at candidate `9081bf4` also passed. Real Windows desktop behavior remains unverified.
+- Current status: Historical QuickFolder CI run `35562858225` and release-candidate workflow `35565687100` passed. The current FileGo rename, GNU/MSVC dual-toolchain policy, and explicit MSVC target-path changes require fresh remote MSVC CI and release-candidate workflow validation; real Windows desktop behavior also remains unverified.
 
 ## References
 

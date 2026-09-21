@@ -1,6 +1,6 @@
 # Dependency and license policy
 
-QuickFolder source code is MIT-licensed. Every dependency must be reviewed before it is added, pinned in `Cargo.lock`, and distributable with the resulting Windows application.
+FileGo source code is MIT-licensed. Every dependency must be reviewed before it is added, pinned in `Cargo.lock`, and distributable with the resulting Windows application.
 
 ## Automated gate
 
@@ -14,7 +14,7 @@ cargo deny --locked check advisories bans licenses sources
 
 ## Slint licensing decision
 
-QuickFolder uses Slint 1.18.0 under `LicenseRef-Slint-Royalty-free-2.0` for a desktop application. The project satisfies both available attribution paths: the public README shows the Slint attribution badge, and the application embeds Slint's `AboutSlint` widget. The production settings/about page must keep that widget accessible from the top-level tray menu before release. Removing either path requires an explicit compliance review; at least one valid path is mandatory.
+FileGo uses Slint 1.18.0 under `LicenseRef-Slint-Royalty-free-2.0` for a desktop application. The project satisfies both available attribution paths: the public README shows the Slint attribution badge, and the application embeds Slint's `AboutSlint` widget. The production settings/about page must keep that widget accessible from the top-level tray menu before release. Removing either path requires an explicit compliance review; at least one valid path is mandatory.
 
 Slint's exact v1.18.0 royalty-free license text is vendored at `third-party/slint/LicenseRef-Slint-Royalty-free-2.0.md` and copied into every portable package. Other dependency notices are generated into `THIRD_PARTY_LICENSES.html`. A build missing either notice source is suitable only as a CI diagnostic artifact, never as a release candidate.
 

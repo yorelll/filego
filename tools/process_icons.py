@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create transparent QuickFolder application icons from owner-provided artwork.
+"""Create transparent FileGo application icons from owner-provided artwork.
 
 The source images contain a light checkerboard baked into their RGB pixels. This
 script separates the strongly blue logo from that near-neutral background,
@@ -27,9 +27,9 @@ SOURCES = {
     "tray": SOURCE_DIR / "tray-logo-original.png",
 }
 
-MAIN_OUTPUT = OUTPUT_DIR / "quickfolder.png"
-TRAY_OUTPUT = OUTPUT_DIR / "quickfolder-tray.png"
-ICO_OUTPUT = OUTPUT_DIR / "quickfolder.ico"
+MAIN_OUTPUT = OUTPUT_DIR / "filego.png"
+TRAY_OUTPUT = OUTPUT_DIR / "filego-tray.png"
+ICO_OUTPUT = OUTPUT_DIR / "filego.ico"
 
 # Pixels in the artwork are blue while the baked checkerboard is almost neutral.
 # A smooth threshold retains anti-aliased blue edge coverage and excludes neutral

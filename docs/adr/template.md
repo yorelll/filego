@@ -2,7 +2,7 @@
 
 - Status: Proposed
 - Date: YYYY-MM-DD
-- Owners: QuickFolder maintainers
+- Owners: FileGo maintainers
 - Requirements: REQ-...
 
 ## Context

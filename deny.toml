@@ -1,5 +1,5 @@
 [graph]
-# QuickFolder 0.0.1 ships only Windows x86-64. Audit that actual release
+# FileGo 0.0.1 ships only Windows x86-64. Audit that actual release
 # dependency graph; platform-specific entries retained in Cargo.lock are not
 # evidence that their code is present in the Windows artifact.
 targets = ["x86_64-pc-windows-msvc"]
