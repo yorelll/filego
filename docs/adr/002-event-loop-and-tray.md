@@ -43,7 +43,7 @@ Slint 1.18 provides `SystemTrayIcon`. Its Windows backend creates a message-only
 
 - Automated: lifecycle state/port tests; Windows build; version smoke.
 - Desktop: hidden startup, repeated show/hide, menu actions, clean Exit, and idle CPU.
-- Current status: Historical QuickFolder CI run `35562858225` and release-candidate workflow `35565687100` passed. The current FileGo rename, GNU/MSVC dual-toolchain policy, and explicit MSVC target-path changes require fresh remote MSVC CI and release-candidate workflow validation; real Windows desktop behavior also remains unverified.
+- Current status: FileGo rename, GNU/MSVC policy, and explicit MSVC target paths passed Windows CI run `35587340136` (head `c42f5728`). The renamed release-candidate workflow package paths still require a FileGo candidate run. Real Windows desktop behavior remains unverified.
 
 ## References
 

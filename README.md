@@ -4,7 +4,7 @@
 
 FileGo 是面向 Windows 的轻量级文件夹快捷启动工具。它常驻系统托盘；用户通过全局快捷键唤出搜索窗口，输入名称、路径、分类或标签，并用键盘快速打开已添加的文件夹。
 
-> 当前状态：`0.0.1` 开发中。历史 QuickFolder M00 已有通过的 Windows CI 与 release-candidate workflow 审计证据。当前 FileGo 更名、GNU/MSVC 双工具链规则及 MSVC target 路径变更仍待新的远程 MSVC CI 与 release-candidate workflow 验证；真实 Windows 桌面行为亦待验证。
+> 当前状态：`0.0.1` 开发中。FileGo 更名、GNU/MSVC 双工具链规则及显式 MSVC target 路径已由 Windows CI run `35587340136`（head `c42f5728`）验证。由于 release-candidate workflow 的包名和路径也已随更名调整，仍须针对 FileGo 候选 SHA 重新执行该 workflow；真实 Windows 桌面行为亦待验证。
 
 ## 产品目标
 

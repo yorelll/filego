@@ -48,7 +48,7 @@ Slint 1.18.0 requires Rust 1.92 and contains the `SystemTrayIcon` implementation
 
 - Automated: local GNU checks provide fast feedback; Windows MSVC CI must compile the UI and embedded desktop resources, run clippy/tests, and build Release with only selected features.
 - Desktop: inspect text/IME, 100–200% DPI, high contrast, and idle CPU on Windows 10/11.
-- Current status: Historical QuickFolder CI run `35562858225` and release-candidate workflow `35565687100` passed. The current FileGo rename, GNU/MSVC dual-toolchain policy, and explicit MSVC target-path changes require fresh remote MSVC CI and release-candidate workflow validation; real Windows desktop behavior also remains unverified. Local GNU validation is permitted only under the repository policy and cannot replace MSVC evidence.
+- Current status: FileGo rename, GNU/MSVC policy, and explicit MSVC target paths passed Windows CI run `35587340136` (head `c42f5728`). The renamed release-candidate workflow package paths still require a FileGo candidate run. Real Windows desktop behavior remains unverified. Local GNU validation is permitted only under the repository policy and cannot replace MSVC evidence.
 
 ## References
 
