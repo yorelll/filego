@@ -124,9 +124,10 @@
 
 | 修复 commit SHA | Workflow | run ID/URL | 结果 | 说明 |
 |---|---|---|---|---|
-| `03179339a5e01f48dc73e54ffe97dcfff8ca8f7c`（+ response doc `4c8a232`） | [Windows CI](https://github.com/yorelll/filego/actions/runs/35726133222) | `35726133222` | in_progress（监控中） | run head `4c8a23235b0d05a591008d9b9f801691487dbe1c`，包含修复 commit；本文档记录提交时刻状态，待 run 结束后由 implementation agent / reviewer 复核结论 |
+| `03179339a5e01f48dc73e54ffe97dcfff8ca8f7c`（修复代码；head `f501442` 的 run 覆盖） | [Windows CI](https://github.com/yorelll/filego/actions/runs/35726458488) | `35726458488` | success | run head `f5014427bc5bacdbe440c7e69c46c54a9b8ea5b5`（`0317933` + 两份 review/response 文档 `4c8a232`/`f501442`）；job `fmt, clippy, test, release, package` 全绿，测试 70 项（lib 69 + main 1）通过。修复代码全部包含于该 run。 |
+| （对照）初始提交时刻 run | [Windows CI](https://github.com/yorelll/filego/actions/runs/35726133222) | `35726133222` | cancelled | run head `4c8a23235b0d05a591008d9b9f801691487dbe1c`；因随后 `f501442` 推送被取消。`4c8a232..f501442` 仅改 response 文档，构建输入与 head 相同，无证据损失。权威结论以上方 `35726458488` 的 success 为准。 |
 
-> 说明：run 从 `D:\Program Files\GitHub CLI\gh.exe run list` 获取。文档记录的是提交时刻的 in_progress 状态；未确认 success 前不宣称完成、不作为发布依据（CLAUDE.md §3.4）。
+> 说明：run 从 `D:\Program Files\GitHub CLI\gh.exe run list` 获取。权威 run `35726458488` 对应实际 head `f501442` 且已确认 success；提交时刻的 in_progress run `35726133222` 因被后续推送取消，如实记录为 cancelled（构建输入与 head 相同）。未确认 success 前不宣称完成、不作为发布依据（CLAUDE.md §3.4）。
 
 ## 未解决事项与待人工验证项
 
@@ -136,8 +137,13 @@
 4. **`%LOCALAPPDATA%\FileGo` production 解析/首次目录创建/权限错误 UI 提示/恢复动作** 属 M03/M05 范围，未在本 slice 接入（location.rs 仍为注入 base_dir）。
 5. **无 GUI/托盘/IME/DPI 等多显示器桌面验收项** 超出本次持久化代码范围。
 
+## 未解决事项补充（r02 复审 M01B-R02-N001）
+
+r02 复审确认 F001–F005 全部 CLOSED，但新增 1 个 **Medium finding：M01B-R02-N001** —— `repair_from_backup` 未获取写锁，在双实例/后台线程模型下可与一次 `save` 竞争并把 main 静默回退到旧 backup 版本。r02 reviewer 已明确 **ACCEPTED（延期）**：
+
+- **后续任务 M01B-N001-followup**：`repair_from_backup` 通过 `pending_recovery` 检查后获取 `WriteLock`，并将 main/backup 的重读与判定纳入锁内；stale-lock 恢复一并处理；增加「repair 竞争 save（barrier 双线程）」回归测试。
+- 该任务**不阻断 M01 里程碑批准**，但在任何 **release-review 前必须关闭**（重新 CI + 复审）。同属「多 writer 完整互斥」下一 slice 事项。
+
 ## r02 复审请求
 
-已完整修复 `m01b-persistence-review-r01` 的 F001–F005（全部 ACCEPTED），新增/更新 16 项持久化回归测试并更新模块文档契约。请独立 reviewer 针对本修复 commit 进行 r02 复审：复核代码 diff、新增测试、GNU 验证记录与远程 MSVC CI run（推送后回填），确认 F001–F005 关闭后再评估里程碑/发布结论。
-
-请求原 reviewer（或另一名独立、未参与本实现与评审的 code-review agent）执行 r02 复审。
+已完整修复 `m01b-persistence-review-r01` 的 F001–F005（全部 ACCEPTED），新增/更新 16 项持久化回归测试并更新模块文档契约。该修复已由独立 reviewer 在 `m01b-persistence-review-r02.md` 复审并得 `APPROVED_FOR_MILESTONE`（F001–F005 全部 CLOSED；N001 为已接受延期的 Medium）。
