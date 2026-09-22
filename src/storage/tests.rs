@@ -4,9 +4,16 @@ use uuid::Uuid;
 use crate::{
     domain::{
         document::AppData,
-        folder::{Category, FolderColor, FolderEntry, MAX_FAVORITES, Tag},
+        folder::{
+            Category, FolderColor, FolderEntry, MAX_ALIAS_LEN, MAX_ALIASES_PER_FOLDER,
+            MAX_CATEGORY_NAME_LEN, MAX_FAVORITES, MAX_MANUAL_WEIGHT, MAX_NOTE_LEN,
+            MAX_TAG_NAME_LEN, MIN_MANUAL_WEIGHT, Tag,
+        },
         ids::{CategoryId, FolderId, TagId},
-        settings::{AppSettings, MAX_MAX_RESULTS, ThemePreference},
+        settings::{
+            AppSettings, MAX_EDIT_DISTANCE, MAX_MAX_RESULTS, MAX_WINDOW_WIDTH, MIN_MAX_RESULTS,
+            MIN_WINDOW_WIDTH, ThemePreference,
+        },
     },
     storage::{
         codec::{StorageErrorKind, decode, encode},
@@ -106,6 +113,238 @@ fn settings_outside_allowed_range_are_rejected() {
         ..AppSettings::default()
     };
     assert!(settings.validate().is_err());
+}
+
+#[test]
+fn settings_range_boundaries_are_enforced_inclusively() {
+    // max_results: MIN-1 rejected; MIN accepted; MAX accepted; MAX+1 rejected.
+    {
+        let below = AppSettings {
+            max_results: MIN_MAX_RESULTS - 1,
+            ..AppSettings::default()
+        };
+        assert!(below.validate().is_err(), "max_results below MIN must fail");
+        assert_eq!(
+            encode(&StoredDocumentV1::new(AppData {
+                settings: below,
+                ..fixture_document().data
+            }))
+            .expect_err("invalid settings document must fail")
+            .kind(),
+            StorageErrorKind::InvalidDocument
+        );
+
+        let at_min = AppSettings {
+            max_results: MIN_MAX_RESULTS,
+            ..AppSettings::default()
+        };
+        assert!(at_min.validate().is_ok());
+
+        let at_max = AppSettings {
+            max_results: MAX_MAX_RESULTS,
+            ..AppSettings::default()
+        };
+        assert!(at_max.validate().is_ok());
+
+        let above = AppSettings {
+            max_results: MAX_MAX_RESULTS + 1,
+            ..AppSettings::default()
+        };
+        assert!(above.validate().is_err());
+    }
+
+    // window_width: MIN-1 rejected; MIN accepted; MAX accepted; MAX+1 rejected.
+    {
+        let below = AppSettings {
+            window_width: MIN_WINDOW_WIDTH - 1,
+            ..AppSettings::default()
+        };
+        assert!(below.validate().is_err());
+
+        let at_min = AppSettings {
+            window_width: MIN_WINDOW_WIDTH,
+            ..AppSettings::default()
+        };
+        assert!(at_min.validate().is_ok());
+
+        let at_max = AppSettings {
+            window_width: MAX_WINDOW_WIDTH,
+            ..AppSettings::default()
+        };
+        assert!(at_max.validate().is_ok());
+
+        let above = AppSettings {
+            window_width: MAX_WINDOW_WIDTH + 1,
+            ..AppSettings::default()
+        };
+        assert!(above.validate().is_err());
+    }
+
+    // max_edit_distance: 0..=MAX accepted; MAX+1 rejected.
+    for distance in 0..=MAX_EDIT_DISTANCE {
+        let settings = AppSettings {
+            max_edit_distance: distance,
+            ..AppSettings::default()
+        };
+        assert!(
+            settings.validate().is_ok(),
+            "max_edit_distance {distance} within range must be accepted"
+        );
+    }
+    let above = AppSettings {
+        max_edit_distance: MAX_EDIT_DISTANCE + 1,
+        ..AppSettings::default()
+    };
+    assert!(above.validate().is_err());
+}
+
+#[test]
+fn folder_range_boundaries_are_enforced_inclusively() {
+    let base = fixture_document().data;
+
+    // manual_weight: MIN-1 rejected; MIN and MAX accepted; MAX+1 rejected.
+    let mut below = base.clone();
+    below.folders[0].manual_weight = MIN_MANUAL_WEIGHT - 1;
+    assert_eq!(
+        encode(&StoredDocumentV1::new(below))
+            .expect_err("weight below MIN must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+
+    let mut at_min = base.clone();
+    at_min.folders[0].manual_weight = MIN_MANUAL_WEIGHT;
+    encode(&StoredDocumentV1::new(at_min)).expect("weight at MIN must encode");
+
+    let mut at_max = base.clone();
+    at_max.folders[0].manual_weight = MAX_MANUAL_WEIGHT;
+    encode(&StoredDocumentV1::new(at_max)).expect("weight at MAX must encode");
+
+    let mut above = base.clone();
+    above.folders[0].manual_weight = MAX_MANUAL_WEIGHT + 1;
+    assert_eq!(
+        encode(&StoredDocumentV1::new(above))
+            .expect_err("weight above MAX must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+
+    // Exactly MAX_ALIASES_PER_FOLDER distinct aliases accepted; one more rejected.
+    let mut at_limit = base.clone();
+    at_limit.folders[0].aliases = (0..MAX_ALIASES_PER_FOLDER)
+        .map(|index| format!("alias-{index}"))
+        .collect();
+    encode(&StoredDocumentV1::new(at_limit.clone())).expect("exactly twenty aliases must encode");
+
+    at_limit.folders[0]
+        .aliases
+        .push(format!("alias-{}", MAX_ALIASES_PER_FOLDER));
+    assert_eq!(
+        encode(&StoredDocumentV1::new(at_limit))
+            .expect_err("more than twenty aliases must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+}
+
+#[test]
+fn empty_alias_after_trim_is_rejected() {
+    let mut document = fixture_document();
+    document.data.folders[0].aliases = vec!["   ".to_owned()];
+
+    assert_eq!(
+        encode(&document)
+            .expect_err("an alias that trims to empty must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+}
+
+#[test]
+fn too_long_alias_is_rejected() {
+    let mut document = fixture_document();
+    document.data.folders[0].aliases = vec!["x".repeat(MAX_ALIAS_LEN + 1)];
+
+    assert_eq!(
+        encode(&document)
+            .expect_err("an alias above the length limit must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+}
+
+#[test]
+fn too_long_note_is_rejected() {
+    let mut document = fixture_document();
+    document.data.folders[0].note = "x".repeat(MAX_NOTE_LEN + 1);
+
+    assert_eq!(
+        encode(&document)
+            .expect_err("a note above the length limit must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+}
+
+#[test]
+fn too_long_category_and_tag_names_are_rejected() {
+    let mut long_category = fixture_document();
+    long_category.data.categories[0].name = "x".repeat(MAX_CATEGORY_NAME_LEN + 1);
+    assert_eq!(
+        encode(&long_category)
+            .expect_err("a category name above the length limit must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+
+    let mut long_tag = fixture_document();
+    long_tag.data.tags[0].name = "x".repeat(MAX_TAG_NAME_LEN + 1);
+    assert_eq!(
+        encode(&long_tag)
+            .expect_err("a tag name above the length limit must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+}
+
+#[test]
+fn duplicate_category_and_tag_ids_are_rejected() {
+    let mut duplicate_category = fixture_document();
+    duplicate_category
+        .data
+        .categories
+        .push(duplicate_category.data.categories[0].clone());
+    assert_eq!(
+        encode(&duplicate_category)
+            .expect_err("a duplicated category ID must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+
+    let mut duplicate_tag = fixture_document();
+    duplicate_tag
+        .data
+        .tags
+        .push(duplicate_tag.data.tags[0].clone());
+    assert_eq!(
+        encode(&duplicate_tag)
+            .expect_err("a duplicated tag ID must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+}
+
+#[test]
+fn unknown_category_reference_is_rejected() {
+    let mut document = fixture_document();
+    document.data.folders[0].category_id = Some(CategoryId::from_uuid(Uuid::from_u128(998)));
+
+    assert_eq!(
+        encode(&document)
+            .expect_err("a folder referencing an unknown category must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
 }
 
 #[test]
