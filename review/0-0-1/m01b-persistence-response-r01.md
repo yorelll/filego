@@ -124,9 +124,9 @@
 
 | 修复 commit SHA | Workflow | run ID/URL | 结果 | 说明 |
 |---|---|---|---|---|
-| `03179339a5e01f48dc73e54ffe97dcfff8ca8f7c` | Windows CI（MSVC） | <推送后回填> | pending | 推送 feature/m00-foundation 后监控该修复 commit 的 run |
+| `03179339a5e01f48dc73e54ffe97dcfff8ca8f7c`（+ response doc `4c8a232`） | [Windows CI](https://github.com/yorelll/filego/actions/runs/35726133222) | `35726133222` | in_progress（监控中） | run head `4c8a23235b0d05a591008d9b9f801691487dbe1c`，包含修复 commit；本文档记录提交时刻状态，待 run 结束后由 implementation agent / reviewer 复核结论 |
 
-> 说明：修复 commit 推送后，CI run 的 ID/URL/结论栏位由 implementation agent 用 `D:\Program Files\GitHub CLI\gh.exe run list` 回填；未验证前标记「未验证」，不宣称完成，也不作为发布依据（CLAUDE.md §3.4）。
+> 说明：run 从 `D:\Program Files\GitHub CLI\gh.exe run list` 获取。文档记录的是提交时刻的 in_progress 状态；未确认 success 前不宣称完成、不作为发布依据（CLAUDE.md §3.4）。
 
 ## 未解决事项与待人工验证项
 
