@@ -1,6 +1,10 @@
 //! Platform-independent FileGo business rules.
-//!
-//! Folder records, settings, and search models are introduced in M01 and M02.
+
+pub mod document;
+pub mod error;
+pub mod folder;
+pub mod ids;
+pub mod settings;
 
 pub const PRODUCT_SCOPE: &str = "user-maintained folder shortcuts";
 

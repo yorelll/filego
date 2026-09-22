@@ -1,6 +1,13 @@
-//! Storage boundary.
+//! Versioned document codecs and future storage boundary.
 //!
-//! M01 will implement versioned JSON loading and atomic, recoverable writes.
+//! M01-A keeps this module free of filesystem side effects. M01-B will add
+//! atomic, recoverable persistence behind a separate repository boundary.
+
+pub mod codec;
+pub mod schema;
+
+#[cfg(test)]
+mod tests;
 
 pub trait SettingsRepository {
     type Error;
