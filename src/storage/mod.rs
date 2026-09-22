@@ -4,8 +4,13 @@
 //! atomic, recoverable persistence behind a separate repository boundary.
 
 pub mod codec;
+pub mod io;
+pub mod location;
+pub mod repository;
 pub mod schema;
 
+#[cfg(test)]
+mod repository_tests;
 #[cfg(test)]
 mod tests;
 

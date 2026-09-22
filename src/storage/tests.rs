@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -605,4 +607,71 @@ fn domain_does_not_expose_real_directory_delete_api() {
     assert!(!source.contains("remove_dir"));
     assert!(!source.contains("remove_file"));
     assert!(!source.contains("delete_directory"));
+}
+
+/// Recursive source scan of `src/storage/` and `src/domain/`: no described
+/// call may delete a real folder or the real stored document.
+///
+/// - `remove_dir` / `remove_dir_all` / `delete_directory` must not appear in
+///   any source under either tree — folder deletion is never represented at
+///   this layer.
+/// - `remove_file` is permitted only inside the `src/storage/io.rs` filesystem
+///   adapter (used purely for best-effort cleanup of the repository's own
+///   `data.json.tmp.*` siblings); it must not appear in `repository.rs`,
+///   anywhere else in `src/storage/`, or anywhere in `src/domain/`.
+#[test]
+fn source_under_storage_and_domain_has_no_fs_delete_api_calls() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    let mut pending = vec![source_root.join("storage"), source_root.join("domain")];
+    let mut seen_roots = std::collections::HashSet::new();
+    while let Some(dir) = pending.pop() {
+        if !seen_roots.insert(dir.clone()) {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).expect("src tree must be readable") {
+            let entry = entry.expect("directory entry must be readable");
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+    assert!(
+        sources.len() >= 2,
+        "src/storage and src/domain must contain sources"
+    );
+
+    for path in &sources {
+        // Only implementation sources are scanned; the test files themselves
+        // legitimately mention these tokens inside their assertions.
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name.ends_with("tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(path).expect("source must be readable");
+        for forbidden in ["remove_dir", "remove_dir_all", "delete_directory"] {
+            assert!(
+                !source.contains(forbidden),
+                "{forbidden} must not appear in {}",
+                path.display()
+            );
+        }
+        let is_io_adapter = path
+            .parent()
+            .is_some_and(|parent| parent.ends_with("storage"))
+            && path.file_name().is_some_and(|name| name == "io.rs");
+        if !is_io_adapter {
+            assert!(
+                !source.contains("remove_file"),
+                "remove_file must not appear outside the storage io.rs adapter: {}",
+                path.display()
+            );
+        }
+    }
 }
