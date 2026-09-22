@@ -8,7 +8,7 @@
 - **Implementation agent:** M01-A implementation agent（仅实现与补测；未参与 m01-storage-review-r01 评审）
 - **对应 review 文档:** [`m01-storage-review-r01.md`](m01-storage-review-r01.md)
 - **评审前 commit SHA（head）:** `b6ba57ec3efd5083fdf3ac01978a29ec69518dfc`
-- **修复/补测后 commit SHA:** `%（见下方 CI 证据）`
+- **修复/补测后 commit SHA:** `9adc92b4847789c21bd773c10022ce57f0a916b5`
 - **Response 日期:** 2026-09-21
 
 ## Summary
@@ -131,9 +131,7 @@
 
 | Commit / run | Workflow | Result |
 |---|---|---|
-| 修复后 commit SHA：`%（响应后在推送时回填 commit SHA 与 run ID，见下备忘）` | Windows CI | 进行中/见 run 列表 |
-
-> 备忘：推送后回填本行与下表为 `%` 占位；响应正文以推送后的实际 commit SHA 与 `gh run list` 结果为准。**response 文档随代码处于同一提交，SHA 在提交后即确定。**
+| 修复后 commit SHA：`9adc92b4847789c21bd773c10022ce57f0a916b5` | Windows CI | 见 `gh run list`（本响应随代码同一提交推送后触发） |
 
 ## 未解决事项与待人工验证项
 
