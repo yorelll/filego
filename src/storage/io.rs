@@ -1,30 +1,44 @@
 //! Filesystem access seam with a fault-injection variant for tests.
 //!
 //! `DocumentRepository` talks exclusively through `FileOps`, so every step of
-//! the persistence write path (temp create/write, sync, backup copy, atomic
-//! rename) can be faulted deterministically. This keeps the persistence logic
-//! unit-testable and lets the fault matrix prove that a failed step never
-//! deletes the original document or its backup.
+//! the persistence write path (temp create/write, sync, backup replace, atomic
+//! main rename, write-lock acquisition) can be faulted deterministically. This
+//! keeps the persistence logic unit-testable and lets the fault matrix prove
+//! that a failed step never deletes the original document or its backup.
 
-use std::{fs, io, path::Path};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 /// The disk-access contract the repository relies on. [`FsFileOps`] is the
 /// real implementation; `FaultyFileOps` (test-only, in the `fault` submodule)
 /// injects errors without shipping its machinery in release builds.
 ///
 /// Methods take `&mut self` so a fault-injecting test double can track its own
-/// mutable step counter without interior mutability.
-pub trait FileOps {
+/// mutable step counter without interior mutability. The trait is `Send` so a
+/// test double behind `Box<dyn FileOps>` can be moved across threads to
+/// simulate two processes contending on one base directory.
+pub trait FileOps: Send {
     /// Create (or truncate) the file, write `bytes`, flush, and sync to
     /// durable storage. On error no promise is made about the file's state,
     /// so callers treat a returned error as "temp file not ready".
     fn write_flush_sync(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()>;
-    /// Copy existing bytes of `from` into `to` (backup creation).
-    fn copy(&mut self, from: &Path, to: &Path) -> io::Result<()>;
-    /// Atomically replace `to` with `from` on the same volume (main replace).
+    /// Atomically replace `to` with `from` on the same volume (main replace /
+    /// backup replace). On Windows the rename replaces the destination.
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Read the file's bytes in full. `NotFound` errors are meaningful to
+    /// callers (used for "no file yet"); every other error is surfaced, never
+    /// swallowed, so an inaccessible file is never mistaken for a missing one.
     fn read(&mut self, path: &Path) -> io::Result<Vec<u8>>;
-    fn exists(&mut self, path: &Path) -> bool;
+    /// Whether `path` exists. Errors (access denied, an offline store, a
+    /// broken parent link for a reason other than absence) are returned, so an
+    /// inaccessible file is never treated as if it did not exist.
+    fn exists(&mut self, path: &Path) -> io::Result<bool>;
+    /// Create `path` exclusively; fails with `ErrorKind::AlreadyExists` when a
+    /// file already exists there (used for the per-directory write lock).
+    fn create_new(&mut self, path: &Path) -> io::Result<()>;
+    /// Delete the file at `path`, tolerating `NotFound` (best-effort cleanup).
     fn remove(&mut self, path: &Path) -> io::Result<()>;
     /// Best-effort fsync of `path`'s current bytes (used after the atomic
     /// replace, for directory consistency). The default implementation opens
@@ -49,10 +63,6 @@ impl FileOps for FsFileOps {
         Ok(())
     }
 
-    fn copy(&mut self, from: &Path, to: &Path) -> io::Result<()> {
-        fs::copy(from, to).map(|_| ())
-    }
-
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
     }
@@ -61,8 +71,18 @@ impl FileOps for FsFileOps {
         fs::read(path)
     }
 
-    fn exists(&mut self, path: &Path) -> bool {
-        path.exists()
+    fn exists(&mut self, path: &Path) -> io::Result<bool> {
+        fs::metadata(path).map(|_| true).or_else(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        })
+    }
+
+    fn create_new(&mut self, path: &Path) -> io::Result<()> {
+        fs::File::create_new(path).map(|_| ())
     }
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {
@@ -71,6 +91,37 @@ impl FileOps for FsFileOps {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Cross-process writer exclusion for one base directory.
+///
+/// 0.0.1 runs a single process, but the repository honours a per-directory
+/// write lock so two processes sharing a data directory can never interleave a
+/// check-then-rename (F003). The lock is a `data.json.lock` sibling created
+/// with exclusive (`File::create_new`) semantics, held for the whole
+/// revision-check → backup → rename → cleanup window, and removed on drop.
+///
+/// Stale-lock recovery (a crashed writer left the file behind) is a
+/// manual/next-slice concern for 0.0.1 and is deliberately NOT auto-expired:
+/// an automatic expiry would silently break the exclusion the lock provides.
+/// A leftover lock simply keeps later writers failing with
+/// `ConcurrentModification` until the user removes it.
+pub(crate) struct WriteLock {
+    path: PathBuf,
+}
+
+impl WriteLock {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        // Best-effort: a failed removal leaves a stale lock that a later
+        // writer resolves manually (see the stale-lock note above).
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -92,21 +143,27 @@ pub mod fault {
     };
 
     use super::{FileOps, FsFileOps};
+    use crate::storage::location::BACKUP_TEMP_FILE_PREFIX;
 
     /// The operation that is allowed to fail at an injected point.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FaultOp {
-        /// Step 0 of a save: open/create the temp file and write its bytes.
+        /// Step 0 of a save: acquire the per-directory write lock.
+        LockAcquire,
+        /// Main-temp write then sync (steps 1,2 of a save).
         TempWrite,
-        /// Step 1 of a save: flush and sync the temp file.
         TempSync,
-        /// Step 2 of a save: probe whether a main file exists (before backup).
+        /// Probe whether a main file exists (step 3 of a save).
         MainExists,
-        /// Step 3 of a save: copy the current main file to the backup path.
-        BackupCopy,
-        /// Step 4 of a save: atomic rename of the temp file onto the main path.
+        /// Backup-temp write then sync (steps 4,5 of a save).
+        BackupWrite,
+        BackupSync,
+        /// Rename of the backup temp onto the live backup (step 6 of a save).
+        BackupReplace,
+        /// Atomic rename of the main temp onto the main path (step 7 of a
+        /// save; step 4 when no main exists and the backup steps are skipped).
         ReplaceRename,
-        /// Later steps of a save: best-effort removal of a stale temp sibling.
+        /// Best-effort removal of a stale main-temp sibling during cleanup.
         StaleTempRemove,
     }
 
@@ -159,56 +216,86 @@ pub mod fault {
                 .iter()
                 .any(|point| point.step == current && point.op == op)
         }
+
+        /// Whether `path` is a backup temp (`data.json.bak.tmp.*`); used to
+        /// route the write/sync/rename faults to the backup or the main temp.
+        fn is_backup_temp(path: &Path) -> bool {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(BACKUP_TEMP_FILE_PREFIX))
+        }
     }
 
     impl FileOps for FaultyFileOps {
         fn write_flush_sync(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-            // Two injectable sub-steps: temp write then temp sync. Both tick
+            // Two injectable sub-steps per call: write then sync. Both tick
             // unconditionally (no short-circuit) so the counter stays in step
             // with the documented save sequence.
-            let fail_write = self.tick(FaultOp::TempWrite);
-            let fail_sync = self.tick(FaultOp::TempSync);
+            let is_backup = Self::is_backup_temp(path);
+            let (write_op, sync_op) = if is_backup {
+                (FaultOp::BackupWrite, FaultOp::BackupSync)
+            } else {
+                (FaultOp::TempWrite, FaultOp::TempSync)
+            };
+            let fail_write = self.tick(write_op);
+            let fail_sync = self.tick(sync_op);
             if fail_sync {
                 // Pretend the sync failed without touching the disk at all.
-                return Err(io::Error::other("injected fault: temp sync"));
+                let label = if is_backup {
+                    "backup temp sync"
+                } else {
+                    "temp sync"
+                };
+                return Err(io::Error::other(format!("injected fault: {label}")));
             }
             if fail_write {
-                // Simulate a partial write: a real temp file with truncated
+                // Simulate a partial write: a real file with truncated
                 // content is left behind, then the write reports failure.
                 if let Ok(mut file) = fs::File::create(path) {
                     let _ = file.write_all(&bytes[..bytes.len() / 2]);
                     let _ = file.flush();
                 }
-                return Err(io::Error::other("injected fault: temp write"));
+                let label = if is_backup {
+                    "backup temp write"
+                } else {
+                    "temp write"
+                };
+                return Err(io::Error::other(format!("injected fault: {label}")));
             }
             FsFileOps.write_flush_sync(path, bytes)
         }
 
-        fn copy(&mut self, from: &Path, to: &Path) -> io::Result<()> {
-            if self.tick(FaultOp::BackupCopy) {
-                return Err(io::Error::other("injected fault: copy"));
-            }
-            FsFileOps.copy(from, to)
-        }
-
         fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
-            if self.tick(FaultOp::ReplaceRename) {
+            let op = if Self::is_backup_temp(from) {
+                FaultOp::BackupReplace
+            } else {
+                FaultOp::ReplaceRename
+            };
+            if self.tick(op) {
                 return Err(io::Error::other("injected fault: rename"));
             }
             FsFileOps.rename(from, to)
         }
 
         fn read(&mut self, path: &Path) -> io::Result<Vec<u8>> {
-            // Read faulting is not part of the save fault matrix; load fault
-            // tests drive corruption with real file content instead.
+            // Read faulting is not part of the save fault matrix; load and
+            // revision-guard I/O-classification tests drive those errors with
+            // a dedicated double in `repository_tests`, not this counter.
             FsFileOps.read(path)
         }
 
-        fn exists(&mut self, path: &Path) -> bool {
+        fn exists(&mut self, path: &Path) -> io::Result<bool> {
             if self.tick(FaultOp::MainExists) {
-                return false;
+                return Ok(false);
             }
             FsFileOps.exists(path)
+        }
+
+        fn create_new(&mut self, path: &Path) -> io::Result<()> {
+            if self.tick(FaultOp::LockAcquire) {
+                return Err(io::Error::other("injected fault: lock acquire"));
+            }
+            FsFileOps.create_new(path)
         }
 
         fn remove(&mut self, path: &Path) -> io::Result<()> {
