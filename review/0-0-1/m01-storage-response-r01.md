@@ -120,7 +120,7 @@
 |---|---|---|
 | fmt | `cargo fmt --all -- --check` | PASS |
 | clippy | `cargo clippy --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu -- -D warnings` | PASS（0 警告） |
-| test | `cargo test --workspace --all-features --locked --target x86_64-pc-windows-gnu` | PASS（storage 28 + main 1 = 29 通过，0 失败；bin/doc 0） |
+| test | `cargo test --workspace --all-features --locked --target x86_64-pc-windows-gnu` | PASS（storage 25 + main 1 = 26 通过，0 失败；bin/doc 0） |
 | release | `cargo build --workspace --all-features --release --locked --target x86_64-pc-windows-gnu` | PASS |
 
 环境备注：默认 GNU linker `x86_64-w64-mingw32-gcc` 出现已知本地工具链漂移 `cannot find -lshlwapi`，已按既定 Workaround 仅在本命令环境临时设置 `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C linker=D:\mingw64\bin\x86_64-w64-mingw32-gcc.exe"` 与 `PATH` 前置 `D:\mingw64\bin`。该 Workaround **未**写入任何仓库文件/CI/workflow，non-committed；不构成 MSVC 证据。
