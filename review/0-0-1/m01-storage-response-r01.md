@@ -108,7 +108,7 @@
 
 - 修改文件：仅 `src/storage/tests.rs`（+241 / −2；含 rustfmt 对 import 重排）。`src/domain/settings.rs`、`src/domain/folder.rs`、`src/domain/document.rs`、`src/domain/error.rs`、`src/storage/codec.rs`、`src/storage/schema.rs`、`Cargo.toml`、`Cargo.lock` 均未改动。
 - 新增测试 8 个（均位于 `src/storage/tests.rs`）：`settings_range_boundaries_are_enforced_inclusively`、`folder_range_boundaries_are_enforced_inclusively`、`empty_alias_after_trim_is_rejected`、`too_long_alias_is_rejected`、`too_long_note_is_rejected`、`too_long_category_and_tag_names_are_rejected`、`duplicate_category_and_tag_ids_are_rejected`、`unknown_category_reference_is_rejected`。
-- 测试总数从 20 → 28（storage 模块）。
+- 测试总数从 17 → 25（storage 模块，新增 8）。
 
 ## 验证方式与结果
 
