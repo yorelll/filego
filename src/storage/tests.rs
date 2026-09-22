@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::{
     domain::{
         document::AppData,
-        folder::{Category, FolderColor, FolderEntry, Tag},
+        folder::{Category, FolderColor, FolderEntry, MAX_FAVORITES, Tag},
         ids::{CategoryId, FolderId, TagId},
         settings::{AppSettings, MAX_MAX_RESULTS, ThemePreference},
     },
@@ -39,6 +39,7 @@ fn fixture_document() -> StoredDocumentV1 {
             path: format!(r"{SENSITIVE_PATH}\非常长的目录\emoji-📁"),
             enabled: true,
             favorite: true,
+            pinned: true,
             manual_weight: 25,
             category_id: Some(category_id),
             tag_ids: vec![first_tag_id, second_tag_id, first_tag_id],
@@ -169,6 +170,69 @@ fn favorite_limit_is_enforced() {
     assert_eq!(
         encode(&document)
             .expect_err("more than five favorites must fail")
+            .kind(),
+        StorageErrorKind::InvalidDocument
+    );
+}
+
+#[test]
+fn pinned_and_favorite_are_independent_persisted_fields() {
+    let document = fixture_document();
+    let encoded = encode(&document).expect("fixture must encode");
+    let decoded = decode(&encoded).expect("encoded fixture must decode");
+    let folder = &decoded.data.folders[0];
+    assert!(folder.favorite);
+    assert!(folder.pinned);
+
+    let mut folder = fixture_document().data.folders[0].clone();
+    folder.pinned = true;
+    folder.favorite = false;
+    let mut document = fixture_document();
+    document.data.folders[0] = folder;
+    let decoded =
+        decode(&encode(&document).expect("document must encode")).expect("document must decode");
+    assert!(decoded.data.folders[0].pinned);
+    assert!(!decoded.data.folders[0].favorite);
+
+    let mut folder = fixture_document().data.folders[0].clone();
+    folder.pinned = false;
+    folder.favorite = true;
+    let mut document = fixture_document();
+    document.data.folders[0] = folder;
+    let decoded =
+        decode(&encode(&document).expect("document must encode")).expect("document must decode");
+    assert!(!decoded.data.folders[0].pinned);
+    assert!(decoded.data.folders[0].favorite);
+
+    let mut many_pinned = fixture_document();
+    let original = many_pinned.data.folders[0].clone();
+    for index in 1..=10 {
+        let mut additional = original.clone();
+        additional.id = FolderId::from_uuid(Uuid::from_u128(200 + index));
+        additional.pinned = true;
+        additional.favorite = false;
+        many_pinned.data.folders.push(additional);
+    }
+    let favorite_count = many_pinned
+        .data
+        .folders
+        .iter()
+        .filter(|folder| folder.favorite)
+        .count();
+    assert!(favorite_count <= MAX_FAVORITES);
+    encode(&many_pinned).expect("uncapped pinned folders must remain valid");
+
+    let mut six_favorites = fixture_document();
+    let original = six_favorites.data.folders[0].clone();
+    for index in 1..=5 {
+        let mut additional = original.clone();
+        additional.id = FolderId::from_uuid(Uuid::from_u128(300 + index));
+        additional.favorite = true;
+        six_favorites.data.folders.push(additional);
+    }
+    assert_eq!(
+        encode(&six_favorites)
+            .expect_err("six favorites must still be rejected")
             .kind(),
         StorageErrorKind::InvalidDocument
     );

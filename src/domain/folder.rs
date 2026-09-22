@@ -62,6 +62,7 @@ pub struct FolderEntry {
     pub path: String,
     pub enabled: bool,
     pub favorite: bool,
+    pub pinned: bool,
     pub manual_weight: i16,
     pub category_id: Option<CategoryId>,
     pub tag_ids: Vec<TagId>,
