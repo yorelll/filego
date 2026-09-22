@@ -25,7 +25,7 @@ use crate::{
     },
     storage::{
         codec as codec_mod,
-        location::{DocumentPaths, backup_path, main_path, temp_path},
+        location::{DocumentPaths, backup_document_path, main_document_path, temp_document_path},
         repository::{DocumentRepository, LoadOutcome, RepositoryError},
         schema::StoredDocumentV1,
     },
@@ -132,9 +132,9 @@ fn paths_resolve_same_dir_with_expected_names() {
     let base = TempDir::new().expect("temp dir");
     let paths = real_paths(&base);
 
-    assert_eq!(paths.main(), main_path(base.path()));
-    assert_eq!(paths.backup(), backup_path(base.path()));
-    assert_eq!(paths.temp("t1"), temp_path(base.path(), "t1"));
+    assert_eq!(paths.main(), main_document_path(base.path()));
+    assert_eq!(paths.backup(), backup_document_path(base.path()));
+    assert_eq!(paths.temp("t1"), temp_document_path(base.path(), "t1"));
 
     assert_eq!(
         paths.main().file_name().unwrap().to_str().unwrap(),
@@ -174,16 +174,16 @@ fn save_success_creates_main_and_temp_is_cleaned() {
     repo.save(&document).expect("first save must succeed");
 
     assert!(
-        main_path(base.path()).exists(),
+        main_document_path(base.path()).exists(),
         "main must exist after save"
     );
     assert!(
-        !backup_path(base.path()).exists(),
+        !backup_document_path(base.path()).exists(),
         "no backup before a second save"
     );
 
-    let decoded =
-        codec_mod::decode(&read_raw(&main_path(base.path()))).expect("saved main must decode");
+    let decoded = codec_mod::decode(&read_raw(&main_document_path(base.path())))
+        .expect("saved main must decode");
     assert_eq!(decoded, document);
 }
 
@@ -192,7 +192,8 @@ fn save_round_trip_preserves_data_and_unicode() {
     let base = TempDir::new().expect("temp dir");
     let mut repo = real_repo(&base);
     repo.save(&fixture_document()).expect("save must succeed");
-    let decoded = codec_mod::decode(&read_raw(&main_path(base.path()))).expect("main must decode");
+    let decoded =
+        codec_mod::decode(&read_raw(&main_document_path(base.path()))).expect("main must decode");
     assert_eq!(decoded.data.folders[0].display_name, "项目 文档 🗂️");
     assert!(decoded.data.folders[0].path.contains("机密 文件夹"));
 }
@@ -206,13 +207,16 @@ fn backup_from_previous_save_holds_first_revision_bytes() {
     // Seeding with a raw file matching what save would have produced proves the
     // backup carries the exact previous committed bytes.
     let first_bytes = codec_mod::encode(&first).expect("fixture must encode");
-    write_raw(&main_path(base.path()), &first_bytes);
+    write_raw(&main_document_path(base.path()), &first_bytes);
 
     let second = fixture_with_revision(4);
     repo.save(&second).expect("second save must succeed");
 
-    assert!(backup_path(base.path()).exists(), "backup must exist");
-    let backup_bytes = read_raw(&backup_path(base.path()));
+    assert!(
+        backup_document_path(base.path()).exists(),
+        "backup must exist"
+    );
+    let backup_bytes = read_raw(&backup_document_path(base.path()));
     assert_eq!(backup_bytes, first_bytes, "backup must equal previous main");
     let backup_decoded = codec_mod::decode(&backup_bytes).expect("backup must decode");
     assert_eq!(backup_decoded.data.revision, 2);
@@ -257,9 +261,9 @@ fn load_corrupt_main_with_valid_backup_recovers_and_preserves_main() {
     repo.save(&document).expect("seed save must succeed");
 
     // Seed a backup holding the committed bytes, then corrupt the main file.
-    let committed = read_raw(&main_path(base.path()));
-    write_raw(&backup_path(base.path()), &committed);
-    write_raw(&main_path(base.path()), &corrupt_bytes());
+    let committed = read_raw(&main_document_path(base.path()));
+    write_raw(&backup_document_path(base.path()), &committed);
+    write_raw(&main_document_path(base.path()), &corrupt_bytes());
 
     let mut repo = real_repo(&base);
     let outcome = repo.load().expect("recovery must succeed");
@@ -272,7 +276,7 @@ fn load_corrupt_main_with_valid_backup_recovers_and_preserves_main() {
         }
         other => panic!("expected Recovered, got {other:?}"),
     }
-    let main_after = read_raw(&main_path(base.path()));
+    let main_after = read_raw(&main_document_path(base.path()));
     assert_eq!(
         main_after,
         corrupt_bytes(),
@@ -286,28 +290,28 @@ fn load_corrupt_main_no_or_invalid_backup_returns_corrupt_data_and_preserves_mai
     let base = TempDir::new().expect("temp dir");
 
     // No backup at all.
-    write_raw(&main_path(base.path()), &corrupt_bytes());
+    write_raw(&main_document_path(base.path()), &corrupt_bytes());
     let mut repo = real_repo(&base);
     assert_eq!(
         repo.load().expect_err("no backup must fail"),
         RepositoryError::CorruptData
     );
     assert_eq!(
-        read_raw(&main_path(base.path())),
+        read_raw(&main_document_path(base.path())),
         corrupt_bytes(),
         "corrupt main must be preserved when no backup exists"
     );
     drop(repo);
 
     // Backup exists but is invalid too.
-    write_raw(&backup_path(base.path()), b"{\"not json\"");
+    write_raw(&backup_document_path(base.path()), b"{\"not json\"");
     let mut repo = real_repo(&base);
     assert_eq!(
         repo.load().expect_err("invalid backup must fail"),
         RepositoryError::CorruptData
     );
     assert_eq!(
-        read_raw(&main_path(base.path())),
+        read_raw(&main_document_path(base.path())),
         corrupt_bytes(),
         "corrupt main must still be preserved"
     );
@@ -319,7 +323,7 @@ fn load_main_missing_with_valid_backup_recovers_from_backup() {
     // No main file at all, only a valid backup.
     let document = fixture_with_revision(5);
     write_raw(
-        &backup_path(base.path()),
+        &backup_document_path(base.path()),
         &codec_mod::encode(&document).expect("encode"),
     );
     let mut repo = real_repo(&base);
@@ -359,9 +363,12 @@ fn save_fault_temp_write_error_leaves_no_main_or_backup() {
             .expect_err("temp write fail must error"),
         RepositoryError::Io
     );
-    assert!(!main_path(base.path()).exists(), "main must not be created");
     assert!(
-        !backup_path(base.path()).exists(),
+        !main_document_path(base.path()).exists(),
+        "main must not be created"
+    );
+    assert!(
+        !backup_document_path(base.path()).exists(),
         "backup must not be created"
     );
     // A partial temp file may be left — that is safe and cleaned on next save.
@@ -374,7 +381,7 @@ fn save_fault_temp_sync_error_returns_and_preserves_previous_main() {
 
     let mut repo = real_repo(&base);
     repo.save(&first).expect("seed save must succeed");
-    let previous_main = read_raw(&main_path(base.path()));
+    let previous_main = read_raw(&main_document_path(base.path()));
 
     let second = fixture_with_revision(2);
     let mut repo = faulted_repo(
@@ -389,12 +396,12 @@ fn save_fault_temp_sync_error_returns_and_preserves_previous_main() {
         RepositoryError::Io
     );
     assert_eq!(
-        read_raw(&main_path(base.path())),
+        read_raw(&main_document_path(base.path())),
         previous_main,
         "original main must survive a failed sync"
     );
     assert!(
-        !backup_path(base.path()).exists(),
+        !backup_document_path(base.path()).exists(),
         "no backup should be written on fail"
     );
 }
@@ -407,9 +414,9 @@ fn save_fault_backup_copy_error_preserves_main_and_backup() {
         let mut repo = real_repo(&base);
         repo.save(&first).expect("seed save must succeed");
     }
-    let previous_main = read_raw(&main_path(base.path()));
+    let previous_main = read_raw(&main_document_path(base.path()));
     // Seed a backup that exists already.
-    write_raw(&backup_path(base.path()), b"{\"older\"}");
+    write_raw(&backup_document_path(base.path()), b"{\"older\"}");
 
     let second = fixture_with_revision(2);
     let mut repo = faulted_repo(
@@ -424,12 +431,12 @@ fn save_fault_backup_copy_error_preserves_main_and_backup() {
         RepositoryError::Io
     );
     assert_eq!(
-        read_raw(&main_path(base.path())),
+        read_raw(&main_document_path(base.path())),
         previous_main,
         "main must be untouched on backup-copy failure"
     );
     assert_eq!(
-        read_raw(&backup_path(base.path())),
+        read_raw(&backup_document_path(base.path())),
         b"{\"older\"}",
         "pre-existing backup must be untouched"
     );
@@ -443,7 +450,7 @@ fn save_fault_rename_error_preserves_main_and_backup() {
         let mut repo = real_repo(&base);
         repo.save(&first).expect("seed save must succeed");
     }
-    let previous_main = read_raw(&main_path(base.path()));
+    let previous_main = read_raw(&main_document_path(base.path()));
 
     let second = fixture_with_revision(2);
     let mut repo = faulted_repo(
@@ -458,12 +465,12 @@ fn save_fault_rename_error_preserves_main_and_backup() {
         RepositoryError::Io
     );
     assert_eq!(
-        read_raw(&main_path(base.path())),
+        read_raw(&main_document_path(base.path())),
         previous_main,
         "main must be untouched on rename failure"
     );
     assert!(
-        backup_path(base.path()).exists(),
+        backup_document_path(base.path()).exists(),
         "backup from the first save must remain readable"
     );
 }
@@ -480,8 +487,11 @@ fn save_invalid_data_returns_invalid_data_without_touching_disk() {
             .expect_err("invalid revision must be rejected"),
         RepositoryError::InvalidData
     );
-    assert!(!main_path(base.path()).exists(), "nothing may be written");
-    assert!(!backup_path(base.path()).exists());
+    assert!(
+        !main_document_path(base.path()).exists(),
+        "nothing may be written"
+    );
+    assert!(!backup_document_path(base.path()).exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -507,7 +517,7 @@ fn revision_guard_rejects_stale_expected_and_accepts_matching() {
             .expect_err("stale expected must be rejected"),
         RepositoryError::ConcurrentModification
     );
-    let main_bytes = read_raw(&main_path(base.path()));
+    let main_bytes = read_raw(&main_document_path(base.path()));
     let decoded = codec_mod::decode(&main_bytes).expect("main must still be previous state");
     assert_eq!(decoded.data.revision, 10, "main must not be overwritten");
 
@@ -516,8 +526,52 @@ fn revision_guard_rejects_stale_expected_and_accepts_matching() {
     repo.save_if_current(&next, 10)
         .expect("matching guard must pass");
     assert_eq!(repo.latest_loaded_revision(), Some(11));
-    let decoded = codec_mod::decode(&read_raw(&main_path(base.path()))).expect("main must decode");
+    let decoded =
+        codec_mod::decode(&read_raw(&main_document_path(base.path()))).expect("main must decode");
     assert_eq!(decoded.data.revision, 11);
+}
+
+/// The guard must detect an EXTERNAL writer (a different repository instance /
+/// process wrote a newer revision to disk), not just the stale in-memory
+/// baseline.
+#[test]
+fn revision_guard_detects_external_concurrent_writer_on_disk() {
+    let base = TempDir::new().expect("temp dir");
+
+    // Instance A writes v1.
+    let v1 = fixture_with_revision(1);
+    {
+        let mut repo_a = real_repo(&base);
+        repo_a.save(&v1).expect("seed v1 must succeed");
+    }
+
+    // Instance B loads v1, then an external writer persists v2 to disk.
+    let mut repo_b = real_repo(&base);
+    repo_b.load().expect("v1 must load");
+    let v2 = fixture_with_revision(2);
+    {
+        let mut external = real_repo(&base);
+        external.save(&v2).expect("external v2 write must succeed");
+    }
+
+    // B tries to save its v2 based on the stale expected revision 1.
+    assert_eq!(
+        repo_b
+            .save_if_current(&v2, 1)
+            .expect_err("stale expected must be rejected"),
+        RepositoryError::ConcurrentModification
+    );
+    // The on-disk main must still be the external writer's v2 — not overwritten.
+    let decoded =
+        codec_mod::decode(&read_raw(&main_document_path(base.path()))).expect("main must decode");
+    assert_eq!(decoded.data.revision, 2, "external state must be preserved");
+
+    // With the correct expected revision 2 the save goes through.
+    let v3 = fixture_with_revision(3);
+    repo_b
+        .save_if_current(&v3, 2)
+        .expect("matching on-disk revision must pass");
+    assert_eq!(repo_b.latest_loaded_revision(), Some(3));
 }
 
 #[test]
@@ -529,7 +583,8 @@ fn revision_guard_is_not_enforced_before_any_load_or_save() {
     // No baseline yet: save_if_current proceeds regardless of expected value.
     repo.save_if_current(&document, 999)
         .expect("no baseline means no guard");
-    let decoded = codec_mod::decode(&read_raw(&main_path(base.path()))).expect("main must decode");
+    let decoded =
+        codec_mod::decode(&read_raw(&main_document_path(base.path()))).expect("main must decode");
     assert_eq!(decoded.data.revision, 3);
 }
 
@@ -586,8 +641,8 @@ fn stale_temp_siblings_are_removed_after_successful_save() {
     let base = TempDir::new().expect("temp dir");
     let mut repo = real_repo(&base);
 
-    let stale_one = temp_path(base.path(), "stale-1");
-    let stale_two = temp_path(base.path(), "stale-2");
+    let stale_one = temp_document_path(base.path(), "stale-1");
+    let stale_two = temp_document_path(base.path(), "stale-2");
     write_raw(&stale_one, b"leftover");
     write_raw(&stale_two, b"leftover");
 
@@ -595,7 +650,7 @@ fn stale_temp_siblings_are_removed_after_successful_save() {
 
     assert!(!stale_one.exists(), "stale temp must be cleaned");
     assert!(!stale_two.exists(), "stale temp must be cleaned");
-    assert!(main_path(base.path()).exists(), "main must exist");
+    assert!(main_document_path(base.path()).exists(), "main must exist");
     // The current save temp must not remain behind either (renamed to main).
     let leftovers = std::fs::read_dir(base.path())
         .expect("dir readable")

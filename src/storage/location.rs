@@ -19,12 +19,12 @@ pub const BACKUP_FILE_NAME: &str = "data.json.bak";
 pub const TEMP_FILE_PREFIX: &str = "data.json.tmp.";
 
 /// `base_dir/data.json`
-pub fn main_path(base_dir: &Path) -> PathBuf {
+pub fn main_document_path(base_dir: &Path) -> PathBuf {
     base_dir.join(MAIN_FILE_NAME)
 }
 
 /// `base_dir/data.json.bak`
-pub fn backup_path(base_dir: &Path) -> PathBuf {
+pub fn backup_document_path(base_dir: &Path) -> PathBuf {
     base_dir.join(BACKUP_FILE_NAME)
 }
 
@@ -32,7 +32,7 @@ pub fn backup_path(base_dir: &Path) -> PathBuf {
 /// or process-id string). A unique token keeps concurrent/overlapping saves
 /// from stepping on the same temp name and lets stale-temp cleanup tell old
 /// attempts apart.
-pub fn temp_path(base_dir: &Path, token: &str) -> PathBuf {
+pub fn temp_document_path(base_dir: &Path, token: &str) -> PathBuf {
     base_dir.join(format!("{TEMP_FILE_PREFIX}{token}"))
 }
 
@@ -55,14 +55,14 @@ impl DocumentPaths {
     }
 
     pub fn main(&self) -> PathBuf {
-        main_path(&self.base_dir)
+        main_document_path(&self.base_dir)
     }
 
     pub fn backup(&self) -> PathBuf {
-        backup_path(&self.base_dir)
+        backup_document_path(&self.base_dir)
     }
 
     pub fn temp(&self, token: &str) -> PathBuf {
-        temp_path(&self.base_dir, token)
+        temp_document_path(&self.base_dir, token)
     }
 }
