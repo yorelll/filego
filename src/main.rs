@@ -395,6 +395,26 @@ impl MainWindowController {
                 .map(|row| row.inaccessible)
                 .collect::<Vec<bool>>(),
         )));
+        // M05.5: per-row pin/enable state for the context-menu labels. Search
+        // only shows enabled records (the repository filters on `enabled`), so
+        // `rows-enabled` is `true` for every row; the disabled state is only
+        // ever reached from the settings page. The pinned flag comes from the
+        // resolved SearchEntry (rows are always built from `self.resolved`, so
+        // the look-up succeeds for every row).
+        let (rows_pinned, rows_enabled): (Vec<bool>, Vec<bool>) = rows
+            .iter()
+            .map(|row| {
+                let pinned = self
+                    .resolved
+                    .iter()
+                    .find(|entry| entry.searchable.id.as_uuid() == row.entry_id)
+                    .map(|entry| entry.searchable.pinned)
+                    .unwrap_or(false);
+                (pinned, true)
+            })
+            .unzip();
+        window.set_rows_pinned(ModelRc::new(VecModel::from(rows_pinned)));
+        window.set_rows_enabled(ModelRc::new(VecModel::from(rows_enabled)));
 
         // Empty/error state: map NoResultReason to the i18n title + body.
         let show_empty = state.no_result_reason.is_some() || state.failure.is_some();
@@ -616,22 +636,14 @@ impl SettingsWindowController {
         window.set_rows_tags(string_model(
             view.rows.iter().flat_map(|r| r.tag_names.clone()),
         ));
-        let (enabled, pinned, favorite, ids): (Vec<bool>, Vec<bool>, Vec<bool>, Vec<i32>) = view
+        let (enabled, pinned, favorite): (Vec<bool>, Vec<bool>, Vec<bool>) = view
             .rows
             .iter()
-            .map(|r| {
-                (
-                    r.enabled,
-                    r.pinned,
-                    r.favorite,
-                    r.id.as_uuid().as_u128() as i32,
-                )
-            })
+            .map(|r| (r.enabled, r.pinned, r.favorite))
             .collect();
         window.set_rows_enabled(ModelRc::new(VecModel::from(enabled)));
         window.set_rows_pinned(ModelRc::new(VecModel::from(pinned)));
         window.set_rows_favorite(ModelRc::new(VecModel::from(favorite)));
-        window.set_rows_ids(ModelRc::new(VecModel::from(ids)));
 
         window.set_categories_count(view.categories.len() as i32);
         window.set_categories_name(string_model(view.categories.iter().map(|c| c.name.clone())));
@@ -678,28 +690,98 @@ impl SettingsWindowController {
             window.set_pending_remove_seconds(0);
         }
 
+        // M05 review M1: the persisted one-level-import enablement (default OFF).
+        window.set_one_level_import_on(view.one_level_import_setting);
+
+        // M05 review M2: folder-list filter + sort selector state.
+        window.set_filter_category_model(string_model(
+            std::iter::once(Msg::FilterStatusAll.tr(locale))
+                .chain(std::iter::once(Msg::Uncategorized.tr(locale)))
+                .chain(view.categories.iter().map(|c| c.name.clone())),
+        ));
+        let category_index = match view.filter.category {
+            None => 0,
+            Some(id) if id == filego::domain::ids::CategoryId::from_uuid(uuid::Uuid::nil()) => 1,
+            Some(id) => {
+                2 + view
+                    .categories
+                    .iter()
+                    .position(|c| c.id == id)
+                    .map_or(usize::MAX, |p| p)
+            }
+        };
+        window.set_filter_category_index(category_index.min(1 + view.categories.len()) as i32);
+        window.set_filter_status_index(match view.filter.enabled {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        });
+        window.set_sort_index(match view.sort {
+            filego::presentation::management::FolderSort::Name => 0,
+            filego::presentation::management::FolderSort::RecentlyUsed => 1,
+            filego::presentation::management::FolderSort::AddedTime => 2,
+        });
+
         // Draft dialog.
         match &view.add_flow {
             filego::presentation::manager::AddFlowView::Draft(draft) => {
                 window.set_draft_visible(true);
+                window.set_batch_visible(false);
                 window.set_draft_name(draft.display_name.clone().into());
                 window.set_draft_path(draft.path.clone().into());
                 window.set_draft_note(draft.note.clone().into());
+                window.set_draft_weight(i32::from(draft.manual_weight));
                 let title = if draft.id.is_some() {
                     Msg::EditDialogTitle
                 } else {
                     Msg::AddDialogTitle
                 };
                 window.set_draft_title(title.tr(locale).into());
+                let duplicate = draft.duplicate_existing.is_some();
                 let error = if !draft.valid {
                     Msg::NoticeInvalidPath.tr(locale)
-                } else if let Some(existing) = &draft.duplicate_existing {
-                    format!("{}: {existing}", Msg::NoticeDuplicateBlocked.tr(locale))
+                } else if duplicate {
+                    format!(
+                        "{}: {}",
+                        Msg::NoticeDuplicateBlocked.tr(locale),
+                        draft.duplicate_existing.as_deref().unwrap_or_default()
+                    )
                 } else {
                     String::new()
                 };
                 window.set_draft_error(error.into());
-                window.set_draft_color(slint::Color::from_rgb_u8(0x25, 0x63, 0xEB));
+                window.set_draft_duplicate(duplicate);
+                window.set_draft_unsaved(draft.unsaved);
+                window.set_draft_enabled(draft.enabled);
+                // The draft color (editable): resolve the stored color via the
+                // palette, mirroring `cycle_draft_color` so the swatch matches.
+                window.set_draft_color(draft_color_to_slint(draft));
+                // Category select (index 0 = uncategorized, 1+k = category k).
+                window.set_draft_categories_model(string_model(
+                    std::iter::once(String::new())
+                        .chain(view.categories.iter().map(|c| c.name.clone())),
+                ));
+                let category_index = match draft.category_id {
+                    None => 0,
+                    Some(id) => {
+                        1 + view
+                            .categories
+                            .iter()
+                            .position(|c| c.id == id)
+                            .map_or(0, |p| p + 1)
+                    }
+                };
+                window.set_draft_category_index(
+                    (category_index).clamp(0, view.categories.len()) as i32
+                );
+                // Tag multi-select (names + on/off state parallel arrays).
+                window.set_draft_tags_model(string_model(view.tags.iter().map(|t| t.name.clone())));
+                window.set_draft_tags_state(ModelRc::new(VecModel::from(
+                    view.tags
+                        .iter()
+                        .map(|t| draft.tag_ids.contains(&t.id))
+                        .collect::<Vec<bool>>(),
+                )));
             }
             filego::presentation::manager::AddFlowView::Preview(batch) => {
                 window.set_draft_visible(false);
@@ -723,6 +805,16 @@ impl SettingsWindowController {
                 window.set_batch_visible(false);
             }
         }
+    }
+}
+
+/// Resolve the draft color for the swatch (M05 review H2). `None` (no color
+/// yet) renders the default accent; a stored palette color renders as-is so the
+/// shown swatch always matches the value `CycleDraftColor` will preserve.
+fn draft_color_to_slint(draft: &filego::presentation::manager::FolderDraftView) -> slint::Color {
+    match draft.color {
+        Some(color) => slint::Color::from_argb_encoded(color.0),
+        None => slint::Color::from_argb_encoded(0xFF25_63EB),
     }
 }
 
@@ -822,7 +914,10 @@ fn apply_settings_localization(
         ("action_add", Msg::ActionAdd),
         ("action_edit", Msg::ActionEdit),
         ("action_remove", Msg::ActionRemoveRecord),
-        ("action_toggle_enabled", Msg::ActionAdd),
+        // M05 review H4: the per-row enable/disable toggle label is bound in
+        // Slint to the row state (context-menu.disable/enable); this static
+        // string is now only a fallback and must never read "添加".
+        ("action_toggle_enabled", Msg::DisabledLabel),
         ("action_toggle_pin", Msg::PinnedLabel),
         ("action_check", Msg::ActionCheck),
         ("filter_name_placeholder", Msg::FilterNamePlaceholder),
@@ -858,6 +953,8 @@ fn apply_settings_localization(
         ("import_parent_only", Msg::ImportParentOnly),
         ("import_children", Msg::ImportChildren),
         ("import_second_confirm", Msg::ImportSecondConfirm),
+        // M7: the import hover is a `max 100` hint, not a repeat of the
+        // children button label.
         ("import_max_hint", Msg::ImportChildren),
         ("batch_preview_title", Msg::BatchPreviewTitle),
         ("batch_add", Msg::BatchAdd),
@@ -871,6 +968,28 @@ fn apply_settings_localization(
         ("tag_merge_to", Msg::TagMerge),
         ("tag_delete", Msg::TagDelete),
         ("usage_suffix", Msg::UsageSuffix),
+        // M05 review M2: filter + sort selector labels.
+        ("filter_status_all", Msg::FilterStatusAll),
+        ("filter_status_enabled", Msg::FilterStatusEnabled),
+        ("filter_status_disabled", Msg::FilterStatusDisabled),
+        ("sort_name", Msg::SortName),
+        ("sort_recent", Msg::SortRecent),
+        ("sort_added", Msg::SortAdded),
+        // M05 review H2: add/edit dialog field labels + duplicate resolution.
+        ("field_note", Msg::FieldNote),
+        ("field_weight", Msg::FieldWeight),
+        ("field_category", Msg::FieldCategory),
+        ("field_tags", Msg::FieldTags),
+        ("field_color", Msg::FieldColor),
+        ("duplicate_cancel", Msg::DuplicateCancel),
+        ("duplicate_edit_existing", Msg::DuplicateEditExisting),
+        ("duplicate_save_different", Msg::DuplicateSaveDifferent),
+        ("unsaved_changes", Msg::UnsavedChanges),
+        ("discard_changes", Msg::DiscardChanges),
+        ("discard_no", Msg::DiscardNo),
+        // M05 review H3: category/tag delete confirmation.
+        ("confirm_delete_category", Msg::ConfirmDeleteCategory),
+        ("confirm_delete_tag", Msg::ConfirmDeleteTag),
     ];
     for (field, msg) in entries {
         let value = msg.tr(locale);
@@ -946,6 +1065,25 @@ fn call_string_setter(window: &SettingsWindow, field: &str, value: String) {
         "tag_merge_to" => strings.set_tag_merge_to(value),
         "tag_delete" => strings.set_tag_delete(value),
         "usage_suffix" => strings.set_usage_suffix(value),
+        "filter_status_all" => strings.set_filter_status_all(value),
+        "filter_status_enabled" => strings.set_filter_status_enabled(value),
+        "filter_status_disabled" => strings.set_filter_status_disabled(value),
+        "sort_name" => strings.set_sort_name(value),
+        "sort_recent" => strings.set_sort_recent(value),
+        "sort_added" => strings.set_sort_added(value),
+        "field_note" => strings.set_field_note(value),
+        "field_weight" => strings.set_field_weight(value),
+        "field_category" => strings.set_field_category(value),
+        "field_tags" => strings.set_field_tags(value),
+        "field_color" => strings.set_field_color(value),
+        "duplicate_cancel" => strings.set_duplicate_cancel(value),
+        "duplicate_edit_existing" => strings.set_duplicate_edit_existing(value),
+        "duplicate_save_different" => strings.set_duplicate_save_different(value),
+        "unsaved_changes" => strings.set_unsaved_changes(value),
+        "discard_changes" => strings.set_discard_changes(value),
+        "discard_no" => strings.set_discard_no(value),
+        "confirm_delete_category" => strings.set_confirm_delete_category(value),
+        "confirm_delete_tag" => strings.set_confirm_delete_tag(value),
         _ => {}
     }
 }
@@ -1118,6 +1256,52 @@ fn apply_localization_and_theme(window: &AppWindow, locale: filego::presentation
     );
     strings.set_inaccessible_tooltip(
         filego::presentation::i18n::Msg::InaccessibleTooltip
+            .tr(locale)
+            .into(),
+    );
+    // M05.5 context menu strings.
+    strings.set_context_menu_open(
+        filego::presentation::i18n::Msg::ContextMenuOpen
+            .tr(locale)
+            .into(),
+    );
+    strings.set_context_menu_copy_path(
+        filego::presentation::i18n::Msg::ContextMenuCopyPath
+            .tr(locale)
+            .into(),
+    );
+    strings.set_context_menu_copy_name(
+        filego::presentation::i18n::Msg::ContextMenuCopyName
+            .tr(locale)
+            .into(),
+    );
+    strings.set_context_menu_edit(
+        filego::presentation::i18n::Msg::ContextMenuEdit
+            .tr(locale)
+            .into(),
+    );
+    strings.set_context_menu_pin(
+        filego::presentation::i18n::Msg::ContextMenuPin
+            .tr(locale)
+            .into(),
+    );
+    strings.set_context_menu_unpin(
+        filego::presentation::i18n::Msg::ContextMenuUnpin
+            .tr(locale)
+            .into(),
+    );
+    strings.set_context_menu_disable(
+        filego::presentation::i18n::Msg::ContextMenuDisable
+            .tr(locale)
+            .into(),
+    );
+    strings.set_context_menu_enable(
+        filego::presentation::i18n::Msg::ContextMenuEnable
+            .tr(locale)
+            .into(),
+    );
+    strings.set_context_menu_remove_record(
+        filego::presentation::i18n::Msg::ContextMenuRemove
             .tr(locale)
             .into(),
     );
@@ -1441,6 +1625,24 @@ fn run() -> Result<(), slint::PlatformError> {
     app.on_command_set_overlay(move |open| {
         main_ui.borrow_mut().handle(ViewCommand::SetOverlay(open));
     });
+    // M05.5: context-menu action for a requested row. The adapter selects the
+    // row and dispatches the corresponding RowAction (the ViewModel maps it to
+    // an ExternalEffect; edit/pin/enable/remove route to the settings window).
+    let main_ui = Rc::clone(&main);
+    app.on_command_context_action(move |index, action| {
+        let mut main = main_ui.borrow_mut();
+        main.handle(ViewCommand::SelectIndex(index as usize));
+        let row_action = match action {
+            0 => RowAction::Open,
+            1 => RowAction::CopyPath,
+            2 => RowAction::CopyName,
+            3 => RowAction::Edit,
+            4 => RowAction::TogglePin,
+            5 => RowAction::ToggleEnable,
+            _ => RowAction::RemoveFromList,
+        };
+        main.handle(ViewCommand::RowAction(row_action));
+    });
 
     // IME gate: while composing, the UI's key handler already rejects
     // Enter/arrows (see app-window.slint). The logic-level gate is driven
@@ -1513,53 +1715,78 @@ fn run() -> Result<(), slint::PlatformError> {
             settings.borrow_mut().browse();
         });
     }
+    // M05 review C1 (Critical): folder row actions carry the ROW INDEX (never
+    // a truncating `u128 as i32` id); the index resolves to the real 128-bit
+    // FolderId held in the current view rows. An out-of-range index no-ops
+    // instead of acting on a wrong record — deterministic, no silent
+    // wrong-record.
     {
         let settings = Rc::clone(&settings_adapter);
-        settings_window.on_command_edit(move |id| {
-            let folder_id =
-                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
-            settings
-                .borrow_mut()
-                .handle(MCommand::EditFolder(folder_id));
-            if let Some(window) = settings.borrow().window.upgrade() {
-                let _ = window.show();
+        settings_window.on_command_edit(move |index| {
+            let folder_id = {
+                let s = settings.borrow();
+                filego::presentation::manager::folder_id_at(&s.manager.view().rows, index as usize)
+            };
+            if let Some(folder_id) = folder_id {
+                settings
+                    .borrow_mut()
+                    .handle(MCommand::EditFolder(folder_id));
+                if let Some(window) = settings.borrow().window.upgrade() {
+                    let _ = window.show();
+                }
             }
         });
     }
     {
         let settings = Rc::clone(&settings_adapter);
-        settings_window.on_command_remove(move |id| {
-            let folder_id =
-                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
-            settings
-                .borrow_mut()
-                .handle(MCommand::StartRemove(folder_id));
+        settings_window.on_command_remove(move |index| {
+            let folder_id = {
+                let s = settings.borrow();
+                filego::presentation::manager::folder_id_at(&s.manager.view().rows, index as usize)
+            };
+            if let Some(folder_id) = folder_id {
+                settings
+                    .borrow_mut()
+                    .handle(MCommand::StartRemove(folder_id));
+            }
         });
     }
     {
         let settings = Rc::clone(&settings_adapter);
-        settings_window.on_command_toggle_enabled(move |id| {
-            let folder_id =
-                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
-            settings
-                .borrow_mut()
-                .handle(MCommand::ToggleEnable(folder_id));
+        settings_window.on_command_toggle_enabled(move |index| {
+            let folder_id = {
+                let s = settings.borrow();
+                filego::presentation::manager::folder_id_at(&s.manager.view().rows, index as usize)
+            };
+            if let Some(folder_id) = folder_id {
+                settings
+                    .borrow_mut()
+                    .handle(MCommand::ToggleEnable(folder_id));
+            }
         });
     }
     {
         let settings = Rc::clone(&settings_adapter);
-        settings_window.on_command_toggle_pin(move |id| {
-            let folder_id =
-                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
-            settings.borrow_mut().handle(MCommand::TogglePin(folder_id));
+        settings_window.on_command_toggle_pin(move |index| {
+            let folder_id = {
+                let s = settings.borrow();
+                filego::presentation::manager::folder_id_at(&s.manager.view().rows, index as usize)
+            };
+            if let Some(folder_id) = folder_id {
+                settings.borrow_mut().handle(MCommand::TogglePin(folder_id));
+            }
         });
     }
     {
         let settings = Rc::clone(&settings_adapter);
-        settings_window.on_command_check(move |id| {
-            let folder_id =
-                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
-            settings.borrow_mut().handle(MCommand::CheckPath(folder_id));
+        settings_window.on_command_check(move |index| {
+            let folder_id = {
+                let s = settings.borrow();
+                filego::presentation::manager::folder_id_at(&s.manager.view().rows, index as usize)
+            };
+            if let Some(folder_id) = folder_id {
+                settings.borrow_mut().handle(MCommand::CheckPath(folder_id));
+            }
         });
     }
     {
@@ -1568,6 +1795,54 @@ fn run() -> Result<(), slint::PlatformError> {
             settings
                 .borrow_mut()
                 .handle(MCommand::SetFilterName(text.to_string()));
+        });
+    }
+    // M05 review M2: category / enabled-status filters and the sort selector
+    // map their combo indices to the existing pure `FolderFilter`/`FolderSort`
+    // logic (index 0 = all / by-name; status 1 = enabled only, 2 = disabled
+    // only; category index 0 = all, 1 = 未分类, 2+k = categories[k]).
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_filter_category(move |index| {
+            let category = match index {
+                i if i <= 0 => None,
+                1 => Some(filego::domain::ids::CategoryId::from_uuid(uuid::Uuid::nil())),
+                _ => {
+                    let s = settings.borrow();
+                    s.manager
+                        .view()
+                        .categories
+                        .get((index - 2) as usize)
+                        .map(|c| c.id)
+                }
+            };
+            settings
+                .borrow_mut()
+                .handle(MCommand::SetFilterCategory(category));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_filter_enabled(move |index| {
+            let enabled = match index {
+                1 => Some(true),
+                2 => Some(false),
+                _ => None,
+            };
+            settings
+                .borrow_mut()
+                .handle(MCommand::SetFilterEnabled(enabled));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_set_sort(move |index| {
+            let sort = match index {
+                1 => filego::presentation::management::FolderSort::RecentlyUsed,
+                2 => filego::presentation::management::FolderSort::AddedTime,
+                _ => filego::presentation::management::FolderSort::Name,
+            };
+            settings.borrow_mut().handle(MCommand::SetSort(sort));
         });
     }
     {
@@ -1615,6 +1890,49 @@ fn run() -> Result<(), slint::PlatformError> {
                 settings.borrow_mut().handle(MCommand::DeleteTag(tag_id));
             }
         });
+    }
+    // M05 review H3: category/tag deletion requires a two-step confirmation.
+    // The UI arms a per-row confirm state; only the explicit confirm callback
+    // performs the delete (whose semantics stay right: category delete → 未分类,
+    // tag delete → refs cleared, and real directories are never touched).
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_confirm_delete_category(move |index| {
+            let category_id = {
+                let s = settings.borrow();
+                s.manager
+                    .view()
+                    .categories
+                    .get(index as usize)
+                    .map(|c| c.id)
+            };
+            if let Some(category_id) = category_id {
+                settings
+                    .borrow_mut()
+                    .handle(MCommand::DeleteCategory(category_id));
+            }
+        });
+    }
+    // The two cancel handlers are intentional no-ops: the Slint UI clears its
+    // own per-row confirm arming locally; Rust has nothing else to do (the
+    // closure captures nothing, so no `settings` clone).
+    {
+        settings_window.on_command_cancel_delete_category(move || {});
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_confirm_delete_tag(move |index| {
+            let tag_id = {
+                let s = settings.borrow();
+                s.manager.view().tags.get(index as usize).map(|t| t.id)
+            };
+            if let Some(tag_id) = tag_id {
+                settings.borrow_mut().handle(MCommand::DeleteTag(tag_id));
+            }
+        });
+    }
+    {
+        settings_window.on_command_cancel_delete_tag(move || {});
     }
     {
         let settings = Rc::clone(&settings_adapter);
@@ -1674,6 +1992,87 @@ fn run() -> Result<(), slint::PlatformError> {
             settings
                 .borrow_mut()
                 .handle(MCommand::SetDraftEnabled(enabled));
+        });
+    }
+    // M05 review H2: add/edit dialog fields bound to the real draft values.
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_set_draft_note(move |note| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::EditNote(note.to_string()));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_set_draft_weight(move |weight| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::SetDraftWeight(weight as i16));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_cycle_draft_color(move || {
+            settings.borrow_mut().handle(MCommand::CycleDraftColor);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_set_draft_category(move |index| {
+            let category = {
+                let s = settings.borrow();
+                if index <= 0 {
+                    None
+                } else {
+                    s.manager
+                        .view()
+                        .categories
+                        .get((index - 1) as usize)
+                        .map(|c| c.id)
+                }
+            };
+            settings
+                .borrow_mut()
+                .handle(MCommand::SetDraftCategory(category));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_toggle_draft_tag(move |index, on| {
+            let tag_id = {
+                let s = settings.borrow();
+                s.manager.view().tags.get(index as usize).map(|t| t.id)
+            };
+            if let Some(tag_id) = tag_id {
+                settings
+                    .borrow_mut()
+                    .handle(MCommand::SetDraftTag(tag_id, on));
+            }
+        });
+    }
+    // M05 review H2: duplicate-policy resolution (0 = cancel, 1 = edit
+    // existing, 2 = save as different name) is delegated to the pure logic.
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_resolve_duplicate(move |policy| {
+            let policy = match policy {
+                1 => filego::presentation::management::DuplicatePolicy::EditExisting,
+                2 => filego::presentation::management::DuplicatePolicy::SaveAsDifferentName,
+                _ => filego::presentation::management::DuplicatePolicy::Cancel,
+            };
+            settings
+                .borrow_mut()
+                .handle(MCommand::ResolveDuplicate(policy));
+        });
+    }
+    // M05 review M1: persist the one-level-import setting via the controller.
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_set_one_level_import(move |enabled| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::SetOneLevelImport(enabled));
         });
     }
     {

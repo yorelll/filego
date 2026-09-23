@@ -686,21 +686,35 @@ fn domain_does_not_expose_real_directory_delete_api() {
     assert!(!source.contains("delete_directory"));
 }
 
-/// Recursive source scan of `src/storage/` and `src/domain/`: no described
-/// call may delete a real folder or the real stored document.
+/// Recursive source scan of `src/storage/`, `src/domain/`, `src/presentation/`
+/// and `src/platform/`: no described call may delete a real folder or the real
+/// stored document.
 ///
 /// - `remove_dir` / `remove_dir_all` / `delete_directory` must not appear in
-///   any source under either tree — folder deletion is never represented at
+///   any source under these trees — folder deletion is never represented at
 ///   this layer.
 /// - `remove_file` is permitted only inside the `src/storage/io.rs` filesystem
 ///   adapter (used purely for best-effort cleanup of the repository's own
-///   `data.json.tmp.*` siblings); it must not appear in `repository.rs`,
-///   anywhere else in `src/storage/`, or anywhere in `src/domain/`.
+///   `data.json.tmp.*` siblings and the lock file); it must not appear in
+///   `repository.rs`, anywhere else in `src/storage/`, or anywhere in
+///   `src/domain/`, `src/presentation/`, or `src/platform/`.
+///
+/// M05 review M4: the original guard only scanned `src/storage/` + `src/domain/`.
+/// The management milestone added large new presenters (`management.rs`,
+/// `manager.rs`, `view_model.rs`) and platform adapters (`folder_picker.rs`,
+/// `clipboard.rs`), so the structural scan now includes them — a future call to a
+/// real-directory/real-file deletion API in those layers is caught at CI time
+/// instead of being verified only by hand.
 #[test]
 fn source_under_storage_and_domain_has_no_fs_delete_api_calls() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut sources = Vec::new();
-    let mut pending = vec![source_root.join("storage"), source_root.join("domain")];
+    let mut pending = vec![
+        source_root.join("storage"),
+        source_root.join("domain"),
+        source_root.join("presentation"),
+        source_root.join("platform"),
+    ];
     let mut seen_roots = std::collections::HashSet::new();
     while let Some(dir) = pending.pop() {
         if !seen_roots.insert(dir.clone()) {
@@ -718,7 +732,7 @@ fn source_under_storage_and_domain_has_no_fs_delete_api_calls() {
     }
     assert!(
         sources.len() >= 2,
-        "src/storage and src/domain must contain sources"
+        "src/storage, src/domain, src/presentation and src/platform must contain sources"
     );
 
     for path in &sources {

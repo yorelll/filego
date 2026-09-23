@@ -652,6 +652,17 @@ impl DocumentRepository {
         Ok(())
     }
 
+    /// Update the persisted one-level-import setting in the in-memory working
+    /// copy (M05 review M1). The caller persists with `save`/`save_at`. Returns
+    /// `Err(NotFound)` when no document is loaded.
+    pub fn set_one_level_import(&mut self, enabled: bool) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        document.data.settings.one_level_import = enabled;
+        Ok(())
+    }
+
     /// Insert or replace one category record in the in-memory working copy.
     pub fn put_category(&mut self, category: Category) -> Result<(), RepositoryError> {
         let Some(document) = self.document.as_mut() else {

@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::management::{
-    ChildImportChoice, FolderFilter, FolderSort, MAX_ONE_LEVEL_IMPORT,
+    ChildImportChoice, DuplicatePolicy, FolderFilter, FolderRow, FolderSort, MAX_ONE_LEVEL_IMPORT,
     ONE_LEVEL_IMPORT_MAX_LITERAL, UNDO_WINDOW, child_import_offer, folder_rows, normalize_name,
     preview_batch, suggested_display_name, valid_named_value,
 };
@@ -194,6 +194,9 @@ pub struct FolderDraftView {
     pub enabled: bool,
     pub category_id: Option<CategoryId>,
     pub tag_ids: Vec<TagId>,
+    /// M05 review H2: the draft color (editable in the dialog). `None` = no
+    /// swatch; the UI cycles through the palette via `CycleDraftColor`.
+    pub color: Option<FolderColor>,
     /// Validation result of the current path (recomputed on every edit).
     pub valid: bool,
     pub duplicate_existing: Option<String>,
@@ -253,6 +256,12 @@ pub enum MCommand {
     SetDraftWeight(i16),
     CycleDraftColor,
     SaveDraft,
+    /// M05 review H2: process the duplicate decision when a draft collides with
+    /// an existing record. `Cancel` is the default (nothing saved); `EditExisting`
+    /// opens the record with the same path for editing; `SaveAsDifferentName`
+    /// saves the draft as an independent record keeping the (unchanged) path but
+    /// under the current (different) name.
+    ResolveDuplicate(DuplicatePolicy),
     CancelDraft,
     ApplyBatch,
     CancelBatch,
@@ -269,6 +278,8 @@ pub enum MCommand {
     CreateCategory(String),
     RenameCategory(CategoryId, String),
     DeleteCategory(CategoryId),
+    /// M05 review M1: toggle the persisted one-level-import setting (default OFF).
+    SetOneLevelImport(bool),
     ChooseImport(ChildImportChoice),
     DismissImport,
     CreateTag(String),
@@ -332,6 +343,14 @@ pub trait ManagementStore {
     ) -> Result<(), crate::storage::repository::RepositoryError>;
     fn duplicate_folders(&self, exclude: Option<FolderId>) -> Vec<usize>;
     fn is_duplicate_path(&self, candidate: &str, exclude: Option<FolderId>) -> bool;
+    /// Persist the one-level-import setting (M1). The store resolves the
+    /// current in-memory document, updates the flag, and the caller then
+    /// persists with `save_at`. Returns `Err(NotFound)` when no document is
+    /// loaded.
+    fn set_one_level_import(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), crate::storage::repository::RepositoryError>;
 }
 
 /// The real repository is itself a store: the controller drives `load`/`save_at`
@@ -456,6 +475,13 @@ impl ManagementStore for SharedStore {
     fn is_duplicate_path(&self, candidate: &str, exclude: Option<FolderId>) -> bool {
         self.repo.borrow().is_duplicate_path(candidate, exclude)
     }
+
+    fn set_one_level_import(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), crate::storage::repository::RepositoryError> {
+        self.repo.borrow_mut().set_one_level_import(enabled)
+    }
 }
 
 impl ManagementStore for DocumentRepository {
@@ -558,6 +584,25 @@ impl ManagementStore for DocumentRepository {
     fn is_duplicate_path(&self, candidate: &str, exclude: Option<FolderId>) -> bool {
         self.is_duplicate_path(candidate, exclude)
     }
+
+    fn set_one_level_import(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), crate::storage::repository::RepositoryError> {
+        self.set_one_level_import(enabled)
+    }
+}
+
+/// Resolve a management-list row index to its `FolderId` (M05 review C1).
+///
+/// The UI sends the *row index* — never a truncating `u128 as i32` id — and this
+/// resolves `index → FolderId` against the current `view.rows` snapshot. A row
+/// index is stable within one push (the rows snapshot); an out-of-range index is
+/// `None` (the caller then no-ops instead of acting on a wrong record). This is
+/// the same index→id pattern the category/tag delete path already uses, so no
+/// 128-bit id ever crosses the Slint `int` boundary through folder actions.
+pub fn folder_id_at(rows: &[FolderRow], index: usize) -> Option<FolderId> {
+    rows.get(index).map(|row| row.id)
 }
 
 /// The controller. `S` is the persistence store (production: `DocumentRepository`,
@@ -656,6 +701,7 @@ impl<S: ManagementStore> ManagementController<S> {
             MCommand::SetDraftWeight(weight) => self.set_draft_weight(weight),
             MCommand::CycleDraftColor => self.cycle_draft_color(),
             MCommand::SaveDraft => self.save_draft(),
+            MCommand::ResolveDuplicate(policy) => self.resolve_duplicate(policy),
             MCommand::CancelDraft => self.cancel_draft(),
             MCommand::ApplyBatch => self.apply_batch(),
             MCommand::CancelBatch => self.cancel_batch(),
@@ -672,6 +718,7 @@ impl<S: ManagementStore> ManagementController<S> {
             MCommand::CreateCategory(name) => self.create_category(name),
             MCommand::RenameCategory(id, name) => self.rename_category(id, name),
             MCommand::DeleteCategory(id) => self.delete_category(id),
+            MCommand::SetOneLevelImport(enabled) => self.set_one_level_import(enabled),
             MCommand::ChooseImport(choice) => self.choose_import(choice),
             MCommand::DismissImport => self.dismiss_import(),
             MCommand::CreateTag(name) => self.create_tag(name),
@@ -883,6 +930,7 @@ impl<S: ManagementStore> ManagementController<S> {
             enabled: draft.enabled,
             category_id: draft.category_id,
             tag_ids: draft.tag_ids.clone(),
+            color: draft.color,
             valid,
             duplicate_existing,
             inaccessible: false,
@@ -1030,6 +1078,53 @@ impl<S: ManagementStore> ManagementController<S> {
             self.notice(Notice::DuplicateBlocked);
             return;
         }
+        self.commit_draft(draft);
+    }
+
+    /// Resolve a duplicate-draft collision (M05.2 / H2). The user reached the
+    /// duplicate confirmation explicitly (the Save button surfaced an already-
+    /// existing path), so a non-default decision is honored: `EditExisting`
+    /// opens the record that already owns the path; `SaveAsDifferentName`
+    /// keeps the same path but persists the draft as its own record under the
+    /// current (distinct) name. `Cancel` leaves everything untouched.
+    ///
+    /// Both non-default paths remain record-only: the real folder is never
+    /// touched (the absolute no-delete invariant holds).
+    fn resolve_duplicate(&mut self, policy: DuplicatePolicy) {
+        let Some(draft) = self.draft.clone() else {
+            return;
+        };
+        if path_key(&draft.path).is_none() {
+            self.notice(Notice::InvalidPath);
+            return;
+        }
+        match policy {
+            DuplicatePolicy::Cancel => self.notice(Notice::DuplicateBlocked),
+            DuplicatePolicy::EditExisting => {
+                let existing = self.document_folders().into_iter().find(|folder| {
+                    draft.id != Some(folder.id)
+                        && crate::domain::path_semantics::same_path(&folder.path, &draft.path)
+                });
+                match existing {
+                    Some(existing) => self.open_edit(existing.id),
+                    None => self.notice(Notice::NotFound),
+                }
+            }
+            DuplicatePolicy::SaveAsDifferentName => {
+                if normalize_name(&draft.display_name).is_empty() {
+                    self.notice(Notice::InvalidName);
+                    return;
+                }
+                self.commit_draft(draft);
+            }
+        }
+    }
+
+    /// Build, insert and persist a draft as a folder record. Shared by the
+    /// default save (path/name already validated, duplicate already rejected)
+    /// and the explicit `SaveAsDifferentName` resolution (a deliberate
+    /// duplicate path is allowed there).
+    fn commit_draft(&mut self, draft: FolderDraft) {
         let entry = match draft.id {
             Some(id) => {
                 let folders = self.document_folders();
@@ -1537,6 +1632,26 @@ impl<S: ManagementStore> ManagementController<S> {
         self.import_offer = None;
         self.view.import_offer = None;
     }
+
+    /// Persist the one-level-import setting (M05 review M1). Default OFF; the
+    /// toggle is the user-facing enablement that makes the controlled parent-
+    /// dir import reachable. Dismisses any pending import offer when the setting
+    /// is turned OFF (it no longer applies).
+    fn set_one_level_import(&mut self, enabled: bool) {
+        if self.store.set_one_level_import(enabled).is_err() {
+            self.notice(Notice::SaveFailed);
+            return;
+        }
+        if self.store.save_at().is_ok() {
+            self.view.one_level_import_setting = enabled;
+            self.notice(Notice::Saved);
+            if !enabled {
+                self.dismiss_import();
+            }
+        } else {
+            self.notice(Notice::SaveFailed);
+        }
+    }
 }
 
 /// List the DIRECT children (folders only) of `parent`, capped at `limit`.
@@ -1846,6 +1961,14 @@ mod tests {
                     && crate::domain::path_semantics::same_path(&folder.path, candidate)
             })
         }
+        fn set_one_level_import(
+            &mut self,
+            enabled: bool,
+        ) -> Result<(), crate::storage::repository::RepositoryError> {
+            let document = self.document.as_mut().expect("document");
+            document.data.settings.one_level_import = enabled;
+            Ok(())
+        }
     }
 
     fn controller() -> ManagementController<MemStore> {
@@ -2119,5 +2242,150 @@ mod tests {
         assert_eq!(controller.view().rows.len(), 1);
         controller.handle(MCommand::SetFilterName("DOC".to_owned()));
         assert_eq!(controller.view().rows.len(), 1);
+    }
+
+    // --- M05 review C1: FolderId→row-index resolution (no int truncation) ----
+
+    #[test]
+    fn folder_id_at_resolves_row_index_to_the_real_folder_id() {
+        let controller = controller();
+        // The rows snapshot holds the full 128-bit id. Index resolution is
+        // index→id (the UI never sends a truncated `u128 as i32`).
+        let rows = controller.view().rows.clone();
+        let row_index = rows
+            .iter()
+            .position(|row| row.display_name == "Documents")
+            .expect("seed row exists");
+        assert_eq!(
+            folder_id_at(&rows, row_index),
+            Some(FolderId::from_uuid(Uuid::from_u128(10)))
+        );
+
+        // An out-of-range index resolves to None (the caller no-ops, never
+        // acting on a wrong record).
+        assert_eq!(folder_id_at(&rows, rows.len()), None);
+        assert_eq!(folder_id_at(&rows, 999), None);
+    }
+
+    #[test]
+    fn duplicate_policy_edit_existing_opens_the_existing_record() {
+        let mut controller = controller();
+        // Start a fresh add that collides with the existing "Documents" record.
+        controller.handle(MCommand::OpenManual);
+        controller.handle(MCommand::EditPath(r"C:\Users\me\Documents".to_owned()));
+        controller.handle(MCommand::EditName("Documents copy".to_owned()));
+        controller.handle(MCommand::SaveDraft);
+        assert_eq!(controller.view().notice, Some(Notice::DuplicateBlocked));
+
+        // EditExisting: open the record that owns the path for editing.
+        controller.handle(MCommand::ResolveDuplicate(DuplicatePolicy::EditExisting));
+        let add_flow = controller.view().add_flow.clone();
+        match add_flow {
+            AddFlowView::Draft(draft) => {
+                assert_eq!(draft.id, Some(FolderId::from_uuid(Uuid::from_u128(10))));
+                assert_eq!(draft.display_name, "Documents");
+            }
+            other => panic!("expected edit draft, got {other:?}"),
+        }
+        // The folder count is unchanged (no record was added or removed).
+        assert_eq!(controller.view().folders, 1);
+    }
+
+    #[test]
+    fn duplicate_policy_save_as_different_name_adds_an_independent_record() {
+        let mut controller = controller();
+        controller.handle(MCommand::OpenManual);
+        controller.handle(MCommand::EditPath(r"C:\Users\me\Documents".to_owned()));
+        controller.handle(MCommand::EditName("Documents 2".to_owned()));
+        controller.handle(MCommand::ResolveDuplicate(
+            DuplicatePolicy::SaveAsDifferentName,
+        ));
+        assert_eq!(controller.view().notice, Some(Notice::Saved));
+        assert_eq!(controller.view().folders, 2, "independent record added");
+        let folders = controller.store.document().unwrap().data.folders.clone();
+        let names: Vec<&str> = folders.iter().map(|f| f.display_name.as_str()).collect();
+        assert!(names.contains(&"Documents"));
+        assert!(names.contains(&"Documents 2"));
+    }
+
+    #[test]
+    fn duplicate_policy_cancel_blocks_without_change() {
+        let mut controller = controller();
+        controller.handle(MCommand::OpenManual);
+        controller.handle(MCommand::EditPath(r"C:\Users\me\Documents".to_owned()));
+        controller.handle(MCommand::ResolveDuplicate(DuplicatePolicy::Cancel));
+        assert_eq!(controller.view().notice, Some(Notice::DuplicateBlocked));
+        assert_eq!(controller.view().folders, 1);
+    }
+
+    #[test]
+    fn one_level_import_toggle_persists_and_controls_the_offer() {
+        // Default OFF: no offer is reachable.
+        let mut controller = controller();
+        assert!(!controller.view().one_level_import_setting);
+        assert!(
+            !controller
+                .store
+                .document()
+                .unwrap()
+                .data
+                .settings
+                .one_level_import
+        );
+
+        // Toggle ON: the flag persists into the store and the view.
+        controller.handle(MCommand::SetOneLevelImport(true));
+        assert!(controller.view().one_level_import_setting);
+        assert!(
+            controller
+                .store
+                .document()
+                .unwrap()
+                .data
+                .settings
+                .one_level_import
+        );
+
+        // Toggle OFF again: default restored.
+        controller.handle(MCommand::SetOneLevelImport(false));
+        assert!(!controller.view().one_level_import_setting);
+        assert!(
+            !controller
+                .store
+                .document()
+                .unwrap()
+                .data
+                .settings
+                .one_level_import
+        );
+    }
+
+    #[test]
+    fn index_resolution_never_truncates_a_128_bit_id() {
+        // The structural invariant the review flagged: a UUID whose low 32 bits
+        // are 0 must NOT be reachable through `u128 as i32` (which yields 0).
+        // Pin that truncation would collide and that index resolution does not.
+        // Low 32 bits are zero: `u128 as i32` truncates to 0.
+        let low32_zero =
+            FolderId::from_uuid(Uuid::from_u128(0x1234_5678_9ABC_DEF0_1234_5678_0000_0000));
+        let as_i32 = low32_zero.as_uuid().as_u128() as i32;
+        assert_eq!(as_i32, 0, "low-32-zero UUID truncates to int 0");
+
+        // The row holds the full id; index resolution returns the full id.
+        let row = super::FolderRow {
+            id: low32_zero,
+            display_name: "low".to_owned(),
+            path: r"C:\low".to_owned(),
+            category_name: None,
+            tag_names: Vec::new(),
+            enabled: true,
+            pinned: false,
+            favorite: false,
+            last_opened_at: None,
+            created_at: "2026-09-21T00:00:00Z".parse().expect("fixture"),
+            manual_weight: 0,
+            open_count: 0,
+        };
+        assert_eq!(folder_id_at(&[row], 0), Some(low32_zero));
     }
 }

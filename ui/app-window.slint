@@ -30,7 +30,7 @@
 //    key-pressed handles ↑/↓/Enter and Ctrl+C (copy path).
 //  - While `ime-composing` is set, Enter/↑/↓ are rejected to the IME.
 
-import { Button, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, SpinBox, Switch, VerticalBox } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------------
 // Exported globals: strings + theme, pushed from Rust (i18n module + theme.rs)
@@ -58,6 +58,16 @@ export global UiStrings {
     in-out property <string> count: "";
     in-out property <string> inaccessible: "";
     in-out property <string> inaccessible-tooltip: "";
+    // ---- M05.5 context menu strings ----
+    in-out property <string> context-menu-open: "";
+    in-out property <string> context-menu-copy-path: "";
+    in-out property <string> context-menu-copy-name: "";
+    in-out property <string> context-menu-edit: "";
+    in-out property <string> context-menu-pin: "";
+    in-out property <string> context-menu-unpin: "";
+    in-out property <string> context-menu-disable: "";
+    in-out property <string> context-menu-enable: "";
+    in-out property <string> context-menu-remove-record: "";
     // ---- M05 settings window strings (pushed from Rust) ----
     in-out property <string> settings-title: "";
     in-out property <string> page-folders: "";
@@ -109,6 +119,25 @@ export global UiStrings {
     in-out property <string> import-parent-only: "";
     in-out property <string> import-children: "";
     in-out property <string> import-max-hint: "";
+    // M05 review M2: filter/sort selector labels.
+    in-out property <string> filter-status-all: "";
+    in-out property <string> filter-status-enabled: "";
+    in-out property <string> filter-status-disabled: "";
+    in-out property <string> sort-name: "";
+    in-out property <string> sort-recent: "";
+    in-out property <string> sort-added: "";
+    // M05 review H2: add/edit dialog extra-field labels + duplicate resolution.
+    in-out property <string> field-note: "";
+    in-out property <string> field-weight: "";
+    in-out property <string> field-category: "";
+    in-out property <string> field-tags: "";
+    in-out property <string> field-color: "";
+    in-out property <string> duplicate-cancel: "";
+    in-out property <string> duplicate-edit-existing: "";
+    in-out property <string> duplicate-save-different: "";
+    in-out property <string> unsaved-changes: "";
+    in-out property <string> discard-changes: "";
+    in-out property <string> discard-no: "";
     in-out property <string> import-second-confirm: "";
     in-out property <string> batch-preview-title: "";
     in-out property <string> batch-add: "";
@@ -157,10 +186,17 @@ component ResultRow inherits Rectangle {
     in property <string> row-tags;
     in property <bool> row-inaccessible;
     in property <bool> row-selected;
+    // M05.5 context menu: the row reports its pin/enable state so the menu can
+    // render the correct "置顶/取消置顶" and "禁用/恢复" labels.
+    in property <bool> row-pinned;
+    in property <bool> row-enabled;
 
     // Callbacks the AppWindow wires to commands.
     callback row-clicked(int);
     callback row-activated(int);
+    // M05.5: right-click on the row. Carries the row index plus the window-
+    // absolute click position (logical) so the AppWindow can anchor its popup.
+    callback row-context-requested(int, length, length);
 
     height: 56px;
     border-radius: 8px;
@@ -176,6 +212,10 @@ component ResultRow inherits Rectangle {
     accessible-item-selected: row-selected;
     accessible-item-index: row-index;
 
+    public function request-context(x: length, y: length) {
+        root.row-context-requested(root.row-index, x, y);
+    }
+
     TouchArea {
         // M03.3: single click selects, double-click opens.
         clicked() => {
@@ -183,6 +223,16 @@ component ResultRow inherits Rectangle {
         }
         double-clicked() => {
             root.row-activated(root.row-index);
+        }
+        // M05.5: right-button release opens the context menu (popup-safe via
+        // the adapter's overlay gate).
+        pointer-event(pe) => {
+            if (pe.button == PointerEventButton.right && pe.kind == PointerEventKind.up) {
+                root.request-context(
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y,
+                );
+            }
         }
     }
 
@@ -240,6 +290,87 @@ component ResultRow inherits Rectangle {
 }
 
 // ---------------------------------------------------------------------------
+// M05.5 context menu (declared before the AppWindow that uses it).
+// ---------------------------------------------------------------------------
+// One row of the context menu.
+component MenuRow inherits Rectangle {
+    in property <string> m-text;
+    callback menu-clicked;
+    height: 30px;
+    border-radius: 4px;
+
+    TouchArea {
+        clicked() => { root.menu-clicked(); }
+    }
+    Text {
+        x: 10px;
+        width: parent.width - 20px;
+        text: root.m-text;
+        color: UiTheme.text;
+        font-size: 13px;
+        vertical-alignment: center;
+        horizontal-alignment: left;
+        overflow: elide;
+    }
+}
+
+// The context-menu popup. Declared as its own component (PopupWindow becomes a
+// separate component, so external element access is forbidden). Position and
+// label state are fed through declared in-properties; each row instance
+// connects its own `menu-clicked` callback to the declared `item-clicked(index)`;
+// the AppWindow connects only that one.
+component ContextMenuPopup inherits PopupWindow {
+    in property <length> pos-x;
+    in property <length> pos-y;
+    in property <bool> menu-pinned;
+    in property <bool> menu-enabled;
+    callback item-clicked(int);
+    close-policy: PopupClosePolicy.close-on-click-outside;
+    x: root.pos-x;
+    y: root.pos-y;
+
+    Rectangle {
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: UiTheme.border;
+        background: UiTheme.surface;
+
+        VerticalLayout {
+            spacing: 1px;
+
+            m0 := MenuRow {
+                m-text: UiStrings.context-menu-open;
+                menu-clicked() => { root.item-clicked(0); }
+            }
+            m1 := MenuRow {
+                m-text: UiStrings.context-menu-copy-path;
+                menu-clicked() => { root.item-clicked(1); }
+            }
+            m2 := MenuRow {
+                m-text: UiStrings.context-menu-copy-name;
+                menu-clicked() => { root.item-clicked(2); }
+            }
+            m3 := MenuRow {
+                m-text: UiStrings.context-menu-edit;
+                menu-clicked() => { root.item-clicked(3); }
+            }
+            m4 := MenuRow {
+                m-text: root.menu-pinned ? UiStrings.context-menu-unpin : UiStrings.context-menu-pin;
+                menu-clicked() => { root.item-clicked(4); }
+            }
+            m5 := MenuRow {
+                m-text: root.menu-enabled ? UiStrings.context-menu-disable : UiStrings.context-menu-enable;
+                menu-clicked() => { root.item-clicked(5); }
+            }
+            m6 := MenuRow {
+                m-text: UiStrings.context-menu-remove-record;
+                menu-clicked() => { root.item-clicked(6); }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main window.
 // ---------------------------------------------------------------------------
 export component AppWindow inherits Window {
@@ -270,6 +401,26 @@ export component AppWindow inherits Window {
     in-out property <[string]> rows-category: [];
     in-out property <[string]> rows-tags: [];
     in-out property <[bool]> rows-inaccessible: [];
+    // M05.5: per-row pin/enable state for the context-menu labels.
+    in-out property <[bool]> rows-pinned: [];
+    in-out property <[bool]> rows-enabled: [];
+    // Context menu state (anchored to the requested row).
+    in-out property <int> ctx-menu: -1;
+    in-out property <bool> ctx-pinned: false;
+    in-out property <bool> ctx-enabled: true;
+    in-out property <length> ctx-x: 0px;
+    in-out property <length> ctx-y: 0px;
+    // M05.5: keep the ViewModel overlay gate in sync with the popup. When the
+    // popup closes on ANY path (item select, outside click, Escape), clear the
+    // overlay so the window behaves normally again (Enter opens, Esc hides).
+    // The Slint compiler redirects `context-menu.is-open` references from the
+    // enclosing component to a synthesized parent property automatically.
+    property <bool> ctx-menu-open: context-menu.is-open;
+    changed ctx-menu-open => {
+        if !root.ctx-menu-open {
+            root.command-set-overlay(false);
+        }
+    }
 
     // --- callbacks (commands to Rust) ------------------------------------
     callback command-query-edited(string);
@@ -284,6 +435,11 @@ export component AppWindow inherits Window {
     callback command-copy-path();
     callback command-set-overlay(bool);
     callback hide-requested();
+    // M05.5 context menu: request a row context action. `action` is a stable
+    // code (0 open, 1 copy-path, 2 copy-name, 3 edit, 4 toggle-pin,
+    // 5 toggle-enable, 6 remove-from-list); the adapter selects the row and
+    // dispatches the matching RowAction.
+    callback command-context-action(int, int);
 
     background: UiTheme.background;
     default-font-family: "Segoe UI Variable, Microsoft YaHei UI, sans-serif";
@@ -436,10 +592,22 @@ export component AppWindow inherits Window {
                             row-tags: root.rows-tags[i];
                             row-inaccessible: root.rows-inaccessible[i];
                             row-selected: root.state-selected == i;
+                            row-pinned: root.rows-pinned.length > i ? root.rows-pinned[i] : false;
+                            row-enabled: root.rows-enabled.length > i ? root.rows-enabled[i] : true;
                             row-clicked(index) => { root.command-select-index(index); }
                             row-activated(index) => {
                                 root.command-select-index(index);
                                 root.command-open-index(index);
+                            }
+                            row-context-requested(index, x, y) => {
+                                root.command-select-index(index);
+                                root.command-set-overlay(true);
+                                root.ctx-menu = index;
+                                root.ctx-pinned = root.rows-pinned.length > index ? root.rows-pinned[index] : false;
+                                root.ctx-enabled = root.rows-enabled.length > index ? root.rows-enabled[index] : true;
+                                root.ctx-x = x;
+                                root.ctx-y = y;
+                                context-menu.show();
                             }
                         }
 
@@ -520,6 +688,25 @@ export component AppWindow inherits Window {
             }
         }
     }
+
+    // M05.5 context menu (a single popup anchored to the right-clicked row).
+    // The ViewModel's overlay gate (`command-set-overlay`) stays open while
+    // this popup is shown so hide-on-focus-loss never tears the window away.
+    // Each item carries a `clicked(index)` callback (no access from outside
+    // the popup is allowed); the AppWindow dispatches the action and closes
+    // the overlay. `close-on-click-outside` dismisses on an outside click or
+    // Escape for the dismiss-only path.
+    context-menu := ContextMenuPopup {
+        pos-x: root.ctx-x;
+        pos-y: root.ctx-y;
+        menu-pinned: root.ctx-pinned;
+        menu-enabled: root.ctx-enabled;
+        item-clicked(index) => {
+            context-menu.close();
+            root.command-set-overlay(false);
+            root.command-context-action(root.ctx-menu, index);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +757,10 @@ component FolderManagementRow inherits HorizontalBox {
         Text { text: root.m-tags; color: UiTheme.text-secondary; font-size: 11px; overflow: elide; }
     }
     Text { text: root.m-enabled ? UiStrings.enabled-label : UiStrings.disabled-label; color: root.m-enabled ? UiTheme.accent : UiTheme.warning; font-size: 11px; }
-    Button { text: UiStrings.action-toggle-enabled; clicked() => { root.command-toggle-enabled(root.m-id); } }
+    // M05 review H4: the enable/disable toggle button shows the *action* for the
+    // opposite state (禁用 when now-enabled, 恢复 when now-disabled), never a
+    // generic "添加" label.
+    Button { text: root.m-enabled ? UiStrings.context-menu-disable : UiStrings.context-menu-enable; clicked() => { root.command-toggle-enabled(root.m-id); } }
     Button { text: UiStrings.action-toggle-pin; clicked() => { root.command-toggle-pin(root.m-id); } }
     Button { text: UiStrings.action-edit; clicked() => { root.command-edit(root.m-id); } }
     Button { text: UiStrings.action-remove; clicked() => { root.command-remove(root.m-id); } }
@@ -601,7 +791,6 @@ export component SettingsWindow inherits Window {
     in-out property <[bool]> rows-enabled: [];
     in-out property <[bool]> rows-pinned: [];
     in-out property <[bool]> rows-favorite: [];
-    in-out property <[int]> rows-ids: [];
     in-out property <int> categories-count: 0;
     in-out property <[string]> categories-name: [];
     in-out property <[int]> categories-counts: [];
@@ -623,6 +812,8 @@ export component SettingsWindow inherits Window {
     callback command-add();
     callback command-paste();
     callback command-browse();
+    // M05 review C1: folder row actions pass the ROW INDEX (not a truncated id);
+    // Rust resolves index→FolderId from the current rows snapshot.
     callback command-edit(int);
     callback command-remove(int);
     callback command-toggle-enabled(int);
@@ -630,9 +821,16 @@ export component SettingsWindow inherits Window {
     callback command-check(int);
     callback command-create-category(string);
     callback command-delete-category(int);
+    callback command-confirm-delete-category(int);
+    callback command-cancel-delete-category();
     callback command-create-tag(string);
     callback command-delete-tag(int);
+    callback command-confirm-delete-tag(int);
+    callback command-cancel-delete-tag();
     callback command-filter-name(string);
+    callback command-filter-category(int);
+    callback command-filter-enabled(int);
+    callback command-set-sort(int);
     callback command-confirm-remove();
     callback command-cancel-remove();
     callback command-undo-remove();
@@ -647,6 +845,12 @@ export component SettingsWindow inherits Window {
     callback command-toggle-pinned();
     callback command-toggle-favorite();
     callback command-set-enabled(bool);
+    callback command-set-draft-weight(int);
+    callback command-cycle-draft-color();
+    callback command-set-draft-category(int);
+    callback command-toggle-draft-tag(int, bool);
+    callback command-resolve-duplicate(int);
+    callback command-set-one-level-import(bool);
     callback command-apply-batch();
     callback command-cancel-batch();
 
@@ -658,6 +862,29 @@ export component SettingsWindow inherits Window {
     in-out property <string> draft-title: "";
     in-out property <string> draft-error: "";
     in-out property <color> draft-color: #00000000;
+    in-out property <int> draft-weight: 0;
+    in-out property <bool> draft-duplicate: false;
+    in-out property <bool> draft-unsaved: false;
+    // UI-local: the unsaved-edit Cancel went through the two-step confirm.
+    in-out property <bool> draft-confirm-cancel: false;
+    // M05 review L1: the draft enabled flag (wired via `command-set-enabled`).
+    in-out property <bool> draft-enabled: true;
+    in-out property <[string]> draft-categories-model: [];
+    in-out property <int> draft-category-index: 0;
+    in-out property <[string]> draft-tags-model: [];
+    in-out property <[bool]> draft-tags-state: [];
+    // M05 review H3: per-row delete-confirmation arming (-1 = none armed).
+    in-out property <int> confirm-category-index: -1;
+    in-out property <int> confirm-tag-index: -1;
+    // M05 review M1: the one-level-import user-facing toggle (default OFF).
+    in-out property <bool> one-level-import-on: false;
+    // M05 review M2: folder-list filter + sort controls.
+    in-out property <[string]> filter-category-model: [];
+    in-out property <int> filter-category-index: 0;
+    in-out property <int> filter-status-index: 0;
+    in-out property <int> sort-index: 0;
+    // UI-local delete-confirm confirmation text state.
+    in-out property <string> confirm-banner: "";
     in-out property <bool> batch-visible: false;
     in-out property <int> batch-count: 0;
     in-out property <[string]> batch-name: [];
@@ -703,6 +930,8 @@ export component SettingsWindow inherits Window {
 
             if (root.page == 0): VerticalBox {
                 spacing: 8px;
+                // M05 review M2: name filter, category filter, status filter and
+                // the sort selector are bound to the existing pure logic.
                 HorizontalBox {
                     spacing: 8px;
                     LineEdit {
@@ -710,14 +939,41 @@ export component SettingsWindow inherits Window {
                         horizontal-stretch: 1;
                         edited(text) => { root.command-filter-name(text); }
                     }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: root.filter-category-model;
+                        current-index <=> root.filter-category-index;
+                        selected(cv) => { root.command-filter-category(root.filter-category-index); }
+                    }
+                    ComboBox {
+                        model: [UiStrings.filter-status-all, UiStrings.filter-status-enabled, UiStrings.filter-status-disabled];
+                        current-index <=> root.filter-status-index;
+                        selected(cv) => { root.command-filter-enabled(root.filter-status-index); }
+                    }
+                    ComboBox {
+                        model: [UiStrings.sort-name, UiStrings.sort-recent, UiStrings.sort-added];
+                        current-index <=> root.sort-index;
+                        selected(cv) => { root.command-set-sort(root.sort-index); }
+                    }
                     Button { text: UiStrings.action-add; clicked() => { root.command-add(); } }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    // M05 review M1: the user-facing enablement for controlled
+                    // one-level import (default OFF, persisted).
+                    Text { text: UiStrings.import-offer-title; color: UiTheme.text-secondary; font-size: 12px; }
+                    Switch {
+                        checked: root.one-level-import-on;
+                        toggled() => { root.command-set-one-level-import(root.one-level-import-on); }
+                    }
+                    Text { text: UiStrings.import-second-confirm; color: UiTheme.text-secondary; font-size: 11px; }
                 }
                 ScrollView {
                     height: 400px;
                     VerticalBox {
                         spacing: 2px;
                         for i in root.rows-count: FolderManagementRow {
-                            m-id: root.rows-ids[i];
+                            m-id: i;
                             m-name: root.rows-name[i];
                             m-path: root.rows-path[i];
                             m-category: root.rows-category[i];
@@ -777,7 +1033,15 @@ export component SettingsWindow inherits Window {
                             height: 34px;
                             Text { text: root.categories-name[i]; color: UiTheme.text; font-size: 13px; horizontal-stretch: 1; }
                             Text { text: root.categories-counts[i] + UiStrings.usage-suffix; color: UiTheme.text-secondary; font-size: 12px; }
-                            Button { text: UiStrings.category-delete; clicked() => { root.command-delete-category(i); } }
+                            // M05 review H3: two-step delete confirm. First click
+                            // arms this row's confirm state; only the explicit
+                            // confirm performs the delete (folder → 未分类).
+                            if (root.confirm-category-index == i) : HorizontalBox {
+                                spacing: 4px;
+                                Button { text: UiStrings.confirm-delete-category; clicked() => { root.command-confirm-delete-category(i); root.confirm-category-index = -1; } }
+                                Button { text: UiStrings.cancel; clicked() => { root.confirm-category-index = -1; } }
+                            }
+                            if (root.confirm-category-index != i) : Button { text: UiStrings.category-delete; clicked() => { root.confirm-category-index = i; } }
                         }
                         if (root.categories-count == 0): Text { text: UiStrings.field-not-empty; color: UiTheme.text-secondary; font-size: 13px; }
                     }
@@ -804,7 +1068,14 @@ export component SettingsWindow inherits Window {
                             height: 34px;
                             Text { text: root.tags-name[i]; color: UiTheme.text; font-size: 13px; horizontal-stretch: 1; }
                             Text { text: root.tags-usage[i] + UiStrings.usage-suffix; color: UiTheme.text-secondary; font-size: 12px; }
-                            Button { text: UiStrings.tag-delete; clicked() => { root.command-delete-tag(i); } }
+                            // M05 review H3: two-step delete confirm. The
+                            // confirmed delete only clears folder references.
+                            if (root.confirm-tag-index == i) : HorizontalBox {
+                                spacing: 4px;
+                                Button { text: UiStrings.confirm-delete-tag; clicked() => { root.command-confirm-delete-tag(i); root.confirm-tag-index = -1; } }
+                                Button { text: UiStrings.cancel; clicked() => { root.confirm-tag-index = -1; } }
+                            }
+                            if (root.confirm-tag-index != i) : Button { text: UiStrings.tag-delete; clicked() => { root.confirm-tag-index = i; } }
                         }
                         if (root.tags-count == 0): Text { text: UiStrings.field-not-empty; color: UiTheme.text-secondary; font-size: 13px; }
                     }
@@ -822,6 +1093,13 @@ export component SettingsWindow inherits Window {
                     padding: 12px;
                     spacing: 8px;
                     Text { text: root.draft-title; color: UiTheme.text; font-size: 14px; font-weight: 600; }
+                    // M05 review H2: unsaved-edit warning before leaving.
+                    if root.draft-unsaved : Rectangle {
+                        height: 22px;
+                        border-radius: 4px;
+                        background: UiTheme.selection;
+                        Text { text: "⚠ " + UiStrings.unsaved-changes; color: UiTheme.warning; font-size: 11px; }
+                    }
                     HorizontalBox {
                         spacing: 8px;
                         Text { text: UiStrings.field-name; color: UiTheme.text-secondary; }
@@ -843,12 +1121,79 @@ export component SettingsWindow inherits Window {
                         Button { text: UiStrings.paste; clicked() => { root.command-paste(); } }
                         Button { text: UiStrings.browse; clicked() => { root.command-browse(); } }
                     }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: UiStrings.field-note; color: UiTheme.text-secondary; }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: root.draft-note;
+                            placeholder-text: UiStrings.field-note;
+                            edited(text) => { root.command-set-draft-note(text); }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: UiStrings.field-category; color: UiTheme.text-secondary; }
+                        ComboBox {
+                            model: root.draft-categories-model;
+                            current-index <=> root.draft-category-index;
+                            selected(cv) => { root.command-set-draft-category(root.draft-category-index); }
+                        }
+                        Text { text: UiStrings.field-weight; color: UiTheme.text-secondary; }
+                        SpinBox {
+                            minimum: -100;
+                            maximum: 100;
+                            value: root.draft-weight;
+                            edited(v) => { root.command-set-draft-weight(v); }
+                        }
+                        Text { text: UiStrings.field-color; color: UiTheme.text-secondary; }
+                        Rectangle {
+                            width: 22px;
+                            height: 18px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: UiTheme.border;
+                            background: root.draft-color;
+                        }
+                        Button { text: UiStrings.field-color; clicked() => { root.command-cycle-draft-color(); } }
+                    }
+                    if root.draft-tags-model.length > 0 : HorizontalBox {
+                        spacing: 8px;
+                        Text { text: UiStrings.field-tags; color: UiTheme.text-secondary; }
+                        for tag[i] in root.draft-tags-model: tag-checkbox := CheckBox {
+                            text: root.draft-tags-model[i];
+                            checked: root.draft-tags-state[i];
+                            toggled() => { root.command-toggle-draft-tag(i, tag-checkbox.checked); }
+                        }
+                    }
+                    // M05 review L1: the draft enabled switch (wired to the
+                    // previously-dead `command-set-enabled` callback).
+                    HorizontalBox {
+                        spacing: 8px;
+                        enable-check := CheckBox {
+                            text: UiStrings.enabled-label;
+                            checked: root.draft-enabled;
+                            toggled() => { root.command-set-enabled(enable-check.checked); }
+                        }
+                    }
                     NoticeBar { v-text: root.draft-error; }
+                    // M05 review H2: duplicate-policy confirmation (a duplicate
+                    // path was entered): edit existing / save as different name.
+                    if root.draft-duplicate : HorizontalBox {
+                        spacing: 8px;
+                        Button { text: UiStrings.duplicate-cancel; clicked() => { root.command-resolve-duplicate(0); } }
+                        Button { text: UiStrings.duplicate-edit-existing; clicked() => { root.command-resolve-duplicate(1); } }
+                        Button { text: UiStrings.duplicate-save-different; clicked() => { root.command-resolve-duplicate(2); } }
+                    }
                     HorizontalBox {
                         alignment: end;
                         spacing: 8px;
-                        Button { text: UiStrings.cancel; clicked() => { root.command-cancel-draft(); } }
-                        Button { text: UiStrings.save; clicked() => { root.command-save-draft(); } }
+                        // M05 review H2: unsaved-edit Cancel is two-step.
+                        if root.draft-unsaved && !root.draft-confirm-cancel : Button { text: UiStrings.cancel; clicked() => { root.draft-confirm-cancel = true; } }
+                        if root.draft-unsaved && root.draft-confirm-cancel : Button { text: UiStrings.discard-changes; clicked() => { root.draft-confirm-cancel = false; root.command-cancel-draft(); } }
+                        if root.draft-unsaved && root.draft-confirm-cancel : Button { text: UiStrings.discard-no; clicked() => { root.draft-confirm-cancel = false; } }
+                        if !root.draft-unsaved : Button { text: UiStrings.cancel; clicked() => { root.command-cancel-draft(); } }
+                        Button { text: UiStrings.save; clicked() => { root.draft-confirm-cancel = false; root.command-save-draft(); } }
                     }
                 }
             }
