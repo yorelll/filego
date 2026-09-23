@@ -106,6 +106,6 @@
 3. **真实搜索输入框体验（IME composition、连续输入取消/旧结果覆盖）** 与结果排序的桌面观感属 M02-B/M03，本 slice 为纯核心无 UI。
 4. 正常情况下 GNU 全绿 + 待 MSVC CI 通过后，请求 r02 复审。**本修复不构成发布批准**；`APPROVED_FOR_RELEASE` 需后续 Release Candidate 发布评审与真实桌面手工验收。
 
-## r02 复审请求
+## r02 复审结果
 
-已逐条落实 `m02-search-review-r01` 的 F001–F005（全部 `ACCEPTED`，无拒绝/部分接受）。F001 的 reachable 分支（open_count desc）由端到端同分用例回归，manual_weight/pinned 分支由直接 `tiebreak` 表驱动单元测试覆盖（见 F001/F002 小节对"经 search() 可达性"的澄清）。全部既有 126 项测试保持通过，新增 6 项全绿。恳请原 reviewer（或另一名独立 reviewer）对修复 commit `eaba66d`（+本 response 文档）的 diff、新测试与 CI 证据复核，并以 `APPROVED_FOR_MILESTONE`（或继续 `CHANGES_REQUESTED`）作结。
+独立 reviewer 已在 `m02-search-review-r02.md` 完成复审：**F001–F005 全部 CLOSED，无新 finding**，结论 `APPROVED_FOR_MILESTONE`（非发布授权）。r02 独立核验了：`tiebreak` 降序修复与三个表驱动单元测试、同分 E2E 用例真正同分且由 tiebreak 定序、编辑距离长度护栏、最弱 token 定级文档、拼音首读音备注；权威 MSVC run `35820715554`（head `093941a`）全绿（133 项测试），取消链已透明记录。本里程碑批准不构成 `APPROVED_FOR_RELEASE`。
