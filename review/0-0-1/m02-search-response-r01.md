@@ -97,7 +97,7 @@
 
 | commit SHA | Workflow | run ID/URL | 结果 | 说明 |
 |---|---|---|---|---|
-| 修复代码 `eaba66d` + response 文档 `c0de7e5`..`2142c99`（仅文档，构建输入与 head 相同） | [Windows CI](https://github.com/yorelll/filego/actions/runs/35820614489) | `35820614489` | `进行中`（head `2142c99`，含全部修复代码与文档） | 早期 run（`35820240269`/`35820401923`/`35820488883`/`35820539585`）因文档-only 推送被取消；权威 MSVC 依据为最终推送 head `2142c99` 的 run，构建输入与修复代码 head `eaba66d` 相同。GNU 全绿仅证明本地快速反馈；MSVC 门禁结论以该 run 为准，监控至结束并回填（CLAUDE.md §3.2/§3.4）。 |
+| 修复代码 `eaba66d` + response 文档（仅文档，构建输入与 head 相同） | [Windows CI](https://github.com/yorelll/filego/actions/runs/35820240269) | 见下方说明 | 见下方 | 修复代码首次推送触发的 run `35820240269`（head `eaba66d`）因后续文档-only 推送被取消；此后 r01 response 文档提交（`c0de7e5`.. 最新 head，仅改 review/ 下文档）不改变构建输入，其各自触发的 run 对 MSVC 门禁等价。**权威 MSVC 依据 = 最终推送 head 的最新 Windows CI run**（`gh run list --branch feature/m00-foundation` 首条，head 为最新文档提交），结论由 reviewer 复核时确认。GNU 全绿仅证明本地快速反馈（CLAUDE.md §3.2/§3.4）。 |
 
 ## 未解决事项与待人工验证项
 
