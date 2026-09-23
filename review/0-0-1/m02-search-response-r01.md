@@ -8,7 +8,7 @@
 - **Implementation agent:** M02-A 修复 implementation agent（仅实现、补测与触发 CI；未参与 `m02-search-review-r01` 评审，修复期未做评审）
 - **对应 review 文档:** [`m02-search-review-r01.md`](m02-search-review-r01.md)
 - **评审前（base）commit SHA:** `18c48f5040193be3990251ad8a9c7a11f57efa7a`
-- **修复后（head）commit SHA:** `eaba66d`（消息 `fix: correct tie-break order and add tie-break coverage`）＋随后的 response 文档提交 `<response-sha>`
+- **修复后（head）commit SHA:** `eaba66d`（消息 `fix: correct tie-break order and add tie-break coverage`）＋随后的 response 文档提交 `c0de7e5`
 - **Response 日期:** 2026-09-21
 
 ## Summary
@@ -97,7 +97,7 @@
 
 | commit SHA | Workflow | run ID/URL | 结果 | 说明 |
 |---|---|---|---|---|
-| `eaba66d`（修复代码）+ response 文档 | [Windows CI](https://github.com/yorelll/filego/actions/workflows/ci.yml) | <r02-ci-run-id> | `未验证`（待推送后获取） | 待推送并获取 run 后回填。GNU 全绿仅证明本地快速反馈；MSVC 门禁结论以该 run 为准（CLAUDE.md §3.2/§3.4）。 |
+| `eaba66d`（修复代码）+ response 文档 `c0de7e5`（仅文档，构建输入与 head 相同） | [Windows CI](https://github.com/yorelll/filego/actions/runs/35820240269) | `35820240269` | `进行中`（push 触发，head `eaba66d`） | 推送后触发，监控至结束并回填结论。GNU 全绿仅证明本地快速反馈；MSVC 门禁结论以该 run 为准（CLAUDE.md §3.2/§3.4）。 |
 
 ## 未解决事项与待人工验证项
 
