@@ -1,50 +1,457 @@
-import { AboutSlint, LineEdit, VerticalBox } from "std-widgets.slint";
+// FileGo — M03 main search window.
+//
+// Adapter design (documented):
+//  - This file is intentionally "dumb": it renders state pushed from Rust
+//    (exported globals `UiStrings` / `UiTheme`, plus root `in-out` state
+//    properties) and forwards user gestures through `command-*` callbacks.
+//    All decisions live in the pure-Rust `presentation::view_model::SearchViewModel`
+//    (single source of truth).
+//  - Resolved UI strings are pushed into the `UiStrings` global from Rust (the
+//    i18n catalog in `presentation::i18n`), NOT via Slint's built-in `@tr()`.
+//    Rationale: the logic layer holds no presentation text and the zh/en
+//    key-parity tests run as plain Rust without a Slint compilation.
+//  - Theme tokens are pushed into the `UiTheme` global from Rust. The bundled
+//    Fluent widgets resolve their own palette from `Palette.color-scheme`,
+//    which the adapter sets to match (`ColorScheme.Light`/`Dark`).
+//  - IME gate hook point: the adapter sets `ime-composing` here AND
+//    `SearchViewModel::set_ime_composition` when native preedit starts/ends
+//    (M04+ native adapter). While composing, the input's `key-pressed` handler
+//    rejects Enter/arrow keys so they reach the IME (which owns them) instead
+//    of triggering result actions. The ViewModel gate is a second, logic-level
+//    defense for any path around the UI. In Slint 1.18 the only UI-side signal
+//    is `TextInput.preedit-text` (internal); final native wiring is a
+//    manual-acceptance item (M03 task list).
+//
+// Keyboard routing (M03.3):
+//  - Search LineEdit `key-pressed`: Enter→open, Escape→close, ↑/↓→navigate,
+//    Alt+H→toggle hints. All other keys (including Ctrl+A, Ctrl+Backspace,
+//    Ctrl+C) return `reject` so the native text behavior is kept.
+//  - Results list is wrapped in a FocusScope (tab order: search → results); its
+//    key-pressed handles ↑/↓/Enter and Ctrl+C (copy path).
+//  - While `ime-composing` is set, Enter/↑/↓ are rejected to the IME.
 
-export component AppWindow inherits Window {
-    title: "FileGo";
-    icon: @image-url("../assets/icons/filego.png");
-    background: #f7f8fa;
-    preferred-width: 600px;
-    min-width: 480px;
-    max-width: 760px;
-    preferred-height: 148px;
-    no-frame: true;
-    always-on-top: true;
+import { HorizontalBox, LineEdit, VerticalBox } from "std-widgets.slint";
 
-    callback hide-requested();
+// ---------------------------------------------------------------------------
+// Exported globals: strings + theme, pushed from Rust (i18n module + theme.rs)
+// ---------------------------------------------------------------------------
+export global UiStrings {
+    in-out property <string> search-placeholder: "";
+    in-out property <string> clear: "";
+    in-out property <string> empty-hint: "";
+    in-out property <string> no-data-title: "";
+    in-out property <string> no-data-body: "";
+    in-out property <string> filtered-title: "";
+    in-out property <string> filtered-body: "";
+    in-out property <string> no-match-title: "";
+    in-out property <string> no-match-body: "";
+    in-out property <string> error-load-title: "";
+    in-out property <string> error-load-body: "";
+    in-out property <string> error-save-title: "";
+    in-out property <string> error-save-body: "";
+    in-out property <string> error-search-title: "";
+    in-out property <string> error-search-body: "";
+    in-out property <string> hint-select: "";
+    in-out property <string> hint-open: "";
+    in-out property <string> hint-close: "";
+    in-out property <string> hint-toggle: "";
+    in-out property <string> count: "";
+    in-out property <string> inaccessible: "";
+    in-out property <string> inaccessible-tooltip: "";
+}
 
-    VerticalBox {
-        padding: 16px;
-        spacing: 12px;
+export global UiTheme {
+    in-out property <color> background: #F7F8FA;
+    in-out property <color> surface: #FFFFFF;
+    in-out property <color> border: #E2E5EA;
+    in-out property <color> text: #1B1B1F;
+    in-out property <color> text-secondary: #5F6368;
+    in-out property <color> accent: #005FB8;
+    in-out property <color> on-accent: #FFFFFF;
+    in-out property <color> warning: #8A5A00;
+    in-out property <color> selection: #DEEBFA;
+    // NOTE(M03.4): the bundled Fluent widgets resolve their palette from
+    // SlintInternal.color-scheme (context level). Setting that context scheme
+    // from Rust is not in Slint 1.18's public `Window` API; the system-detection
+    // hook therefore lives in `ResolvedTheme::resolve`, and the adapter passes a
+    // concrete scheme. Native dark-mode switching for the *widget palette* is a
+    // documented manual-acceptance item (M07.x / M08).
+}
 
-        Rectangle {
-            height: 56px;
-            border-radius: 14px;
-            background: #ffffff;
-            border-color: #e2e5ea;
-            border-width: 1px;
+// ---------------------------------------------------------------------------
+// Result row component (56px, two lines).
+// ---------------------------------------------------------------------------
+component ResultRow inherits Rectangle {
+    in property <int> row-index;
+    in property <string> row-name;
+    in property <string> row-path;
+    in property <string> row-category;
+    in property <string> row-tags;
+    in property <bool> row-inaccessible;
+    in property <bool> row-selected;
 
-            LineEdit {
-                x: 16px;
-                y: 8px;
-                width: parent.width - 32px;
-                height: 40px;
-                placeholder-text: "搜索文件夹、标签或路径";
-                font-size: 16px;
+    // Callbacks the AppWindow wires to commands.
+    callback row-clicked(int);
+    callback row-activated(int);
+
+    height: 56px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: row-selected ? UiTheme.accent : UiTheme.border;
+    background: row-selected ? UiTheme.selection : transparent;
+
+    // a11y: not color-only — the accessible label and the secondary text line
+    // also carry the inaccessible state (text/glyph).
+    accessible-role: list-item;
+    accessible-label: row-name + (row-inaccessible ? " (" + UiStrings.inaccessible + ")" : "");
+    accessible-item-selectable: true;
+    accessible-item-selected: row-selected;
+    accessible-item-index: row-index;
+
+    TouchArea {
+        // M03.3: single click selects, double-click opens.
+        clicked() => {
+            root.row-clicked(root.row-index);
+        }
+        double-clicked() => {
+            root.row-activated(root.row-index);
+        }
+    }
+
+    VerticalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 2px;
+
+        // line 1: name (+ status glyph for inaccessible)
+        HorizontalLayout {
+            spacing: 6px;
+
+            Text {
+                text: row-name;
+                color: row-inaccessible ? UiTheme.warning : UiTheme.text;
+                font-size: 14px;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+
+            if (row-inaccessible): Text {
+                text: "⚠ " + UiStrings.inaccessible;
+                color: UiTheme.warning;
+                font-size: 12px;
+                vertical-alignment: center;
+                Tooltip {
+                    Text {
+                        text: UiStrings.inaccessible-tooltip;
+                    }
+                }
             }
         }
 
+        // line 2: path · category · tag with ellipsis and full-path tooltip.
         Text {
-            text: "FileGo 0.0.1 · M00 architecture shell";
-            color: #626975;
+            text: row-path + (!row-category.is-empty ? " · " + row-category : "")
+                   + (!row-tags.is-empty ? " · " + row-tags : "");
+            color: UiTheme.text-secondary;
             font-size: 12px;
-            horizontal-alignment: center;
+            overflow: elide;
+            vertical-alignment: center;
+            vertical-stretch: 1;
+            Tooltip {
+                Text {
+                    text: row-path;
+                }
+            }
         }
-
-        AboutSlint {}
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main window.
+// ---------------------------------------------------------------------------
+export component AppWindow inherits Window {
+    title: "FileGo";
+    icon: @image-url("../assets/icons/filego.png");
+    preferred-width: 600px;
+    min-width: 480px;
+    max-width: 760px;
+    preferred-height: 140px;
+    no-frame: true;
+    always-on-top: true;
+
+    // --- adapter-in state (pushed from Rust) -----------------------------
+    in-out property <string> state-query: "";
+    in-out property <int> state-selected: -1;
+    in-out property <bool> state-busy: false;
+    in-out property <bool> state-stale: false;
+    in-out property <bool> hints-visible: true;
+    in-out property <bool> ime-composing: false;
+    in-out property <bool> state-shows-empty: false;
+    in-out property <string> state-empty-title: "";
+    in-out property <string> state-empty-body: "";
+    // Row data (parallel arrays the adapter updates in one push).
+    in-out property <int> rows-count: 0;
+    in-out property <[string]> rows-name: [];
+    in-out property <[string]> rows-path: [];
+    in-out property <[string]> rows-category: [];
+    in-out property <[string]> rows-tags: [];
+    in-out property <[bool]> rows-inaccessible: [];
+
+    // --- callbacks (commands to Rust) ------------------------------------
+    callback command-query-edited(string);
+    callback command-clear-query();
+    callback command-navigate-up();
+    callback command-navigate-down();
+    callback command-escape();
+    callback command-toggle-hints();
+    callback command-select-index(int);
+    callback command-open-index(int);
+    callback command-open-selected();
+    callback command-copy-path();
+    callback command-set-overlay(bool);
+    callback hide-requested();
+
+    background: UiTheme.background;
+    default-font-family: "Segoe UI Variable, Microsoft YaHei UI, sans-serif";
+    default-font-size: 14px;
+
+    // ------------------------------------------------------------------
+    // Root stack: search box, results area, hint bar.
+    // ------------------------------------------------------------------
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        // Search box --------------------------------------------------
+        Rectangle {
+            height: 56px;
+            border-radius: 14px;
+            border-width: 1px;
+            border-color: UiTheme.border;
+            background: UiTheme.surface;
+
+            // search icon (magnifier glyph)
+            Text {
+                x: 14px;
+                y: (parent.height - self.height) / 2;
+                width: 22px;
+                height: 22px;
+                text: "🔍";
+                font-size: 18px;
+                color: UiTheme.text-secondary;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-label: "search";
+            }
+
+            LineEdit {
+                x: 46px;
+                y: 6px;
+                width: parent.width - 46px - (!root.state-query.is-empty ? 44px : 12px);
+                height: 44px;
+                placeholder-text: UiStrings.search-placeholder;
+                font-size: 16px;
+                text: root.state-query;
+
+                // M03.3 keyboard routing. Enter/arrows/Escape are intercepted;
+                // everything else falls through to native text behavior.
+                key-pressed(event) => {
+                    if (root.ime-composing) {
+                        // The IME owns the keys during composition.
+                        reject
+                    } else if (event.text == Key.Return) {
+                        root.command-open-selected();
+                        accept
+                    } else if (event.text == Key.Escape) {
+                        root.command-escape();
+                        accept
+                    } else if (event.text == Key.UpArrow) {
+                        root.command-navigate-up();
+                        accept
+                    } else if (event.text == Key.DownArrow) {
+                        root.command-navigate-down();
+                        accept
+                    } else if (event.modifiers.alt && event.text == Key.H) {
+                        root.command-toggle-hints();
+                        accept
+                    } else {
+                        // Ctrl+A, Ctrl+Backspace, Ctrl+C and plain text stay native.
+                        reject
+                    }
+                }
+
+                edited(text) => { root.command-query-edited(text); }
+                accepted(text) => { root.command-open-selected(); }
+            }
+
+            // conditional clear button: only when the query is non-empty.
+            if (!root.state-query.is-empty): Rectangle {
+                x: parent.width - 38px;
+                y: (parent.height - 28px) / 2;
+                width: 28px;
+                height: 28px;
+                border-radius: 14px;
+                background: UiTheme.selection;
+
+                Text {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    text: "✕";
+                    font-size: 13px;
+                    color: UiTheme.text;
+                    accessible-role: button;
+                    accessible-label: UiStrings.clear;
+                }
+
+                TouchArea {
+                    clicked() => { root.command-clear-query(); }
+                }
+            }
+        }
+
+        // Results area (compact window hides it until there is something) ---
+        if (root.rows-count > 0 || root.state-busy || root.state-shows-empty): VerticalBox {
+            spacing: 4px;
+
+            // FocusScope for the results list: tab target after the search box.
+            results-focus := FocusScope {
+                focus-on-tab-navigation: true;
+
+                key-pressed(event) => {
+                    if (event.text == Key.UpArrow) {
+                        root.command-navigate-up();
+                        accept
+                    } else if (event.text == Key.DownArrow) {
+                        root.command-navigate-down();
+                        accept
+                    } else if (event.text == Key.Return) {
+                        root.command-open-selected();
+                        accept
+                    } else if (event.modifiers.control && (event.text == "c" || event.text == "C")) {
+                        // Ctrl+C on a focused result copies its path.
+                        root.command-copy-path();
+                        accept
+                    } else if (event.text == Key.Escape) {
+                        root.command-escape();
+                        accept
+                    } else {
+                        reject
+                    }
+                }
+
+                Rectangle {
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: UiTheme.border;
+                    background: UiTheme.surface;
+                    min-height: 0px;
+                    max-height: 480px;
+
+                    // results list (rows pushed from Rust as parallel arrays)
+                    VerticalBox {
+                        padding: 4px;
+                        spacing: 2px;
+                        width: 100%;
+
+                        for row[i] in root.rows-name: ResultRow {
+                            row-index: i;
+                            row-name: root.rows-name[i];
+                            row-path: root.rows-path[i];
+                            row-category: root.rows-category[i];
+                            row-tags: root.rows-tags[i];
+                            row-inaccessible: root.rows-inaccessible[i];
+                            row-selected: root.state-selected == i;
+                            row-clicked(index) => { root.command-select-index(index); }
+                            row-activated(index) => {
+                                root.command-select-index(index);
+                                root.command-open-index(index);
+                            }
+                        }
+
+                        // empty/error state (title + body pushed from Rust)
+                        if (root.rows-name.length == 0 && root.state-shows-empty): Rectangle {
+                            height: 72px;
+                            width: 100%;
+
+                            Text {
+                                x: 16px;
+                                y: 6px;
+                                width: parent.width - 32px;
+                                text: root.state-empty-title;
+                                color: UiTheme.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                x: 16px;
+                                y: 30px;
+                                width: parent.width - 32px;
+                                text: root.state-empty-body;
+                                color: UiTheme.text-secondary;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // plain empty query hint (no results, not busy)
+                        if (root.rows-name.length == 0 && !root.state-shows-empty && !root.state-busy): Rectangle {
+                            height: 48px;
+                            width: 100%;
+
+                            Text {
+                                x: 16px;
+                                y: 12px;
+                                width: parent.width - 32px;
+                                text: UiStrings.empty-hint;
+                                color: UiTheme.text-secondary;
+                                font-size: 14px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (root.rows-count > 0): Text {
+                text: UiStrings.count;
+                color: UiTheme.text-secondary;
+                font-size: 12px;
+            }
+        }
+
+        // Keyboard hint bar (hideable via Alt+H) --------------------------
+        if (root.hints-visible): Rectangle {
+            height: 28px;
+            border-radius: 8px;
+            background: UiTheme.surface;
+            border-width: 1px;
+            border-color: UiTheme.border;
+
+            HorizontalBox {
+                padding-left: 8px;
+                padding-right: 8px;
+                padding-top: 2px;
+                padding-bottom: 2px;
+                alignment: start;
+                spacing: 12px;
+
+                Text { text: UiStrings.hint-select; color: UiTheme.text-secondary; font-size: 12px; }
+                Text { text: UiStrings.hint-open; color: UiTheme.text-secondary; font-size: 12px; }
+                Text { text: UiStrings.hint-close; color: UiTheme.text-secondary; font-size: 12px; }
+                Text { text: UiStrings.hint-toggle; color: UiTheme.text-secondary; font-size: 12px; }
+            }
+        }
+    }
+}
+
+// Keep the tray shell (M00) intact — wiring stays in M04.
 export component AppTray inherits SystemTrayIcon {
     icon: @image-url("../assets/icons/filego-tray.png");
     title: "FileGo";
@@ -58,12 +465,12 @@ export component AppTray inherits SystemTrayIcon {
 
     Menu {
         MenuItem {
-            title: "打开 FileGo";
+            title: @tr("Open FileGo");
             activated => { root.open-window(); }
         }
         MenuSeparator {}
         MenuItem {
-            title: "退出";
+            title: @tr("Exit");
             activated => { root.quit-requested(); }
         }
     }
