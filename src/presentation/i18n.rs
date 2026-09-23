@@ -91,6 +91,9 @@ pub enum Msg {
     ErrorSaveBody,
     ErrorSearchTitle,
     ErrorSearchBody,
+    /// The shell could not open the selected folder (M04.5).
+    ErrorOpenTitle,
+    ErrorOpenBody,
     // --- overlays / menu ---
     FilterPanelTitle,
     ContextMenuOpen,
@@ -129,6 +132,8 @@ impl Msg {
             Msg::ErrorSaveBody => "error.save.body",
             Msg::ErrorSearchTitle => "error.search.title",
             Msg::ErrorSearchBody => "error.search.body",
+            Msg::ErrorOpenTitle => "error.open.title",
+            Msg::ErrorOpenBody => "error.open.body",
             Msg::FilterPanelTitle => "overlay.filter_panel.title",
             Msg::ContextMenuOpen => "contextmenu.open",
             Msg::ContextMenuCopyPath => "contextmenu.copy_path",
@@ -184,6 +189,8 @@ pub const ALL_KEYS: &[&str] = &[
     "error.save.body",
     "error.search.title",
     "error.search.body",
+    "error.open.title",
+    "error.open.body",
     "overlay.filter_panel.title",
     "contextmenu.open",
     "contextmenu.copy_path",
@@ -226,6 +233,11 @@ mod zh_cn {
         ("error.save.body", "更改未能保存，之前的副本未被覆盖。"),
         ("error.search.title", "搜索失败"),
         ("error.search.body", "搜索无法完成，请重试。"),
+        ("error.open.title", "无法打开文件夹"),
+        (
+            "error.open.body",
+            "该文件夹暂时无法打开（可能已断开或没有权限）。按 Enter 重试，Ctrl+C 复制路径。",
+        ),
         ("overlay.filter_panel.title", "筛选"),
         ("contextmenu.open", "打开"),
         ("contextmenu.copy_path", "复制路径"),
@@ -283,6 +295,11 @@ mod en_us {
         (
             "error.search.body",
             "The search could not be completed, try again.",
+        ),
+        ("error.open.title", "Could not open folder"),
+        (
+            "error.open.body",
+            "This folder cannot be opened right now (it may be offline or have no permission). Press Enter to retry or Ctrl+C to copy the path.",
         ),
         ("overlay.filter_panel.title", "Filters"),
         ("contextmenu.open", "Open"),

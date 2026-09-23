@@ -464,6 +464,19 @@ export component AppTray inherits SystemTrayIcon {
     callback toggle-window();
     callback open-window();
     callback quit-requested();
+    // ---- M04.1 tray actions ---------------------------------------------
+    callback add-folder();
+    callback open-settings();
+    callback toggle-launch-at-login();
+    callback toggle-pause-hotkeys();
+    callback show-about();
+    // Checkbox-style state is delivered as a text+glyph prefix (Slint's Windows
+    // tray backend does not render `MF_CHECKED`; the task requires state to be
+    // text+glyph, not color-only). The native menu rebuilds reactively when the
+    // string changes. Empty when unchecked, "✓ " when checked. `in-out` so the
+    // adapter can drive them from Rust (public setters are generated).
+    in-out property <string> launch-at-login-glyph: "";
+    in-out property <string> pause-hotkeys-glyph: "";
 
     clicked => { root.toggle-window(); }
 
@@ -471,6 +484,29 @@ export component AppTray inherits SystemTrayIcon {
         MenuItem {
             title: @tr("Open FileGo");
             activated => { root.open-window(); }
+        }
+        MenuItem {
+            title: @tr("Add Folder…");
+            activated => { root.add-folder(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: @tr("Settings");
+            enabled: false; // M06 wires the settings window.
+            activated => { root.open-settings(); }
+        }
+        MenuItem {
+            title: root.launch-at-login-glyph + @tr("Launch at login");
+            activated => { root.toggle-launch-at-login(); }
+        }
+        MenuItem {
+            title: root.pause-hotkeys-glyph + @tr("Pause hotkeys");
+            activated => { root.toggle-pause-hotkeys(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: @tr("About FileGo");
+            activated => { root.show-about(); }
         }
         MenuSeparator {}
         MenuItem {

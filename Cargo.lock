@@ -1138,12 +1138,14 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "pinyin",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "slint",
  "slint-build",
  "tempfile",
  "uuid",
+ "windows",
  "winresource",
 ]
 
@@ -3925,6 +3927,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "pin-weak",
+ "raw-window-handle",
  "slint-macros",
  "unicode-segmentation",
  "vtable",

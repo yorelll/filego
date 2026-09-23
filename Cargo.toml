@@ -26,8 +26,49 @@ slint = { version = "=1.18.0", default-features = false, features = [
     "software-renderer-systemfonts",
     "accessibility",
     "system-tray",
+    "raw-window-handle-06",
 ] }
 uuid = { version = "=1.26.1", features = ["serde", "v4"] }
+
+# M04 foreground/activation fallback needs the native HWND of the Slint window;
+# Slint 1.18 exposes it through the raw-window-handle 0.6 feature. This crate is
+# tiny, standards-cross-platform, and MIT/Apache-2.0 (already in the tree via
+# Slint), so cargo-deny/cargo-about pass unchanged.
+raw-window-handle = { version = "=0.6.2", default-features = false }
+
+# M04 native Windows integration. Feature list is intentionally minimal and
+# mirrors exactly the Win32 surface the `platform::windows` modules use:
+#   - Foundation: HWND/HANDLE/RECT/POINT/GetLastError/CloseHandle/constants
+#   - Graphics_Gdi: MonitorFromPoint/GetMonitorInfoW/HMONITOR
+#   - UI_HiDpi: GetDpiForMonitor
+#   - UI_Input_KeyboardAndMouse: RegisterHotKey/UnregisterHotKey + VK constants
+#   - UI_WindowsAndMessaging: hidden HWND message window + WM_COPYDATA dispatch
+#     + SetForegroundWindow/GetCursorPos/ShowWindow fallback
+#   - System_Threading: CreateMutexW/OpenMutexW single-instance,
+#     AttachThreadInput/GetCurrentThreadId focus fallback
+#   - Security: SECURITY_ATTRIBUTES parameter type of CreateMutexW
+#   - System_Registry + System_WindowsProgramming + UI_Shell:
+#     ShellExecuteExW open + HKCU Run launch-at-login read/write
+#   - System_DataExchange: COPYDATASTRUCT for WM_COPYDATA activation
+#   - System_LibraryLoader: GetModuleHandleW/GetModuleFileNameW (window class +
+#     launch-at-login exe path)
+# The windows-family crates are MIT-licensed (cargo-deny/cargo-about verified).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+    "Win32_System_DataExchange",
+] }
 
 [build-dependencies]
 slint-build = "=1.18.0"

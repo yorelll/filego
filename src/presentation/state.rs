@@ -37,6 +37,9 @@ pub enum SearchFailure {
     Save,
     /// The search itself cannot run against the given data.
     Search,
+    /// The shell could not open the selected folder (M04.5). The window stays
+    /// up so Retry (Enter) and Copy (Ctrl+C) keep working on the selection.
+    Open,
 }
 
 impl SearchFailure {
@@ -50,6 +53,9 @@ impl SearchFailure {
                 "state could not be saved; the previous stored copy was not overwritten"
             }
             SearchFailure::Search => "the search could not be completed",
+            SearchFailure::Open => {
+                "the folder could not be opened; the window stays up for retry or copy"
+            }
         }
     }
 }

@@ -195,6 +195,20 @@ impl SearchViewModel {
         }
     }
 
+    /// Surface a folder-open failure (M04.5): the window stays up, the
+    /// selection remains so Retry (Enter) / Copy (Ctrl+C) still act on it. The
+    /// selection and rows are left untouched; only the failure banner changes.
+    pub fn set_open_failure(&mut self) {
+        self.state.failure = Some(SearchFailure::Open);
+    }
+
+    /// Clear any open-failure banner (a fresh search or a successful retry).
+    pub fn clear_failure(&mut self) {
+        if matches!(self.state.failure, Some(SearchFailure::Open)) {
+            self.state.failure = None;
+        }
+    }
+
     /// Apply one user command. Returns the external effects the adapter must
     /// perform (in order). The same effects are also delivered to
     /// [`Self::effects`].
