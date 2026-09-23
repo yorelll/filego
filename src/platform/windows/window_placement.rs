@@ -138,6 +138,58 @@ pub fn physical_size_for_cursor(logical_width: f32, logical_height: f32) -> (i32
     )
 }
 
+/// Pure placement projection for per-monitor DPI (M04.4 / F003).
+///
+/// Scales `logical_width/height` by the TARGET monitor's `dpi_scale` (the
+/// monitor under `cursor`) and applies the pure placement rules against that
+/// monitor's `work_area`. This is the correct sizing for placement: the window
+/// is about to be shown on the target monitor and renders at that monitor's
+/// DPI, so centering/clamping must use `logical × target_scale`, never the
+/// window's *current* `scale_factor()` (which may describe a different
+/// monitor in mixed-DPI layouts).
+///
+/// Degenerate inputs are defended: a non-finite/non-positive scale falls back
+/// to 1.0 and sizes are clamped to at least 1 physical pixel.
+pub fn physical_rect_for_monitor(
+    cursor: (i32, i32),
+    work_area: MonitorRect,
+    dpi_scale: f32,
+    logical_width: f32,
+    logical_height: f32,
+) -> WindowRect {
+    let scale = if dpi_scale > 0.0 && dpi_scale.is_finite() {
+        dpi_scale
+    } else {
+        1.0
+    };
+    let width = (logical_width * scale).round().max(1.0) as i32;
+    let height = (logical_height * scale).round().max(1.0) as i32;
+    window_position::compute_position(cursor, &[work_area], width, height).unwrap_or(WindowRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    })
+}
+
+/// One-shot placement for the cursor monitor (M04.4 / F003): gather the cursor
+/// position, the target monitor's work area and its DPI scale, and return the
+/// full physical rect for a logical window size. Falls back to the primary work
+/// area (0,0 point, scale 1.0) when the cursor is unobtainable or outside every
+/// monitor.
+pub fn placement_rect_for_cursor(logical_width: f32, logical_height: f32) -> WindowRect {
+    let (cursor, monitors) = placement_inputs();
+    let cursor = cursor.unwrap_or((0, 0));
+    let work_area = monitors.first().copied().unwrap_or(MonitorRect {
+        left: 0,
+        top: 0,
+        right: 1,
+        bottom: 1,
+    });
+    let dpi_scale = dpi_scale_at(cursor.0, cursor.1);
+    physical_rect_for_monitor(cursor, work_area, dpi_scale, logical_width, logical_height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +200,71 @@ mod tests {
         // (we clamp internally), never NaN/0.
         let scale = dpi_scale_at(-1_000_000, -1_000_000);
         assert!(scale > 0.0 && scale.is_finite());
+    }
+
+    // F003: placement must be computed with the TARGET monitor's DPI scale, not
+    // the window's current global scale factor. A synthetic 200% secondary
+    // monitor proves the physical size (and thus centering/clamping) follows
+    // the target scale.
+    #[test]
+    fn physical_rect_for_monitor_uses_the_target_monitor_dpi() {
+        let secondary = MonitorRect {
+            left: 3840,
+            top: 0,
+            right: 7680,
+            bottom: 2160,
+        };
+        // Cursor on the secondary monitor; its DPI is 200% (scale 2.0).
+        let cursor = (5000, 800);
+        let rect = physical_rect_for_monitor(cursor, secondary, 2.0, 600.0, 140.0);
+
+        // 600x140 logical → 1200x280 physical at 200%.
+        assert_eq!(rect.width, 1200);
+        assert_eq!(rect.height, 280);
+        // Centered horizontally on the secondary work area (3840..7680).
+        assert_eq!(rect.x, 3840 + (3840 - 1200) / 2);
+        // Top ~10% of the work-area height.
+        assert_eq!(rect.y, 2160 / 10);
+        // Fully inside the target monitor and never spanning.
+        assert!(rect.x >= secondary.left && rect.x + rect.width <= secondary.right);
+        assert!(rect.y >= secondary.top && rect.y + rect.height <= secondary.bottom);
+    }
+
+    #[test]
+    fn physical_rect_for_monitor_clamps_with_the_target_scale() {
+        // A window larger than the work area under a 150% scale must clamp with
+        // the physical (scaled) size, staying fully inside the target monitor.
+        let work = MonitorRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let rect = physical_rect_for_monitor((960, 500), work, 1.5, 1920.0, 1040.0);
+        // 1920x1040 logical * 1.5 → 2880x1560 physical → clamped to the work area.
+        assert_eq!(rect.width, 1920);
+        assert_eq!(rect.height, 1040);
+        assert!(rect.x >= work.left && rect.x + rect.width <= work.right);
+        assert!(rect.y >= work.top && rect.y + rect.height <= work.bottom);
+    }
+
+    #[test]
+    fn physical_rect_for_monitor_defends_bad_scale_and_large_sizes() {
+        // NaN / zero / negative scale falls back to 1.0 (never a -NaN size).
+        let work = MonitorRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        for bad_scale in [f32::NAN, 0.0, -2.0] {
+            let rect = physical_rect_for_monitor((960, 500), work, bad_scale, 600.0, 140.0);
+            assert_eq!(rect.width, 600);
+            assert_eq!(rect.height, 140);
+        }
+        // A zero logical size is clamped to at least 1 physical px.
+        let rect = physical_rect_for_monitor((960, 500), work, 2.0, 0.0, 0.0);
+        assert_eq!(rect.width, 1);
+        assert_eq!(rect.height, 1);
     }
 }

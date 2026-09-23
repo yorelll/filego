@@ -7,6 +7,7 @@
 //! state, but they are never serialized and never written to logs.
 
 use super::theme::ResolvedTheme;
+use crate::platform::shell_open::OpenErrorKind;
 use crate::search::NoResultReason;
 
 /// A fully rendered row for the results list.
@@ -39,7 +40,9 @@ pub enum SearchFailure {
     Search,
     /// The shell could not open the selected folder (M04.5). The window stays
     /// up so Retry (Enter) and Copy (Ctrl+C) keep working on the selection.
-    Open,
+    /// Carries the anonymous [`OpenErrorKind`] so the presenter can select a
+    /// per-kind localized message (F006); the kind never carries a path.
+    Open(OpenErrorKind),
 }
 
 impl SearchFailure {
@@ -53,9 +56,7 @@ impl SearchFailure {
                 "state could not be saved; the previous stored copy was not overwritten"
             }
             SearchFailure::Search => "the search could not be completed",
-            SearchFailure::Open => {
-                "the folder could not be opened; the window stays up for retry or copy"
-            }
+            SearchFailure::Open(kind) => kind.as_detail(),
         }
     }
 }

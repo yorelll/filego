@@ -198,13 +198,15 @@ impl SearchViewModel {
     /// Surface a folder-open failure (M04.5): the window stays up, the
     /// selection remains so Retry (Enter) / Copy (Ctrl+C) still act on it. The
     /// selection and rows are left untouched; only the failure banner changes.
-    pub fn set_open_failure(&mut self) {
-        self.state.failure = Some(SearchFailure::Open);
+    /// `kind` is the anonymous [`OpenErrorKind`]; the presenter renders the
+    /// matching localized message (F006) and nothing path-like crosses.
+    pub fn set_open_failure(&mut self, kind: crate::platform::shell_open::OpenErrorKind) {
+        self.state.failure = Some(SearchFailure::Open(kind));
     }
 
     /// Clear any open-failure banner (a fresh search or a successful retry).
     pub fn clear_failure(&mut self) {
-        if matches!(self.state.failure, Some(SearchFailure::Open)) {
+        if matches!(self.state.failure, Some(SearchFailure::Open(_))) {
             self.state.failure = None;
         }
     }
@@ -965,6 +967,51 @@ mod tests {
         assert!(!view_model.state().stale);
         assert_eq!(view_model.state().busy, None);
         assert_eq!(view_model.state().rows.len(), 1);
+    }
+
+    // --- F007: open-failure state machine direct tests ----------------------
+
+    #[test]
+    fn set_open_failure_sets_open_state_and_keeps_rows_selection() {
+        let mut view_model = view_model();
+        // Establish a selected row.
+        view_model.handle(ViewCommand::QueryEdited("Photos".to_owned()));
+        view_model.handle(ViewCommand::SelectMove(SelectionMove::First));
+        let rows_before = view_model.state().rows.clone();
+        let selected_before = view_model.state().selected;
+
+        view_model.set_open_failure(crate::platform::shell_open::OpenErrorKind::AccessDenied);
+        assert_eq!(
+            view_model.state().failure,
+            Some(crate::presentation::state::SearchFailure::Open(
+                crate::platform::shell_open::OpenErrorKind::AccessDenied
+            ))
+        );
+        // The failure banner must not disturb the selection or the rows.
+        assert_eq!(view_model.state().rows, rows_before);
+        assert_eq!(view_model.state().selected, selected_before);
+    }
+
+    #[test]
+    fn clear_failure_only_clears_the_open_failure() {
+        let mut view_model = view_model();
+        view_model.set_open_failure(crate::platform::shell_open::OpenErrorKind::NotFound);
+        assert!(matches!(
+            view_model.state().failure,
+            Some(crate::presentation::state::SearchFailure::Open(_))
+        ));
+
+        view_model.clear_failure();
+        assert_eq!(view_model.state().failure, None);
+
+        // clear_failure must NOT clear a non-open failure (search failure).
+        view_model.set_open_failure(crate::platform::shell_open::OpenErrorKind::NotFound);
+        view_model.state.failure = Some(crate::presentation::state::SearchFailure::Search);
+        view_model.clear_failure();
+        assert_eq!(
+            view_model.state().failure,
+            Some(crate::presentation::state::SearchFailure::Search)
+        );
     }
 
     // helpers ---------------------------------------------------------------

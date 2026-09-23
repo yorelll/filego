@@ -740,4 +740,37 @@ mod tests {
         machine.resume();
         assert_eq!(machine.state(), HotkeyState::Disabled);
     }
+
+    // F001 contract: `NativePlatform::start` builds the machine in a pending
+    // (no-setting) state and calls `set(combo)` only once the worker has
+    // published its HWND. This mirrors that two-step wiring and proves that a
+    // registration issued after the "window ready" point wins (Active + fires),
+    // whereas the old single-step `new(registry, setting)` upfront raced the
+    // worker and could silently stay Disabled forever.
+    #[test]
+    fn startup_in_two_steps_registers_once_the_hwnd_is_ready() {
+        let registry = FakeRegistry::default();
+        // Step 1: pending machine, no registration yet (worker still creating
+        // the window).
+        let mut machine = HotkeyMachine::new(registry, None);
+        assert_eq!(machine.state(), HotkeyState::Disabled);
+        assert_eq!(machine.last_error(), None);
+
+        // Step 2: the window is up; register the default combo via `set`.
+        assert!(machine.set(ctrl_alt_space()).is_ok());
+        assert_eq!(machine.state(), HotkeyState::Active(ctrl_alt_space()));
+        assert_eq!(machine.last_error(), None);
+        assert_eq!(machine.on_event(0x20, CTRL_ALT), Some(HotkeyAction::Show));
+
+        // A conflict at this step surfaces as `Disabled` + `last_error`; never
+        // a silent success.
+        let conflicting = FakeRegistry::fail(HotkeyErrorKind::Conflict);
+        let mut machine = HotkeyMachine::new(conflicting, None);
+        assert_eq!(
+            machine.set(ctrl_alt_space()),
+            Err(HotkeyErrorKind::Conflict)
+        );
+        assert_eq!(machine.state(), HotkeyState::Disabled);
+        assert_eq!(machine.last_error(), Some(HotkeyErrorKind::Conflict));
+    }
 }

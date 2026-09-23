@@ -93,7 +93,21 @@ pub enum Msg {
     ErrorSearchBody,
     /// The shell could not open the selected folder (M04.5).
     ErrorOpenTitle,
+    /// Generic body (also the historical fallback).
     ErrorOpenBody,
+    // --- open-error kinds (F006): per-kind, still anonymous (no path) -----
+    /// The path does not exist (SE_ERR_FNF/PNF).
+    ErrorOpenNotFound,
+    /// The path is missing but permission was denied (SE_ERR_ACCESSDENIED).
+    ErrorOpenAccessDenied,
+    /// No shell verb is associated (SE_ERR_NOASSOC).
+    ErrorOpenNoAssociation,
+    /// A DDE-style failure (SE_ERR_DDEFAIL).
+    ErrorOpenDde,
+    /// The shell started but declined (hInstApp <= 32).
+    ErrorOpenShellRejected,
+    /// Everything else / unknown.
+    ErrorOpenUnavailable,
     // --- overlays / menu ---
     FilterPanelTitle,
     ContextMenuOpen,
@@ -134,6 +148,12 @@ impl Msg {
             Msg::ErrorSearchBody => "error.search.body",
             Msg::ErrorOpenTitle => "error.open.title",
             Msg::ErrorOpenBody => "error.open.body",
+            Msg::ErrorOpenNotFound => "error.open.not_found",
+            Msg::ErrorOpenAccessDenied => "error.open.access_denied",
+            Msg::ErrorOpenNoAssociation => "error.open.no_association",
+            Msg::ErrorOpenDde => "error.open.dde",
+            Msg::ErrorOpenShellRejected => "error.open.shell_rejected",
+            Msg::ErrorOpenUnavailable => "error.open.unavailable",
             Msg::FilterPanelTitle => "overlay.filter_panel.title",
             Msg::ContextMenuOpen => "contextmenu.open",
             Msg::ContextMenuCopyPath => "contextmenu.copy_path",
@@ -191,6 +211,12 @@ pub const ALL_KEYS: &[&str] = &[
     "error.search.body",
     "error.open.title",
     "error.open.body",
+    "error.open.not_found",
+    "error.open.access_denied",
+    "error.open.no_association",
+    "error.open.dde",
+    "error.open.shell_rejected",
+    "error.open.unavailable",
     "overlay.filter_panel.title",
     "contextmenu.open",
     "contextmenu.copy_path",
@@ -237,6 +263,30 @@ mod zh_cn {
         (
             "error.open.body",
             "该文件夹暂时无法打开（可能已断开或没有权限）。按 Enter 重试，Ctrl+C 复制路径。",
+        ),
+        (
+            "error.open.not_found",
+            "找不到该路径（文件夹可能已被移动或删除）。按 Enter 重试，Ctrl+C 复制路径。",
+        ),
+        (
+            "error.open.access_denied",
+            "没有权限打开此文件夹，请检查共享或权限设置。按 Enter 重试，Ctrl+C 复制路径。",
+        ),
+        (
+            "error.open.no_association",
+            "没有关联的程序可以打开此文件夹。按 Enter 重试，Ctrl+C 复制路径。",
+        ),
+        (
+            "error.open.dde",
+            "打开请求未能完成（系统繁忙或其它程序正在处理）。按 Enter 重试，Ctrl+C 复制路径。",
+        ),
+        (
+            "error.open.shell_rejected",
+            "系统已收到请求但未能打开，请稍后重试。按 Enter 重试，Ctrl+C 复制路径。",
+        ),
+        (
+            "error.open.unavailable",
+            "该文件夹暂时无法打开。按 Enter 重试，Ctrl+C 复制路径。",
         ),
         ("overlay.filter_panel.title", "筛选"),
         ("contextmenu.open", "打开"),
@@ -300,6 +350,30 @@ mod en_us {
         (
             "error.open.body",
             "This folder cannot be opened right now (it may be offline or have no permission). Press Enter to retry or Ctrl+C to copy the path.",
+        ),
+        (
+            "error.open.not_found",
+            "The path could not be found (the folder may have been moved or deleted). Press Enter to retry or Ctrl+C to copy the path.",
+        ),
+        (
+            "error.open.access_denied",
+            "You do not have permission to open this folder; check the share or permissions. Press Enter to retry or Ctrl+C to copy the path.",
+        ),
+        (
+            "error.open.no_association",
+            "There is no associated app that can open this folder. Press Enter to retry or Ctrl+C to copy the path.",
+        ),
+        (
+            "error.open.dde",
+            "The open request could not complete (system busy or another program is handling it). Press Enter to retry or Ctrl+C to copy the path.",
+        ),
+        (
+            "error.open.shell_rejected",
+            "The system received the request but could not open it; try again shortly. Press Enter to retry or Ctrl+C to copy the path.",
+        ),
+        (
+            "error.open.unavailable",
+            "This folder cannot be opened right now. Press Enter to retry or Ctrl+C to copy the path.",
         ),
         ("overlay.filter_panel.title", "Filters"),
         ("contextmenu.open", "Open"),

@@ -153,6 +153,46 @@ mod tests {
         assert_eq!(error.code().0, HRESULT_FROM_WIN32_ERRORHOTKEY);
     }
 
+    // F001 contract: the hotkey is registered only after the worker has
+    // published its HWND. Before publication `register` resolves `Unavailable`
+    // by construction (the "no window yet" path the old `new()`-before-spawn
+    // raced); after `publish_hwnd` the registry targets a concrete HWND and the
+    // registration reaches the OS instead of short-circuiting. The wiring in
+    // `NativePlatform::start` calls `set` strictly after `wait_for_hwnd`, which
+    // is exactly this ordering. The end-to-end `Active` state after the
+    // two-step startup is asserted in `platform::hotkey`
+    // (`startup_in_two_steps_registers_once_the_hwnd_is_ready`).
+    #[test]
+    fn publish_hwnd_changes_the_register_target_from_unavailable_to_the_window() {
+        let slot = shared_hwnd_slot();
+        let mut registry = Win32HotkeyRegistry::new(slot.clone());
+        let combo = HotkeySetting {
+            modifiers: HotkeyModifiers {
+                control: true,
+                alt: true,
+                shift: false,
+                win: false,
+            },
+            key: crate::domain::settings::HotkeyKey::Vk { vk: 0x20 },
+        };
+
+        // Not yet published → Unavailable by construction (window absent).
+        assert!(registry.current_hwnd().is_none());
+        assert_eq!(registry.register(combo), Err(HotkeyErrorKind::Unavailable));
+
+        // After the worker publishes (mirrors `worker_main` writing the slot),
+        // the registry targets the live window: `current_hwnd` now returns it
+        // and `register` exercises the OS-call path with a concrete HWND rather
+        // than failing by construction. (With this synthetic handle the OS call
+        // itself may fail against no real window — the deterministic half of the
+        // guarantee is the target selection; the Active outcome is the machine
+        // test.)
+        let published = HWND(0x1234 as *mut core::ffi::c_void);
+        registry.publish_hwnd(published);
+        assert_eq!(registry.current_hwnd(), Some(published));
+        let _ = registry.register(combo); // no by-construction Unavailable
+    }
+
     #[test]
     fn slot_starts_empty_and_can_be_filled() {
         let slot = shared_hwnd_slot();

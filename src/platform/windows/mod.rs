@@ -40,15 +40,15 @@ pub mod window_focus;
 pub mod window_placement;
 
 use crate::domain::settings::HotkeySetting;
-use crate::platform::hotkey::{HotkeyMachine, HotkeyState};
+use crate::platform::hotkey::{HotkeyErrorKind, HotkeyMachine, HotkeyState};
 use std::sync::mpsc::{Receiver, Sender};
 
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     UI::WindowsAndMessaging::{
         CS_HREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        HWND_MESSAGE, MSG, PostQuitMessage, RegisterClassW, TranslateMessage, WM_COPYDATA,
-        WM_DESTROY, WM_HOTKEY, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        MSG, RegisterClassW, TranslateMessage, WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WNDCLASSW,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     },
 };
 use windows::core::PCWSTR;
@@ -69,15 +69,19 @@ pub enum NativeEvent {
 type SharedHotkey =
     std::sync::Arc<std::sync::Mutex<HotkeyMachine<hotkey_adapter::Win32HotkeyRegistry>>>;
 
-/// Worker-thread entry: create the hidden window, then pump messages forever.
+/// Worker-thread entry: create the hidden top-level window, then pump messages
+/// until the queue is torn down (WM_QUIT).
 ///
-/// The hidden window's WndProc matches hotkeys against the shared machine and
-/// forwards `Show` actions into `events`.
+/// The PUBLICATION ORDER is the F001 contract: the shared HWND slot is written
+/// ONLY after `CreateWindowExW` succeeds, so a `register` issued once the slot
+/// is non-null always targets a fully-existing window (never the `Unavailable`
+/// "no window yet" path). The worker returns `()` once the loop ends (F005:
+/// graceful thread end, no `std::process::abort()`).
 fn worker_main(
     events: Sender<NativeEvent>,
     hotkey: SharedHotkey,
     hwnd_slot: hotkey_adapter::HwndSlot,
-) -> ! {
+) {
     // The wide strings must outlive the RegisterClassW/CreateWindowExW calls,
     // so they live in a scope-local Vec (never a dangling temporary pointer).
     let class_wide = wide_string(HIDDEN_WINDOW_CLASS);
@@ -98,12 +102,20 @@ fn worker_main(
     };
     let atom = unsafe { RegisterClassW(&class) };
     if atom == 0 {
-        // Cannot register; terminate deterministically.
-        let _ = events;
-        unsafe { PostQuitMessage(1) };
-        unreachable!();
+        // Cannot register; the hidden window cannot come up.
+        return;
     }
 
+    // F002: an invisible TOP-LEVEL tool window, NOT a message-only window
+    // (`HWND_MESSAGE`). Message-only windows are not enumerable by
+    // `FindWindowW`/`EnumWindows`, so the second instance's activation
+    // discovery could never find the primary. `WS_EX_TOOLWINDOW` keeps it out
+    // of the taskbar / alt-tab; `WS_EX_NOACTIVATE` stops a stray activation;
+    // we never call ShowWindow so it is never visible. It is, however, still a
+    // top-level window that `FindWindowW` enumerates — the F002 fix.
+    //
+    // `WS_POPUP` (a top-level owned window) + no parent + no owner keeps a
+    // zero-size icon-less handle that receives `WM_HOTKEY` / `WM_COPYDATA`.
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -114,31 +126,35 @@ fn worker_main(
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None, // top-level: not HWND_MESSAGE, no owning window
             None,
             Some(instance),
             None,
         )
     };
     let hwnd = match hwnd {
-        Ok(hwnd) => {
-            // Store raw pointer bits (HWND is not Send; the slot is shared with
-            // the main thread through `Arc<Mutex<Option<isize>>>`).
-            *hwnd_slot.lock().expect("hwnd slot") = Some(hwnd.0 as isize);
-            hwnd
-        }
-        Err(_) => {
-            unsafe { PostQuitMessage(1) };
-            unreachable!();
-        }
+        Ok(hwnd) => hwnd,
+        Err(_) => return,
     };
 
-    // Register the WndProc context: events + hotkey machine, keyed by thread id
-    // in a thread-local (the WndProc receives only the HWND + a per-instance
-    // user-data slot; we stash the shared state on the thread that owns hwnd).
-    // The hotkey machine itself carries the pause gate (Paused → no events),
-    // so the WndProc does not need a separate flag.
+    // Register the WndProc context BEFORE publishing the HWND slot: events +
+    // hotkey machine, keyed by thread id in a thread-local (the WndProc
+    // receives only the HWND + a per-instance user-data slot; we stash the
+    // shared state on the thread that owns hwnd). The hotkey machine itself
+    // carries the pause gate (Paused → no events), so the WndProc does not need
+    // a separate flag. Ordering this before the publish guarantees that the
+    // moment the main thread observes the HWND, the WndProc context is fully
+    // live (no early WM_HOTKEY / WM_COPYDATA can be dropped against an
+    // unregistered thread-local).
     set_thread_state(hwnd, events.clone(), hotkey);
+
+    // Publish the raw pointer bits (HWND is not Send; the slot is shared with
+    // the main thread through `Arc<Mutex<Option<isize>>>`) ONLY now that the
+    // window fully exists and its WndProc context is registered — the F001
+    // ordering contract: a `register` issued once the slot is non-null always
+    // targets a live, dispatched window (never the "window not created yet"
+    // `Unavailable` path).
+    *hwnd_slot.lock().expect("hwnd slot lock") = Some(hwnd.0 as isize);
 
     let mut msg = MSG::default();
     loop {
@@ -153,11 +169,13 @@ fn worker_main(
             let _ = DispatchMessageW(&msg);
         }
     }
+    // F005: return instead of `std::process::abort()`. The process is still
+    // expected to exit via the main event loop (the tray shell owns its
+    // lifetime); a worker that reaches WM_QUIT simply ends its thread and lets
+    // the handles / window be torn down through normal RAII + DestroyWindow.
     unsafe {
         let _ = DestroyWindow(hwnd);
     }
-    unsafe { PostQuitMessage(0) };
-    std::process::abort();
 }
 
 /// Hidden-window WndProc: resolves `WM_HOTKEY` and `WM_COPYDATA` into
@@ -326,11 +344,29 @@ pub struct NativePlatform {
 impl NativePlatform {
     /// Start the worker thread and register the hotkey (if `settings.hotkey`
     /// is `Some` and valid). Returns self or an anonymous error.
+    ///
+    /// F001 ordering: the hotkey is registered ONLY AFTER the worker has
+    /// published its real HWND. The worker writes the shared slot only once
+    /// `CreateWindowExW` succeeded, so a registration issued after
+    /// `wait_for_hwnd` always targets a live window — the startup race that used
+    /// to yield a silent, permanent `Disabled` (the old `HotkeyMachine::new`
+    /// before the window existed) is gone.
+    ///
+    /// The machine starts in a *pending* (not-yet-registered) `Disabled` state
+    /// and only calls `set(hotkey_setting)` once the HWND is populated — the
+    /// review's suggested option (b). Registration failures are surfaced as
+    /// `Disabled + last_error` (never silently swallowed) and readable through
+    /// [`Self::hotkey_state`] / [`Self::hotkey_last_error`]. A transient
+    /// `Unavailable` result is retried once after a short delay before being
+    /// recorded.
     pub fn start(hotkey_setting: Option<HotkeySetting>) -> Result<NativePlatform, NativeError> {
         let (events_tx, events_rx) = std::sync::mpsc::channel();
         let hwnd_slot = hotkey_adapter::shared_hwnd_slot();
         let registry = hotkey_adapter::Win32HotkeyRegistry::new(hwnd_slot.clone());
-        let machine = HotkeyMachine::new(registry, hotkey_setting);
+        // Pending machine: no registration yet. The worker inherits the shared
+        // reference (stashed into the WndProc thread-local) before we ever call
+        // `set`, so a hotkey press can never arrive before the machine exists.
+        let machine = HotkeyMachine::new(registry, None);
         let hotkey: SharedHotkey = std::sync::Arc::new(std::sync::Mutex::new(machine));
         let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -342,9 +378,23 @@ impl NativePlatform {
             .spawn(move || worker_main(thread_events, thread_hotkey, thread_slot))
             .map_err(|_| NativeError::WorkerStartFailed)?;
 
-        // Wait briefly for the hidden window to come up so a caller that needs
-        // it (activation target) is already addressable.
+        // Wait for the hidden window to come up BEFORE registering: this is the
+        // happens-before edge that makes `register` deterministic (F001).
         let hwnd = wait_for_hwnd(&hwnd_slot, std::time::Duration::from_millis(2_000));
+        if let Some(combo) = hotkey_setting {
+            // Register once the HWND exists. If the window still did not come up
+            // (`hwnd` is None), `set` resolves `register` → `Unavailable` and
+            // records `last_error`, which the tray can surface.
+            let mut hotkey_guard = hotkey.lock().expect("hotkey lock");
+            if hotkey_guard.set(combo).is_err() {
+                // Retry once after a short delay for a transient platform
+                // failure (F001 retry-once path). A second `set` from a
+                // `Disabled` state with the same combo just re-registers.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = hotkey_guard.set(combo);
+            }
+        }
+
         Ok(NativePlatform {
             events: events_tx,
             receiver: events_rx,
@@ -373,6 +423,12 @@ impl NativePlatform {
     /// Current hotkey state (for tray text).
     pub fn hotkey_state(&self) -> HotkeyState {
         self.hotkey.lock().expect("hotkey lock").state()
+    }
+
+    /// The last registration failure, if any. Lets the tray surface a
+    /// `Disabled` hotkey (F001: registration failures are never silent).
+    pub fn hotkey_last_error(&self) -> Option<HotkeyErrorKind> {
+        self.hotkey.lock().expect("hotkey lock").last_error()
     }
 
     /// Apply a hotkey change (validate + re-register; keep-old on conflict).
@@ -461,7 +517,7 @@ impl NativeError {
     pub const fn as_detail(self) -> &'static str {
         match self {
             NativeError::WorkerStartFailed => "the background worker could not be started",
-            NativeError::WindowCreateFailed => "the hidden message window could not be created",
+            NativeError::WindowCreateFailed => "the hidden window could not be created",
             NativeError::MutexFailed => "the single-instance check could not run",
             NativeError::InvalidMutexName => "the single-instance mutex name is invalid",
         }
@@ -506,5 +562,22 @@ mod tests {
             assert!(!error.as_detail().is_empty());
             assert!(!error.as_detail().contains("0x"));
         }
+    }
+
+    // F002 wiring invariant: the worker creates the hidden window with the
+    // class `HIDDEN_WINDOW_CLASS`, and the second instance's activator looks it
+    // up by the SAME class name via `FindWindowW`. If the two constants ever
+    // diverge, second-instance activation silently breaks. The hidden window is
+    // now a real top-level popup (never message-only), so `FindWindowW` can
+    // enumerate it — the F002 root-cause fix. This test pins the shared,
+    // discoverable class at the wiring layer (the FFI itself is not headless-
+    // testable).
+    #[test]
+    fn hidden_window_class_is_shared_with_the_activator() {
+        let worker_class = super::HIDDEN_WINDOW_CLASS;
+        let activator_class =
+            crate::platform::windows::single_instance::activator::HIDDEN_WINDOW_CLASS;
+        assert_eq!(worker_class, activator_class);
+        assert_eq!(worker_class, "FileGoHotkeyWindow");
     }
 }

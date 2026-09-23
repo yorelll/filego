@@ -50,22 +50,27 @@ impl WindowPort for SlintWindowPort {
 /// Compute and apply the M04.4 window placement (cursor monitor, centered,
 /// top ≈ 10%, clamped to the work area) before showing.
 ///
-/// Re-computed on every show so monitor count/DPI changes are picked up
-/// deterministically.
+/// F003: the physical size is derived from the TARGET (cursor) monitor's DPI
+/// scale — never the window's current `scale_factor()`, which may describe a
+/// different monitor in a mixed-DPI layout. `placement_rect_for_cursor` queries
+/// the cursor position, the target monitor's work area, and its `GetDpiForMonitor`
+/// scale, then computes the physical rect. Re-computed on every show so monitor
+/// count/DPI changes are picked up deterministically.
 fn place_window(app: &AppWindow) {
     let window = app.window();
-    let scale = window.scale_factor();
-    // Slint reports the logical window size; scale to physical, then place.
-    let logical = window.size().to_logical(scale);
-    let (physical_w, physical_h) = if logical.width > 0.0 && logical.height > 0.0 {
-        (logical.width * scale, logical.height * scale)
+    // Slint's `window.size()` is already physical for the window's own monitor;
+    // converting to logical and re-scaling by the TARGET monitor's DPI is what
+    // F003 fixes (the old code scaled the logical size by the window's current
+    // scale, mis-sizing on a different-DPI target monitor).
+    let logical = window.size().to_logical(window.scale_factor());
+    let (logical_w, logical_h) = if logical.width > 0.0 && logical.height > 0.0 {
+        (logical.width, logical.height)
     } else {
         // Default first-show size (600x140 logical).
-        (600.0 * scale, 140.0 * scale)
+        (600.0, 140.0)
     };
-    let rect = filego::platform::windows::window_placement::placement_rect(
-        physical_w.round().max(1.0) as i32,
-        physical_h.round().max(1.0) as i32,
+    let rect = filego::platform::windows::window_placement::placement_rect_for_cursor(
+        logical_w, logical_h,
     );
     // Apply through Slint's public physical-position API.
     window.set_position(slint::WindowPosition::Physical(
@@ -218,8 +223,9 @@ impl MainWindowController {
                 }
             }
             // M04.5: open the selected entry via the shell verb. The shell call
-            // is async off the UI thread; the result is delivered back through
-            // `slint::invoke_from_event_loop` into `apply_open_result`.
+            // is async off the UI thread; the result is posted to a channel and
+            // drained by a repeating UI-thread polling timer (see `open_drain`)
+            // into `apply_open_result`.
             ExternalEffect::OpenEntry => self.open_selected(),
             // Copy the full selection path to the system clipboard. M04 keeps
             // the ViewModel's effect; the wiring is clipboard via Slint's
@@ -289,10 +295,11 @@ impl MainWindowController {
                 }
                 self.sync_ui();
             }
-            OpenResult::Failed(_kind) => {
-                // Keep the window; surface an anonymous failure; the selection
-                // stays so Retry (Enter) / Copy (Ctrl+C) keep working.
-                self.view_model.set_open_failure();
+            OpenResult::Failed(kind) => {
+                // Keep the window; surface an anonymous failure (kind only, no
+                // path); the selection stays so Retry (Enter) / Copy (Ctrl+C)
+                // keep working.
+                self.view_model.set_open_failure(kind);
                 self.sync_ui();
             }
         }
@@ -343,10 +350,35 @@ impl MainWindowController {
         // Empty/error state: map NoResultReason to the i18n title + body.
         let show_empty = state.no_result_reason.is_some() || state.failure.is_some();
         let (title, body) = match state.failure {
-            Some(filego::presentation::state::SearchFailure::Open) => (
-                filego::presentation::i18n::Msg::ErrorOpenTitle.tr(state.locale),
-                filego::presentation::i18n::Msg::ErrorOpenBody.tr(state.locale),
-            ),
+            // F006: pick the per-kind localized body (still anonymous — the
+            // kind never carries a path); a kind not in the table falls back to
+            // the generic open body.
+            Some(filego::presentation::state::SearchFailure::Open(kind)) => {
+                let body = match kind {
+                    filego::platform::shell_open::OpenErrorKind::NotFound => {
+                        filego::presentation::i18n::Msg::ErrorOpenNotFound
+                    }
+                    filego::platform::shell_open::OpenErrorKind::AccessDenied => {
+                        filego::presentation::i18n::Msg::ErrorOpenAccessDenied
+                    }
+                    filego::platform::shell_open::OpenErrorKind::NoAssociation => {
+                        filego::presentation::i18n::Msg::ErrorOpenNoAssociation
+                    }
+                    filego::platform::shell_open::OpenErrorKind::DdeFailure => {
+                        filego::presentation::i18n::Msg::ErrorOpenDde
+                    }
+                    filego::platform::shell_open::OpenErrorKind::ShellRejected => {
+                        filego::presentation::i18n::Msg::ErrorOpenShellRejected
+                    }
+                    filego::platform::shell_open::OpenErrorKind::Unavailable => {
+                        filego::presentation::i18n::Msg::ErrorOpenUnavailable
+                    }
+                };
+                (
+                    filego::presentation::i18n::Msg::ErrorOpenTitle.tr(state.locale),
+                    body.tr(state.locale),
+                )
+            }
             Some(_failure) => (
                 filego::presentation::i18n::Msg::ErrorSearchTitle.tr(state.locale),
                 filego::presentation::i18n::Msg::ErrorSearchBody.tr(state.locale),

@@ -97,6 +97,13 @@ pub fn compute_position(
 }
 
 /// Identity of the monitor to use, decoded by the adapter.
+///
+/// RESERVED for a future "always place on a fixed monitor" setting. The current
+/// M04.4 placement uses the cursor monitor exclusively (`compute_position` is
+/// cursor-driven), so `TargetMonitor` is intentionally not wired into any call
+/// path yet; the variants are kept so the geometry code documents the two
+/// policies and a settings-driven adapter can select between them without
+/// inventing a new shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetMonitor {
     /// The monitor containing the current cursor.
