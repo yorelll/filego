@@ -68,7 +68,11 @@
 
 use std::fmt;
 
-use crate::domain::ids::FolderId;
+use crate::domain::{
+    folder::{Category, FolderEntry, Tag},
+    ids::{CategoryId, FolderId, TagId},
+    path_semantics::same_path,
+};
 
 use super::{
     codec,
@@ -534,6 +538,15 @@ impl DocumentRepository {
     /// Remove the in-memory folder record for `folder_id`. This is the only
     /// deletion surface for folder records: the real folder and every path it
     /// references are never touched. Returns `false` when no record was found.
+    ///
+    /// M05-consistent spelling of the record-level semantics (the old
+    /// `remove_folder` name is kept as a thin alias for M01 tests).
+    pub fn remove_record(&mut self, folder_id: FolderId) -> bool {
+        self.remove_folder(folder_id)
+    }
+
+    /// Remove the in-memory folder record for `folder_id`. See
+    /// [`Self::remove_record`].
     pub fn remove_folder(&mut self, folder_id: FolderId) -> bool {
         let Some(document) = self.document.as_mut() else {
             return false;
@@ -544,6 +557,360 @@ impl DocumentRepository {
             .folders
             .retain(|folder| folder.id != folder_id);
         document.data.folders.len() != initial_count
+    }
+
+    /// Toggle the in-memory `enabled` flag of one folder record (`false` =
+    /// hidden from search, never touching the real folder). Returns `Ok(())`
+    /// when the record was found and changed; `Err(NotFound)` when the record
+    /// does not exist.
+    pub fn disable_record(&mut self, folder_id: FolderId) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        let folder = document
+            .data
+            .folders
+            .iter_mut()
+            .find(|folder| folder.id == folder_id)
+            .ok_or(RepositoryError::NotFound)?;
+        folder.enabled = false;
+        folder.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Set the in-memory `enabled` flag of one folder record to `true`.
+    pub fn enable_record(&mut self, folder_id: FolderId) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        let folder = document
+            .data
+            .folders
+            .iter_mut()
+            .find(|folder| folder.id == folder_id)
+            .ok_or(RepositoryError::NotFound)?;
+        folder.enabled = true;
+        folder.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Toggle the in-memory `pinned` flag of one folder record.
+    pub fn set_pinned(&mut self, folder_id: FolderId, pinned: bool) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        let folder = document
+            .data
+            .folders
+            .iter_mut()
+            .find(|folder| folder.id == folder_id)
+            .ok_or(RepositoryError::NotFound)?;
+        folder.pinned = pinned;
+        folder.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Record an open of one folder (bump `open_count`, set `last_opened_at`)
+    /// in the in-memory working copy. The caller persists with `save`/`save_at`;
+    /// a not-found record is `Err(NotFound)` (never panics).
+    pub fn record_open(&mut self, folder_id: FolderId) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        let folder = document
+            .data
+            .folders
+            .iter_mut()
+            .find(|folder| folder.id == folder_id)
+            .ok_or(RepositoryError::NotFound)?;
+        folder.open_count = folder.open_count.saturating_add(1);
+        folder.last_opened_at = Some(chrono::Utc::now());
+        folder.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Insert or replace one folder record in the in-memory working copy.
+    /// Replacing keeps the existing `created_at`; the caller sets `id` for an
+    /// edit ("edit existing"). Returns `Err(NotFound)` when there is no loaded
+    /// document to mutate.
+    pub fn put_folder(&mut self, folder: FolderEntry) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        if let Some(existing) = document
+            .data
+            .folders
+            .iter_mut()
+            .find(|existing| existing.id == folder.id)
+        {
+            let created_at = existing.created_at;
+            *existing = folder;
+            existing.created_at = created_at;
+        } else {
+            document.data.folders.push(folder);
+        }
+        Ok(())
+    }
+
+    /// Insert or replace one category record in the in-memory working copy.
+    pub fn put_category(&mut self, category: Category) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        if let Some(existing) = document
+            .data
+            .categories
+            .iter_mut()
+            .find(|existing| existing.id == category.id)
+        {
+            *existing = category;
+        } else {
+            document.data.categories.push(category);
+        }
+        Ok(())
+    }
+
+    /// Rename a category in memory (an edit is `put_category` with the same
+    /// id; this helper is for statistics). Returns `Err(NotFound)`.
+    pub fn rename_category(
+        &mut self,
+        category_id: CategoryId,
+        name: String,
+    ) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        let category = document
+            .data
+            .categories
+            .iter_mut()
+            .find(|category| category.id == category_id)
+            .ok_or(RepositoryError::NotFound)?;
+        category.name = name;
+        Ok(())
+    }
+
+    /// Remove a category; folders referencing it become **未分类** (the folder
+    /// records themselves are never removed). Returns `false` when no category
+    /// matched.
+    pub fn remove_category(&mut self, category_id: CategoryId) -> bool {
+        let Some(document) = self.document.as_mut() else {
+            return false;
+        };
+        let initial_count = document.data.categories.len();
+        document
+            .data
+            .categories
+            .retain(|category| category.id != category_id);
+        let removed = document.data.categories.len() != initial_count;
+        if removed {
+            for folder in &mut document.data.folders {
+                if folder.category_id == Some(category_id) {
+                    folder.category_id = None;
+                    folder.updated_at = chrono::Utc::now();
+                }
+            }
+        }
+        removed
+    }
+
+    /// Remove a tag; folders referencing it lose only the association (the
+    /// folder records are never removed). Returns `false` when no tag matched.
+    pub fn remove_tag(&mut self, tag_id: TagId) -> bool {
+        let Some(document) = self.document.as_mut() else {
+            return false;
+        };
+        let initial_count = document.data.tags.len();
+        document.data.tags.retain(|tag| tag.id != tag_id);
+        let removed = document.data.tags.len() != initial_count;
+        if removed {
+            for folder in &mut document.data.folders {
+                let before = folder.tag_ids.len();
+                folder.tag_ids.retain(|id| *id != tag_id);
+                if folder.tag_ids.len() != before {
+                    folder.updated_at = chrono::Utc::now();
+                }
+            }
+        }
+        removed
+    }
+
+    /// Insert or replace one tag record in the in-memory working copy.
+    pub fn put_tag(&mut self, tag: Tag) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        if let Some(existing) = document
+            .data
+            .tags
+            .iter_mut()
+            .find(|existing| existing.id == tag.id)
+        {
+            *existing = tag;
+        } else {
+            document.data.tags.push(tag);
+        }
+        Ok(())
+    }
+
+    /// Rename a tag in memory (an edit is `put_tag` with the same id).
+    pub fn rename_tag(&mut self, tag_id: TagId, name: String) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        let tag = document
+            .data
+            .tags
+            .iter_mut()
+            .find(|tag| tag.id == tag_id)
+            .ok_or(RepositoryError::NotFound)?;
+        tag.name = name;
+        Ok(())
+    }
+
+    /// Merge `source_id` into `target_id`, atomically updating **every**
+    /// reference in the working copy: folder `tag_ids` that pointed at
+    /// `source_id` now point at `target_id` (deduplicated). The source tag
+    /// record is removed. Returns `Ok(())` when both tags exist; the caller
+    /// persists the whole document with one `save` — the merge is atomic on
+    /// save (either the merged document lands, or nothing does).
+    ///
+    /// The list of folders whose references changed is returned (all of them —
+    /// a deterministic order; used for the undo record and derived usage
+    /// counts).
+    pub fn merge_tag(&mut self, source_id: TagId, target_id: TagId) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        let has_source = document.data.tags.iter().any(|tag| tag.id == source_id);
+        let has_target = document.data.tags.iter().any(|tag| tag.id == target_id);
+        if !has_source || !has_target {
+            return Err(RepositoryError::NotFound);
+        }
+        for folder in &mut document.data.folders {
+            if folder.tag_ids.contains(&source_id) {
+                folder.tag_ids.retain(|id| *id != source_id);
+                if !folder.tag_ids.contains(&target_id) {
+                    folder.tag_ids.push(target_id);
+                }
+                folder.updated_at = chrono::Utc::now();
+            }
+        }
+        document.data.tags.retain(|tag| tag.id != source_id);
+        document.data.tags.sort_by_key(|tag| tag.id.as_uuid());
+        Ok(())
+    }
+
+    /// Number of folder records referencing `tag_id` (usage count).
+    pub fn tag_usage_count(&self, tag_id: TagId) -> usize {
+        self.document.as_ref().map_or(0, |document| {
+            document
+                .data
+                .folders
+                .iter()
+                .filter(|folder| folder.tag_ids.contains(&tag_id))
+                .count()
+        })
+    }
+
+    /// Locate duplicate folder records by M01.2 path semantics. Returns the
+    /// index of every folder whose record is duplicated by an *earlier* record
+    /// (same class and normalized key). `exclude_id` lets an edit skip the
+    /// record being edited.
+    pub fn duplicate_folders(&self, exclude_id: Option<FolderId>) -> Vec<usize> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let mut seen: Vec<std::string::String> = Vec::new();
+        let mut duplicates = Vec::new();
+        for (index, folder) in document.data.folders.iter().enumerate() {
+            if exclude_id == Some(folder.id) {
+                continue;
+            }
+            let Some(key) = crate::domain::path_semantics::path_key(&folder.path) else {
+                continue;
+            };
+            let entry = format!("{:?}\u{1}{}", key.class, key.normalized);
+            if seen.contains(&entry) {
+                duplicates.push(index);
+            } else {
+                seen.push(entry);
+            }
+        }
+        duplicates
+    }
+
+    /// Save the working copy and return the new revision.
+    pub fn save_at(&mut self) -> Result<u64, RepositoryError> {
+        let Some(document) = self.document.as_ref() else {
+            return Err(RepositoryError::NotFound);
+        };
+        if self.pending_recovery {
+            return Err(RepositoryError::RecoveryRequired);
+        }
+        // Encode first (pure); a validation failure must not touch the disk.
+        let mut next = document.clone();
+        let new_revision = next
+            .data
+            .next_revision()
+            .map_err(|_| RepositoryError::InvalidData)?;
+        next.data.revision = new_revision;
+        let bytes = codec::encode(&next)?;
+        let _lock = self.acquire_write_lock()?;
+        self.save_locked(&next, &bytes)?;
+        Ok(new_revision)
+    }
+
+    /// Undo the removal of one folder record: `pre_payload` is the *matching*
+    /// entry of the removed record (returned by the caller when it removed a
+    /// record), `previous_revision` the revision the document had **before** the
+    /// removal was saved, `expected_current_revision` the revision the working
+    /// copy must still hold. If either the working copy's revision differs from
+    /// `expected_current_revision` or `previous_revision` is not in the saved
+    /// history of the working copy, the undo is refused and `Err` is returned —
+    /// the undo is **deterministic across save boundaries**: it claims the
+    /// exact `(previous revision, previous payload)` pair.
+    ///
+    /// Because the caller pushes the removed payload, the undo does not need a
+    /// tombstone in the document. The restore is in-memory; the caller then
+    /// persists with `save_at` (exactly one save → one revision, no merge
+    /// window).
+    pub fn undo_remove_record(
+        &mut self,
+        pre_payload: FolderEntry,
+        previous_revision: u64,
+        expected_current_revision: u64,
+    ) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        let removed_earlier = !document.data.folders.iter().any(|f| f.id == pre_payload.id);
+        // The removal must be the LAST save: the claimed previous revision is
+        // exactly one behind the current working copy. Any save after the
+        // removal (or before it) makes the undo refuse — deterministic across
+        // save boundaries.
+        let undoing_the_last_save = previous_revision.saturating_add(1) == document.data.revision;
+        if document.data.revision != expected_current_revision
+            || !removed_earlier
+            || !undoing_the_last_save
+        {
+            return Err(RepositoryError::ConcurrentModification);
+        }
+        document.data.folders.push(pre_payload);
+        Ok(())
+    }
+
+    /// Whether `candidate` duplicates an existing folder record under M01.2
+    /// path semantics, ignoring the record `exclude_id` (the one being edited).
+    pub fn is_duplicate_path(&self, candidate: &str, exclude_id: Option<FolderId>) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        document
+            .data
+            .folders
+            .iter()
+            .any(|folder| exclude_id != Some(folder.id) && same_path(&folder.path, candidate))
     }
 
     /// Document currently held in memory, if a load or save established one.

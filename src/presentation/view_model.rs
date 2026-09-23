@@ -113,6 +113,17 @@ pub enum ExternalEffect {
     OpenEntry,
     /// Copy the selected path to the clipboard (M03 stub).
     CopyPath,
+    /// Copy the selected entry's display name to the clipboard (M05.5).
+    CopyName,
+    /// Open the record in the settings edit dialog (the adapter resolves the
+    /// selected entry id against the repository) (M05.5).
+    EditSelected,
+    /// Toggle the pinned flag of the selected record (M05.5).
+    TogglePinSelected,
+    /// Disable/restore the selected record (M05.5).
+    ToggleEnableSelected,
+    /// Remove the selected record from FileGo (never the real folder) (M05.5).
+    RemoveSelectedFromList,
     /// Clear the query field in the UI (focus retained).
     ClearInput,
 }
@@ -171,6 +182,14 @@ impl SearchViewModel {
 
     pub fn state(&self) -> &ViewState {
         &self.state
+    }
+
+    /// Replace the underlying entries and re-run the current query (M05: the
+    /// repository-backed data changed after a management action in the settings
+    /// window; the adapter calls this, then re-pushes the snapshot).
+    pub fn set_resolved_entries(&mut self, entries: Vec<ResolvedEntry>) {
+        self.resolved = entries;
+        self.refresh();
     }
 
     /// Set the locale from a detected/adapter-supplied value.
@@ -483,22 +502,36 @@ impl SearchViewModel {
             RowAction::Open => self.open_selected(),
             RowAction::ContextMenu => {
                 // M03: the panel is a stub; opening it sets the overlay gate so
-                // hide-on-focus-loss is suppressed.
+                // hide-on-focus-loss is suppressed. M05 fills the menu.
                 self.state.overlay_open = true;
                 Vec::new()
             }
-            RowAction::CopyPath => {
-                if self
-                    .state
-                    .selected
-                    .is_some_and(|index| index < self.state.rows.len())
-                {
-                    self.effects.emit(ExternalEffect::CopyPath);
-                    vec![ExternalEffect::CopyPath]
-                } else {
-                    Vec::new()
-                }
+            RowAction::CopyPath => self.effect_for_selected(ExternalEffect::CopyPath),
+            RowAction::CopyName => self.effect_for_selected(ExternalEffect::CopyName),
+            RowAction::Edit => self.effect_for_selected(ExternalEffect::EditSelected),
+            RowAction::TogglePin => self.effect_for_selected(ExternalEffect::TogglePinSelected),
+            RowAction::ToggleEnable => {
+                self.effect_for_selected(ExternalEffect::ToggleEnableSelected)
             }
+            RowAction::RemoveFromList => {
+                self.effect_for_selected(ExternalEffect::RemoveSelectedFromList)
+            }
+        }
+    }
+
+    /// Emit a per-row effect only when a row is selected (M05.5). The overlay
+    /// gate stays open so the menu does not flicker; the adapter drains effects
+    /// and then closes the overlay itself.
+    fn effect_for_selected(&mut self, effect: ExternalEffect) -> Vec<ExternalEffect> {
+        if self
+            .state
+            .selected
+            .is_some_and(|index| index < self.state.rows.len())
+        {
+            self.effects.emit(effect);
+            vec![effect]
+        } else {
+            Vec::new()
         }
     }
 
@@ -867,6 +900,43 @@ mod tests {
         view_model.handle(ViewCommand::SelectMove(SelectionMove::First));
         let effects = view_model.handle(ViewCommand::RowAction(RowAction::CopyPath));
         assert!(last_effect(effects, ExternalEffect::CopyPath));
+    }
+
+    #[test]
+    fn context_menu_actions_emit_selected_row_effects_and_keep_overlay() {
+        // M05.5: every context-menu action needs a selection and keeps the
+        // overlay gate open (no focus-loss hide while the menu is shown).
+        let mut view_model = view_model();
+        view_model.handle(ViewCommand::RowAction(RowAction::ContextMenu));
+        assert!(view_model.state().overlay_open);
+
+        // Without a selection, all actions are no-ops.
+        for action in [
+            RowAction::CopyName,
+            RowAction::Edit,
+            RowAction::TogglePin,
+            RowAction::ToggleEnable,
+            RowAction::RemoveFromList,
+        ] {
+            assert!(
+                view_model.handle(ViewCommand::RowAction(action)).is_empty(),
+                "{action:?} without a selection must be a no-op"
+            );
+        }
+
+        // With a selection, each maps to its effect and the overlay stays.
+        view_model.handle(ViewCommand::SelectMove(SelectionMove::First));
+        let effects = view_model.handle(ViewCommand::RowAction(RowAction::CopyName));
+        assert!(last_effect(effects, ExternalEffect::CopyName));
+        let effects = view_model.handle(ViewCommand::RowAction(RowAction::Edit));
+        assert!(last_effect(effects, ExternalEffect::EditSelected));
+        let effects = view_model.handle(ViewCommand::RowAction(RowAction::TogglePin));
+        assert!(last_effect(effects, ExternalEffect::TogglePinSelected));
+        let effects = view_model.handle(ViewCommand::RowAction(RowAction::ToggleEnable));
+        assert!(last_effect(effects, ExternalEffect::ToggleEnableSelected));
+        let effects = view_model.handle(ViewCommand::RowAction(RowAction::RemoveFromList));
+        assert!(last_effect(effects, ExternalEffect::RemoveSelectedFromList));
+        assert!(view_model.state().overlay_open, "overlay stays open");
     }
 
     #[test]

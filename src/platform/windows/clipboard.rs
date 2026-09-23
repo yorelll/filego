@@ -9,9 +9,9 @@
 //! yields a silent skip — the copy is never a hard failure path.
 
 use windows::Win32::{
-    Foundation::{GlobalFree, HANDLE},
+    Foundation::{GlobalFree, HANDLE, HGLOBAL},
     System::{
-        DataExchange::{CloseClipboard, OpenClipboard, SetClipboardData},
+        DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard, SetClipboardData},
         Memory::{GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock},
     },
 };
@@ -64,6 +64,58 @@ fn write_unicode_text(text: &str) -> Result<(), ()> {
         return Err(());
     }
     Ok(())
+}
+
+/// Read the current clipboard text (UTF-16 → Rust `String`), best effort.
+/// Returns an empty string when the clipboard is unavailable or holds no
+/// Unicode text. Never logs the content.
+pub fn read_text() -> String {
+    // Safety: OpenClipboard with no owner window is the standard usage; it
+    // fails if another app holds the clipboard open.
+    if unsafe { OpenClipboard(None) }.is_err() {
+        return String::new();
+    }
+    let result = read_unicode_text();
+    // Safety: CloseClipboard matches the OpenClipboard above.
+    let _ = unsafe { CloseClipboard() };
+    result.unwrap_or_default()
+}
+
+fn read_unicode_text() -> Result<String, ()> {
+    // Safety: GetClipboardData returns a HANDLE owned by the clipboard; we only
+    // read it while the clipboard is open. The handle type is `Foundation::HANDLE`
+    // (a handle, not an HGLOBAL); GlobalLock takes the raw HGLOBAL form, and the
+    // returned memory is the same in practice for CF_UNICODETEXT blocks.
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT) }.map_err(|_| ())?;
+    if handle.0.is_null() {
+        return Err(());
+    }
+    let hglobal = HGLOBAL(handle.0);
+    // Safety: GlobalLock maps the block (treated as an HGLOBAL); the clipboard
+    // owns it, we only read.
+    let ptr = unsafe { windows::Win32::System::Memory::GlobalLock(hglobal) };
+    if ptr.is_null() {
+        return Err(());
+    }
+    let mut wide = Vec::new();
+    let mut index = 0usize;
+    // Conservative bound: scan for the NUL terminator within a sane limit to
+    // avoid reading beyond the block. The clipboard text is user input; 1 MiB
+    // of UTF-16 is far beyond any folder path we would paste.
+    const MAX_READ: usize = 1 << 20;
+    while index < MAX_READ {
+        // Safety: each u16 read advances within the locked block; we stop at
+        // the terminator or the limit.
+        let unit = unsafe { *((ptr as *const u16).add(index)) };
+        if unit == 0 {
+            break;
+        }
+        wide.push(unit);
+        index += 1;
+    }
+    // Safety: unlock before closing the clipboard.
+    let _ = unsafe { windows::Win32::System::Memory::GlobalUnlock(hglobal) };
+    Ok(String::from_utf16_lossy(&wide))
 }
 
 #[cfg(test)]

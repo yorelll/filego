@@ -10,6 +10,8 @@ pub mod repository;
 pub mod schema;
 
 #[cfg(test)]
+mod m05_tests;
+#[cfg(test)]
 mod repository_tests;
 #[cfg(test)]
 mod tests;

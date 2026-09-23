@@ -4,6 +4,7 @@ pub mod document;
 pub mod error;
 pub mod folder;
 pub mod ids;
+pub mod path_semantics;
 pub mod settings;
 
 pub const PRODUCT_SCOPE: &str = "user-maintained folder shortcuts";

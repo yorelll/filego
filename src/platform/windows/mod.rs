@@ -32,6 +32,7 @@
 //! sends the fixed `Show` payload, then exits — never a second tray icon.
 
 pub mod clipboard;
+pub mod folder_picker;
 pub mod hotkey_adapter;
 pub mod single_instance;
 pub mod tray_open;

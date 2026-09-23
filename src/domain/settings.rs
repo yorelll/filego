@@ -153,6 +153,28 @@ mod tests {
         assert!(HotkeyKey::Function { index: 5 }.is_function());
         assert!(!HotkeyKey::Vk { vk: 0x43 }.is_function());
     }
+
+    #[test]
+    fn one_level_import_defaults_to_off_and_round_trips_forward_compatibly() {
+        // M05.2: default OFF.
+        assert!(!AppSettings::default().one_level_import);
+        // A document without the field must decode with `false` (forward-compat).
+        #[derive(Debug, Deserialize)]
+        struct Legacy {
+            #[serde(default)]
+            one_level_import: bool,
+        }
+        let legacy: Legacy = serde_json::from_str(r#"{}"#).expect("decode legacy");
+        assert!(!legacy.one_level_import);
+        // A document with the field on round-trips.
+        let settings = AppSettings {
+            one_level_import: true,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("encode");
+        let decoded: AppSettings = serde_json::from_str(&json).expect("decode");
+        assert!(decoded.one_level_import);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +211,11 @@ pub struct AppSettings {
     /// document.
     #[serde(default)]
     pub hotkey: Option<HotkeySetting>,
+    /// M05.2: whether picking a parent directory offers a controlled one-level
+    /// import of its direct children (max 100, user-initiated and bounded).
+    /// Default OFF; forward-compatible with `#[serde(default)]`.
+    #[serde(default)]
+    pub one_level_import: bool,
 }
 
 impl Default for AppSettings {
@@ -215,6 +242,7 @@ impl Default for AppSettings {
                 modifiers: DEFAULT_HOTKEY_MODIFIERS,
                 key: DEFAULT_HOTKEY_KEY,
             }),
+            one_level_import: false,
         }
     }
 }

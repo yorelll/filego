@@ -42,6 +42,16 @@ pub enum RowAction {
     ContextMenu,
     /// Copy the full path to the clipboard (M03/M04 stub: records the command).
     CopyPath,
+    /// Copy the display name to the clipboard (M05.5).
+    CopyName,
+    /// Open the record in the settings add/edit dialog (M05.5).
+    Edit,
+    /// Toggle the pinned flag (M05.5).
+    TogglePin,
+    /// Disable/restore the record (M05.5).
+    ToggleEnable,
+    /// Remove the record from FileGo (never the real folder) (M05.5).
+    RemoveFromList,
 }
 
 /// Every user gesture the ViewModel understands.

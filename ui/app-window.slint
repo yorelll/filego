@@ -30,7 +30,7 @@
 //    key-pressed handles ↑/↓/Enter and Ctrl+C (copy path).
 //  - While `ime-composing` is set, Enter/↑/↓ are rejected to the IME.
 
-import { HorizontalBox, LineEdit, VerticalBox } from "std-widgets.slint";
+import { Button, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------------
 // Exported globals: strings + theme, pushed from Rust (i18n module + theme.rs)
@@ -58,6 +58,73 @@ export global UiStrings {
     in-out property <string> count: "";
     in-out property <string> inaccessible: "";
     in-out property <string> inaccessible-tooltip: "";
+    // ---- M05 settings window strings (pushed from Rust) ----
+    in-out property <string> settings-title: "";
+    in-out property <string> page-folders: "";
+    in-out property <string> page-categories: "";
+    in-out property <string> page-tags: "";
+    in-out property <string> col-name: "";
+    in-out property <string> col-path: "";
+    in-out property <string> col-status: "";
+    in-out property <string> col-actions: "";
+    in-out property <string> action-add: "";
+    in-out property <string> action-edit: "";
+    in-out property <string> action-remove: "";
+    in-out property <string> action-toggle-enabled: "";
+    in-out property <string> action-toggle-pin: "";
+    in-out property <string> action-check: "";
+    in-out property <string> action-favorite: "";
+    in-out property <string> filter-name-placeholder: "";
+    in-out property <string> uncategorized-label: "";
+    in-out property <string> enabled-label: "";
+    in-out property <string> disabled-label: "";
+    in-out property <string> pinned-label: "";
+    in-out property <string> notice-saved: "";
+    in-out property <string> notice-save-failed: "";
+    in-out property <string> notice-removed: "";
+    in-out property <string> notice-restored: "";
+    in-out property <string> notice-undo-expired: "";
+    in-out property <string> notice-cannot-undo: "";
+    in-out property <string> notice-duplicate-blocked: "";
+    in-out property <string> notice-invalid-path: "";
+    in-out property <string> notice-invalid-name: "";
+    in-out property <string> notice-not-found: "";
+    in-out property <string> notice-path-accessible: "";
+    in-out property <string> notice-path-inaccessible: "";
+    in-out property <string> notice-import-limited: "";
+    in-out property <string> remove-confirm: "";
+    in-out property <string> remove-never-deletes: "";
+    in-out property <string> undo: "";
+    in-out property <string> add-dialog-title: "";
+    in-out property <string> edit-dialog-title: "";
+    in-out property <string> field-name: "";
+    in-out property <string> field-path: "";
+    in-out property <string> field-not-empty: "";
+    in-out property <string> field-duplicate: "";
+    in-out property <string> save: "";
+    in-out property <string> cancel: "";
+    in-out property <string> paste: "";
+    in-out property <string> browse: "";
+    in-out property <string> import-offer-title: "";
+    in-out property <string> import-parent-only: "";
+    in-out property <string> import-children: "";
+    in-out property <string> import-max-hint: "";
+    in-out property <string> import-second-confirm: "";
+    in-out property <string> batch-preview-title: "";
+    in-out property <string> batch-add: "";
+    in-out property <string> batch-status-duplicate: "";
+    in-out property <string> batch-status-invalid: "";
+    in-out property <string> category-create: "";
+    in-out property <string> category-rename: "";
+    in-out property <string> category-delete: "";
+    in-out property <string> tag-create: "";
+    in-out property <string> tag-rename: "";
+    in-out property <string> tag-merge-to: "";
+    in-out property <string> tag-delete: "";
+    in-out property <string> usage-suffix: "";
+    in-out property <string> confirm-delete-category: "";
+    in-out property <string> confirm-delete-tag: "";
+    in-out property <string> import-setting-off-hint: "";
 }
 
 export global UiTheme {
@@ -450,6 +517,398 @@ export component AppWindow inherits Window {
                 Text { text: UiStrings.hint-open; color: UiTheme.text-secondary; font-size: 12px; }
                 Text { text: UiStrings.hint-close; color: UiTheme.text-secondary; font-size: 12px; }
                 Text { text: UiStrings.hint-toggle; color: UiTheme.text-secondary; font-size: 12px; }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M05 settings window local components (declared before use).
+// ---------------------------------------------------------------------------
+component NoticeBar inherits Rectangle {
+    in property <string> v-text;
+    height: 28px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: UiTheme.border;
+    background: UiTheme.selection;
+    visible: !root.v-text.is-empty;
+    Text {
+        x: 10px;
+        y: (parent.height - self.height) / 2;
+        text: root.v-text;
+        color: UiTheme.text;
+        font-size: 12px;
+    }
+}
+
+component FolderManagementRow inherits HorizontalBox {
+    in property <int> m-id;
+    in property <string> m-name;
+    in property <string> m-path;
+    in property <string> m-category;
+    in property <string> m-tags;
+    in property <bool> m-enabled;
+    in property <bool> m-pinned;
+    callback command-edit(int);
+    callback command-remove(int);
+    callback command-toggle-enabled(int);
+    callback command-toggle-pin(int);
+    callback command-check(int);
+    spacing: 8px;
+    height: 44px;
+
+    VerticalBox {
+        horizontal-stretch: 2;
+        spacing: 0px;
+        Text { text: root.m-name + (root.m-pinned ? " 📌" : ""); color: UiTheme.text; font-size: 13px; }
+        Text { text: root.m-path; color: UiTheme.text-secondary; font-size: 11px; overflow: elide; }
+    }
+    VerticalBox {
+        horizontal-stretch: 1;
+        Text { text: root.m-category; color: UiTheme.text-secondary; font-size: 12px; }
+        Text { text: root.m-tags; color: UiTheme.text-secondary; font-size: 11px; overflow: elide; }
+    }
+    Text { text: root.m-enabled ? UiStrings.enabled-label : UiStrings.disabled-label; color: root.m-enabled ? UiTheme.accent : UiTheme.warning; font-size: 11px; }
+    Button { text: UiStrings.action-toggle-enabled; clicked() => { root.command-toggle-enabled(root.m-id); } }
+    Button { text: UiStrings.action-toggle-pin; clicked() => { root.command-toggle-pin(root.m-id); } }
+    Button { text: UiStrings.action-edit; clicked() => { root.command-edit(root.m-id); } }
+    Button { text: UiStrings.action-remove; clicked() => { root.command-remove(root.m-id); } }
+    Button { text: UiStrings.action-check; clicked() => { root.command-check(root.m-id); } }
+}
+
+// ---------------------------------------------------------------------------
+// M05 settings management window (merged into one .slint so slint-build's
+// `compile` emits a single module; slint-build 1.18 emits one file per compile
+// and the second overwrites SLINT_INCLUDE_GENERATED, so two files cannot be
+// re-exported together).
+// ---------------------------------------------------------------------------
+export component SettingsWindow inherits Window {
+    title: "FileGo — " + UiStrings.settings-title;
+    preferred-width: 900px;
+    min-width: 760px;
+    preferred-height: 640px;
+    min-height: 520px;
+    background: UiTheme.background;
+
+    // --- observable state pushed from Rust (ManagementController + i18n) ---
+    in-out property <int> page: 0;
+    in-out property <int> rows-count: 0;
+    in-out property <[string]> rows-name: [];
+    in-out property <[string]> rows-path: [];
+    in-out property <[string]> rows-category: [];
+    in-out property <[string]> rows-tags: [];
+    in-out property <[bool]> rows-enabled: [];
+    in-out property <[bool]> rows-pinned: [];
+    in-out property <[bool]> rows-favorite: [];
+    in-out property <[int]> rows-ids: [];
+    in-out property <int> categories-count: 0;
+    in-out property <[string]> categories-name: [];
+    in-out property <[int]> categories-counts: [];
+    in-out property <int> tags-count: 0;
+    in-out property <[string]> tags-name: [];
+    in-out property <[int]> tags-usage: [];
+    in-out property <bool> import-offer-visible: false;
+    in-out property <string> import-offer-parent: "";
+    in-out property <int> import-offer-children: 0;
+    in-out property <string> import-offer-hover: "";
+    in-out property <string> notice-text: "";
+    in-out property <bool> has-pending-remove: false;
+    in-out property <string> pending-remove-name: "";
+    in-out property <int> pending-remove-seconds: 0;
+
+    // --- callbacks (commands to Rust) ---
+    callback close-settings();
+    callback command-show-page(int);
+    callback command-add();
+    callback command-paste();
+    callback command-browse();
+    callback command-edit(int);
+    callback command-remove(int);
+    callback command-toggle-enabled(int);
+    callback command-toggle-pin(int);
+    callback command-check(int);
+    callback command-create-category(string);
+    callback command-delete-category(int);
+    callback command-create-tag(string);
+    callback command-delete-tag(int);
+    callback command-filter-name(string);
+    callback command-confirm-remove();
+    callback command-cancel-remove();
+    callback command-undo-remove();
+    callback command-import-parent-only();
+    callback command-import-children();
+    callback command-import-dismiss();
+    callback command-save-draft();
+    callback command-cancel-draft();
+    callback command-set-draft-name(string);
+    callback command-set-draft-path(string);
+    callback command-set-draft-note(string);
+    callback command-toggle-pinned();
+    callback command-toggle-favorite();
+    callback command-set-enabled(bool);
+    callback command-apply-batch();
+    callback command-cancel-batch();
+
+    // --- local edit state for the drafts ---
+    in-out property <string> draft-name: "";
+    in-out property <string> draft-path: "";
+    in-out property <string> draft-note: "";
+    in-out property <bool> draft-visible: false;
+    in-out property <string> draft-title: "";
+    in-out property <string> draft-error: "";
+    in-out property <color> draft-color: #00000000;
+    in-out property <bool> batch-visible: false;
+    in-out property <int> batch-count: 0;
+    in-out property <[string]> batch-name: [];
+    in-out property <[string]> batch-path: [];
+    in-out property <[bool]> batch-dup: [];
+    in-out property <[bool]> batch-invalid: [];
+
+    HorizontalBox {
+        padding: 12px;
+        spacing: 12px;
+
+        // ===== left navigation =====
+        VerticalBox {
+            width: 180px;
+            spacing: 4px;
+            Rectangle {
+                height: 24px;
+                Text { text: UiStrings.settings-title; color: UiTheme.text; font-size: 15px; font-weight: 600; }
+            }
+            Button {
+                text: UiStrings.page-folders;
+                checked: root.page == 0;
+                clicked() => { root.command-show-page(0); }
+            }
+            Button {
+                text: UiStrings.page-categories;
+                checked: root.page == 1;
+                clicked() => { root.command-show-page(1); }
+            }
+            Button {
+                text: UiStrings.page-tags;
+                checked: root.page == 2;
+                clicked() => { root.command-show-page(2); }
+            }
+        }
+
+        // ===== right content =====
+        VerticalBox {
+            horizontal-stretch: 1;
+            spacing: 8px;
+
+            NoticeBar { v-text: root.notice-text; }
+
+            if (root.page == 0): VerticalBox {
+                spacing: 8px;
+                HorizontalBox {
+                    spacing: 8px;
+                    LineEdit {
+                        placeholder-text: UiStrings.filter-name-placeholder;
+                        horizontal-stretch: 1;
+                        edited(text) => { root.command-filter-name(text); }
+                    }
+                    Button { text: UiStrings.action-add; clicked() => { root.command-add(); } }
+                }
+                ScrollView {
+                    height: 400px;
+                    VerticalBox {
+                        spacing: 2px;
+                        for i in root.rows-count: FolderManagementRow {
+                            m-id: root.rows-ids[i];
+                            m-name: root.rows-name[i];
+                            m-path: root.rows-path[i];
+                            m-category: root.rows-category[i];
+                            m-tags: root.rows-tags[i];
+                            m-enabled: root.rows-enabled[i];
+                            m-pinned: root.rows-pinned[i];
+                            command-edit(id) => { root.command-edit(id); }
+                            command-remove(id) => { root.command-remove(id); }
+                            command-toggle-enabled(id) => { root.command-toggle-enabled(id); }
+                            command-toggle-pin(id) => { root.command-toggle-pin(id); }
+                            command-check(id) => { root.command-check(id); }
+                        }
+                        if (root.rows-count == 0): Text {
+                            text: UiStrings.field-not-empty;
+                            color: UiTheme.text-secondary;
+                            font-size: 13px;
+                        }
+                    }
+                }
+                if (root.has-pending-remove): Rectangle {
+                    height: 72px;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: UiTheme.border;
+                    background: UiTheme.surface;
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 4px;
+                        Text { text: UiStrings.remove-confirm + " · " + root.pending-remove-name; color: UiTheme.text; font-size: 12px; }
+                        Text { text: UiStrings.remove-never-deletes; color: UiTheme.warning; font-size: 11px; }
+                        HorizontalBox {
+                            spacing: 8px;
+                            Button { text: UiStrings.undo; clicked() => { root.command-undo-remove(); } }
+                            Button { text: UiStrings.cancel; clicked() => { root.command-cancel-remove(); } }
+                        }
+                    }
+                }
+            }
+
+            if (root.page == 1): VerticalBox {
+                spacing: 8px;
+                HorizontalBox {
+                    spacing: 8px;
+                    cat-input := LineEdit {
+                        placeholder-text: UiStrings.category-create;
+                        horizontal-stretch: 1;
+                        text: "";
+                    }
+                    Button { text: UiStrings.category-create; clicked() => { root.command-create-category(cat-input.text); cat-input.text = ""; } }
+                }
+                ScrollView {
+                    height: 400px;
+                    VerticalBox {
+                        spacing: 2px;
+                        for i in root.categories-count: HorizontalBox {
+                            spacing: 8px;
+                            height: 34px;
+                            Text { text: root.categories-name[i]; color: UiTheme.text; font-size: 13px; horizontal-stretch: 1; }
+                            Text { text: root.categories-counts[i] + UiStrings.usage-suffix; color: UiTheme.text-secondary; font-size: 12px; }
+                            Button { text: UiStrings.category-delete; clicked() => { root.command-delete-category(i); } }
+                        }
+                        if (root.categories-count == 0): Text { text: UiStrings.field-not-empty; color: UiTheme.text-secondary; font-size: 13px; }
+                    }
+                }
+            }
+
+            if (root.page == 2): VerticalBox {
+                spacing: 8px;
+                HorizontalBox {
+                    spacing: 8px;
+                    tag-input := LineEdit {
+                        placeholder-text: UiStrings.tag-create;
+                        horizontal-stretch: 1;
+                        text: "";
+                    }
+                    Button { text: UiStrings.tag-create; clicked() => { root.command-create-tag(tag-input.text); tag-input.text = ""; } }
+                }
+                ScrollView {
+                    height: 400px;
+                    VerticalBox {
+                        spacing: 2px;
+                        for i in root.tags-count: HorizontalBox {
+                            spacing: 8px;
+                            height: 34px;
+                            Text { text: root.tags-name[i]; color: UiTheme.text; font-size: 13px; horizontal-stretch: 1; }
+                            Text { text: root.tags-usage[i] + UiStrings.usage-suffix; color: UiTheme.text-secondary; font-size: 12px; }
+                            Button { text: UiStrings.tag-delete; clicked() => { root.command-delete-tag(i); } }
+                        }
+                        if (root.tags-count == 0): Text { text: UiStrings.field-not-empty; color: UiTheme.text-secondary; font-size: 13px; }
+                    }
+                }
+            }
+
+            // ===== add/edit dialog =====
+            if (root.draft-visible): Rectangle {
+                width: 100%;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: UiTheme.border;
+                background: UiTheme.surface;
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 8px;
+                    Text { text: root.draft-title; color: UiTheme.text; font-size: 14px; font-weight: 600; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: UiStrings.field-name; color: UiTheme.text-secondary; }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: root.draft-name;
+                            edited(text) => { root.command-set-draft-name(text); }
+                        }
+                        Button { text: UiStrings.action-toggle-pin; clicked() => { root.command-toggle-pinned(); } }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: UiStrings.field-path; color: UiTheme.text-secondary; }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: root.draft-path;
+                            edited(text) => { root.command-set-draft-path(text); }
+                        }
+                        Button { text: UiStrings.paste; clicked() => { root.command-paste(); } }
+                        Button { text: UiStrings.browse; clicked() => { root.command-browse(); } }
+                    }
+                    NoticeBar { v-text: root.draft-error; }
+                    HorizontalBox {
+                        alignment: end;
+                        spacing: 8px;
+                        Button { text: UiStrings.cancel; clicked() => { root.command-cancel-draft(); } }
+                        Button { text: UiStrings.save; clicked() => { root.command-save-draft(); } }
+                    }
+                }
+            }
+
+            // ===== controlled one-level child import offer =====
+            if (root.import-offer-visible): Rectangle {
+                width: 100%;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: UiTheme.border;
+                background: UiTheme.surface;
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 8px;
+                    Text { text: UiStrings.import-offer-title; color: UiTheme.text; font-size: 14px; font-weight: 600; }
+                    Text {
+                        text: root.import-offer-parent;
+                        color: UiTheme.text-secondary;
+                        font-size: 12px;
+                        Tooltip { Text { text: root.import-offer-hover; } }
+                    }
+                    Text { text: UiStrings.import-second-confirm; color: UiTheme.warning; font-size: 12px; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button { text: UiStrings.import-parent-only; clicked() => { root.command-import-parent-only(); } }
+                        Button { text: UiStrings.import-children + " (" + root.import-offer-children + ")"; clicked() => { root.command-import-children(); } }
+                        Button { text: UiStrings.cancel; clicked() => { root.command-import-dismiss(); } }
+                    }
+                }
+            }
+
+            // ===== batch preview =====
+            if (root.batch-visible): Rectangle {
+                width: 100%;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: UiTheme.border;
+                background: UiTheme.surface;
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 8px;
+                    Text { text: UiStrings.batch-preview-title; color: UiTheme.text; font-size: 14px; font-weight: 600; }
+                    ScrollView {
+                        horizontal-stretch: 1;
+                        VerticalBox {
+                            for i in root.batch-count: HorizontalBox {
+                                spacing: 8px;
+                                Text { text: root.batch-name[i]; color: UiTheme.text; font-size: 12px; horizontal-stretch: 1; }
+                                if (root.batch-dup[i]): Text { text: UiStrings.batch-status-duplicate; color: UiTheme.warning; font-size: 12px; }
+                                if (root.batch-invalid[i]): Text { text: UiStrings.batch-status-invalid; color: UiTheme.warning; font-size: 12px; }
+                            }
+                        }
+                    }
+                    HorizontalBox {
+                        alignment: end;
+                        spacing: 8px;
+                        Button { text: UiStrings.cancel; clicked() => { root.command-cancel-batch(); } }
+                        Button { text: UiStrings.batch-add; clicked() => { root.command-apply-batch(); } }
+                    }
+                }
             }
         }
     }

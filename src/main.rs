@@ -3,13 +3,15 @@
 use std::{cell::RefCell, rc::Rc};
 
 use filego::{
-    AppTray, AppWindow, UiStrings, UiTheme,
+    AppTray, AppWindow, SettingsWindow, UiStrings, UiTheme,
     app::{LifecycleCommand, LifecycleController, WindowPort},
     domain::settings::AppSettings,
     presentation::{
         commands::{RowAction, SearchKey, ViewCommand},
+        i18n::Msg,
+        manager::{MCommand, ManagementController, ManagementStore},
         state::SelectionMove,
-        view_model::{ExternalEffect, NoopEffects, SearchViewModel, default_runner},
+        view_model::{ExternalEffect, NoopEffects, ResolvedEntry, SearchViewModel, default_runner},
     },
     version,
 };
@@ -135,10 +137,11 @@ impl ShellHandle {
 
 /// The 0.0.1 ViewModel-driven adapter for the M03 search window.
 ///
-/// M03 intentionally has no real repository wiring yet (M05/M06). This adapter
-/// hands the ViewModel a small set of resolved entries so the window can
-/// display and search with fake data, as the M03.5 smoke requirement asks; the
-/// storage-backed construction is M06.
+/// M05 moves search onto the real repository-backed data path: the adapter is
+/// handed the resolved entries (built by `run()` from the shared repository)
+/// instead of demo data. The management side (settings window) shares the same
+/// repository. Context-menu actions (M05.5) are routed to the settings window
+/// through `context_sender`.
 struct MainWindowController {
     view_model: SearchViewModel,
     window: slint::Weak<AppWindow>,
@@ -153,6 +156,12 @@ struct MainWindowController {
     /// The shell opener used for M04.5 (injected for tests to observe it runs
     /// only `open_folder`).
     shell: ShellHandle,
+    /// Sender for context-menu effects (M05.5) drained by the settings window
+    /// controller on a UI-thread timer.
+    context_sender: std::sync::mpsc::Sender<ContextEffect>,
+    /// The full set of resolved entries (rebuilt from the repository after a
+    /// management change; pushed into the ViewModel).
+    resolved: Vec<ResolvedEntry>,
 }
 
 impl MainWindowController {
@@ -161,28 +170,13 @@ impl MainWindowController {
         open_results: std::sync::mpsc::Receiver<OpenResult>,
         open_sender: std::sync::mpsc::Sender<OpenResult>,
         shell: ShellHandle,
+        context_sender: std::sync::mpsc::Sender<ContextEffect>,
+        resolved: Vec<ResolvedEntry>,
+        settings: AppSettings,
     ) -> Self {
-        let settings = AppSettings::default();
-        // M03 demo data: a couple of local shortcut records (paths are never
-        // probed by the search core; accessibility stays Unknown).
-        let searchable = vec![
-            demo_entry(1, "Documents", r"C:\Users\demo\Documents", true),
-            demo_entry(2, "Photos", r"C:\Users\demo\Pictures\Photos", false),
-            demo_entry(3, "设计资料", r"D:\work\design-assets", false),
-            demo_entry(4, "Code Repos", r"C:\dev\repos", true),
-        ];
-        let resolved =
-            filego::presentation::view_model::resolved_from_search(&searchable, |entry| {
-                entry
-                    .path
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .unwrap_or(&entry.path)
-                    .to_owned()
-            });
         let view_model = SearchViewModel::new(
             settings.clone(),
-            resolved,
+            resolved.clone(),
             Box::new(default_runner),
             Box::new(NoopEffects),
         );
@@ -193,7 +187,21 @@ impl MainWindowController {
             open_sender,
             settings,
             shell,
+            context_sender,
+            resolved,
         }
+    }
+
+    /// Rebuild the resolved entries from the shared repository and refresh the
+    /// search window (called after a settings-window change).
+    fn refresh_from_repository(
+        &mut self,
+        repo: &std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>>,
+    ) {
+        self.resolved = resolved_from_repository(repo);
+        let entries = self.resolved.clone();
+        self.view_model.set_resolved_entries(entries);
+        self.sync_ui();
     }
 
     /// Drain any pending open results (called by the UI-thread timer).
@@ -234,10 +242,51 @@ impl MainWindowController {
             // path into the OS clipboard with a UTF-16 write in the clipboard
             // adapter (part of M04 native wiring, but only best-effort).
             ExternalEffect::CopyPath => self.copy_selected_path(),
+            // M05.5: copy the selected display name to the clipboard.
+            ExternalEffect::CopyName => {
+                if let Some(name) = self.selected_display_name() {
+                    filego::platform::windows::clipboard::set_text(&name);
+                }
+            }
+            // M05.5: open the selected record in the settings edit dialog. The
+            // adapter routes this to the settings window controller through a
+            // channel (see `SettingsBridge`).
+            ExternalEffect::EditSelected => self.request_context_action(ContextAction::Edit),
+            ExternalEffect::TogglePinSelected => {
+                self.request_context_action(ContextAction::TogglePin)
+            }
+            ExternalEffect::ToggleEnableSelected => {
+                self.request_context_action(ContextAction::ToggleEnable)
+            }
+            ExternalEffect::RemoveSelectedFromList => {
+                self.request_context_action(ContextAction::Remove)
+            }
             ExternalEffect::ClearInput => {
                 // The LineEdit already clears via state-query; keep focus on it.
             }
         }
+    }
+
+    fn selected_display_name(&self) -> Option<String> {
+        let state = self.view_model.state();
+        let index = state.selected?;
+        state.rows.get(index).map(|row| row.display_name.clone())
+    }
+
+    /// Route a context-menu action for the selected row (M05.5). The settings
+    /// window owns the repository; the action is forwarded through a channel
+    /// drained by the settings timer. The overlay stays open until the adapter
+    /// closes it (popup-safe).
+    fn request_context_action(&mut self, action: ContextAction) {
+        let state = self.view_model.state();
+        let Some(index) = state.selected else {
+            return;
+        };
+        let Some(row) = state.rows.get(index) else {
+            return;
+        };
+        let effect = ContextEffect::from_row(action, row.entry_id);
+        self.context_sender.send(effect).ok();
     }
 
     fn selected_full_path(&self) -> Option<String> {
@@ -411,6 +460,295 @@ fn string_model(values: impl Iterator<Item = String>) -> ModelRc<slint::SharedSt
     ))
 }
 
+/// A context-menu action routed from the search window to the settings window
+/// (M05.5). The settings controller resolves the targe folder by id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAction {
+    Edit,
+    TogglePin,
+    ToggleEnable,
+    Remove,
+}
+
+/// A context effect pushed to the settings controller through a channel.
+#[derive(Debug, Clone)]
+pub enum ContextEffect {
+    OpenEdit { folder_id: uuid::Uuid },
+    TogglePin { folder_id: uuid::Uuid },
+    ToggleEnable { folder_id: uuid::Uuid },
+    Remove { folder_id: uuid::Uuid },
+}
+
+impl ContextEffect {
+    fn from_row(action: ContextAction, folder_id: uuid::Uuid) -> Self {
+        match action {
+            ContextAction::Edit => ContextEffect::OpenEdit { folder_id },
+            ContextAction::TogglePin => ContextEffect::TogglePin { folder_id },
+            ContextAction::ToggleEnable => ContextEffect::ToggleEnable { folder_id },
+            ContextAction::Remove => ContextEffect::Remove { folder_id },
+        }
+    }
+}
+
+/// The 0.0.1 adapter that owns the settings window, drives the manager with ONE
+/// shared repository, forwards tray/picker/context commands, and pushes the
+/// manager's [`MView`] into the Slint `SettingsWindow`.
+struct SettingsWindowController {
+    manager: ManagementController<filego::presentation::manager::SharedStore>,
+    window: slint::Weak<SettingsWindow>,
+    /// Receiver for context-menu effects from the search window (drained by a
+    /// UI-thread timer).
+    context_rx: std::sync::mpsc::Receiver<ContextEffect>,
+    /// The folder-picker entry point; injected so the bin can be tested.
+    picker: fn() -> filego::platform::windows::folder_picker::PickOutcome,
+    /// Shared repository (the search window rebuilds its entries from it).
+    repo: std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>>,
+}
+
+impl SettingsWindowController {
+    fn new(
+        window: slint::Weak<SettingsWindow>,
+        store: filego::presentation::manager::SharedStore,
+        context_rx: std::sync::mpsc::Receiver<ContextEffect>,
+    ) -> Self {
+        let repo = store.repo().clone();
+        let one_level_import_setting = store
+            .document()
+            .map(|document| document.data.settings.one_level_import)
+            .unwrap_or(false);
+        let manager = ManagementController::new(store, one_level_import_setting);
+        Self {
+            manager,
+            window,
+            context_rx,
+            picker: filego::platform::windows::folder_picker::pick_folder_dialog,
+            repo,
+        }
+    }
+
+    fn handle(&mut self, command: MCommand) {
+        self.manager.handle(command);
+        self.sync_ui();
+    }
+
+    /// The shared repository (used by the search window to rebuild entries
+    /// after a management change).
+    fn manager_repo(
+        &self,
+    ) -> std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>> {
+        self.repo.clone()
+    }
+
+    /// Drain context-menu effects from the search window.
+    fn drain_context(&mut self) {
+        while let Ok(effect) = self.context_rx.try_recv() {
+            match effect {
+                ContextEffect::OpenEdit { folder_id } => {
+                    let id = filego::domain::ids::FolderId::from_uuid(folder_id);
+                    self.manager.handle(MCommand::EditFolder(id));
+                    self.show();
+                }
+                ContextEffect::TogglePin { folder_id } => {
+                    let id = filego::domain::ids::FolderId::from_uuid(folder_id);
+                    self.manager.handle(MCommand::TogglePin(id));
+                }
+                ContextEffect::ToggleEnable { folder_id } => {
+                    let id = filego::domain::ids::FolderId::from_uuid(folder_id);
+                    self.manager.handle(MCommand::ToggleEnable(id));
+                }
+                ContextEffect::Remove { folder_id } => {
+                    let id = filego::domain::ids::FolderId::from_uuid(folder_id);
+                    self.manager.handle(MCommand::StartRemove(id));
+                    self.show();
+                }
+            }
+            self.sync_ui();
+        }
+    }
+
+    fn show(&self) {
+        if let Some(window) = self.window.upgrade() {
+            let _ = window.show();
+        }
+    }
+
+    /// Open the native folder picker and forward results (add flow).
+    fn browse(&mut self) {
+        if let filego::platform::windows::folder_picker::PickOutcome::Picked(paths) =
+            (self.picker)()
+        {
+            self.manager.handle(MCommand::OpenPickPaths(paths));
+        }
+        self.sync_ui();
+    }
+
+    /// Paste the clipboard text as a manual path (add/edit field).
+    fn paste_into_path(&mut self) {
+        let path = filego::platform::windows::clipboard::read_text();
+        if !path.trim().is_empty() {
+            self.manager.handle(MCommand::EditPath(path));
+        }
+    }
+
+    /// Push the full manager view into the Slint window.
+    fn sync_ui(&self) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let view = self.manager.view();
+
+        window.set_page(match view.page {
+            filego::presentation::manager::Page::Folders => 0,
+            filego::presentation::manager::Page::Categories => 1,
+            filego::presentation::manager::Page::Tags => 2,
+        });
+
+        window.set_rows_count(view.rows.len() as i32);
+        window.set_rows_name(string_model(
+            view.rows.iter().map(|r| r.display_name.clone()),
+        ));
+        window.set_rows_path(string_model(view.rows.iter().map(|r| r.path.clone())));
+        window.set_rows_category(string_model(
+            view.rows
+                .iter()
+                .map(|r| r.category_name.clone().unwrap_or_default()),
+        ));
+        window.set_rows_tags(string_model(
+            view.rows.iter().flat_map(|r| r.tag_names.clone()),
+        ));
+        let (enabled, pinned, favorite, ids): (Vec<bool>, Vec<bool>, Vec<bool>, Vec<i32>) = view
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.enabled,
+                    r.pinned,
+                    r.favorite,
+                    r.id.as_uuid().as_u128() as i32,
+                )
+            })
+            .collect();
+        window.set_rows_enabled(ModelRc::new(VecModel::from(enabled)));
+        window.set_rows_pinned(ModelRc::new(VecModel::from(pinned)));
+        window.set_rows_favorite(ModelRc::new(VecModel::from(favorite)));
+        window.set_rows_ids(ModelRc::new(VecModel::from(ids)));
+
+        window.set_categories_count(view.categories.len() as i32);
+        window.set_categories_name(string_model(view.categories.iter().map(|c| c.name.clone())));
+        window.set_categories_counts(ModelRc::new(VecModel::from(
+            view.categories
+                .iter()
+                .map(|c| c.count as i32)
+                .collect::<Vec<_>>(),
+        )));
+
+        window.set_tags_count(view.tags.len() as i32);
+        window.set_tags_name(string_model(view.tags.iter().map(|t| t.name.clone())));
+        window.set_tags_usage(ModelRc::new(VecModel::from(
+            view.tags.iter().map(|t| t.usage as i32).collect::<Vec<_>>(),
+        )));
+
+        // Import offer.
+        if let Some(offer) = &view.import_offer {
+            window.set_import_offer_visible(true);
+            window.set_import_offer_parent(offer.parent_path.clone().into());
+            window.set_import_offer_children(offer.child_count as i32);
+            window.set_import_offer_hover(offer.hover.clone().into());
+        } else {
+            window.set_import_offer_visible(false);
+        }
+
+        // Notice.
+        let locale = filego::presentation::i18n::Locale::default();
+        window.set_notice_text(
+            view.notice
+                .map(|notice| settings_notice_text(notice, locale))
+                .unwrap_or_default()
+                .into(),
+        );
+
+        // Pending remove banner.
+        if let Some(pending) = &view.pending_remove {
+            window.set_has_pending_remove(true);
+            window.set_pending_remove_name(pending.folder_name.clone().into());
+            window.set_pending_remove_seconds(i32::from(pending.seconds_left));
+        } else {
+            window.set_has_pending_remove(false);
+            window.set_pending_remove_name("".into());
+            window.set_pending_remove_seconds(0);
+        }
+
+        // Draft dialog.
+        match &view.add_flow {
+            filego::presentation::manager::AddFlowView::Draft(draft) => {
+                window.set_draft_visible(true);
+                window.set_draft_name(draft.display_name.clone().into());
+                window.set_draft_path(draft.path.clone().into());
+                window.set_draft_note(draft.note.clone().into());
+                let title = if draft.id.is_some() {
+                    Msg::EditDialogTitle
+                } else {
+                    Msg::AddDialogTitle
+                };
+                window.set_draft_title(title.tr(locale).into());
+                let error = if !draft.valid {
+                    Msg::NoticeInvalidPath.tr(locale)
+                } else if let Some(existing) = &draft.duplicate_existing {
+                    format!("{}: {existing}", Msg::NoticeDuplicateBlocked.tr(locale))
+                } else {
+                    String::new()
+                };
+                window.set_draft_error(error.into());
+                window.set_draft_color(slint::Color::from_rgb_u8(0x25, 0x63, 0xEB));
+            }
+            filego::presentation::manager::AddFlowView::Preview(batch) => {
+                window.set_draft_visible(false);
+                window.set_batch_visible(true);
+                window.set_batch_count(batch.items.len() as i32);
+                window.set_batch_name(string_model(batch.items.iter().map(|i| i.name.clone())));
+                window.set_batch_path(string_model(batch.items.iter().map(|i| i.path.clone())));
+                window.set_batch_dup(ModelRc::new(VecModel::from(
+                    batch
+                        .items
+                        .iter()
+                        .map(|i| i.duplicate_existing.is_some())
+                        .collect::<Vec<_>>(),
+                )));
+                window.set_batch_invalid(ModelRc::new(VecModel::from(
+                    batch.items.iter().map(|i| i.invalid).collect::<Vec<_>>(),
+                )));
+            }
+            filego::presentation::manager::AddFlowView::Closed => {
+                window.set_draft_visible(false);
+                window.set_batch_visible(false);
+            }
+        }
+    }
+}
+
+/// Localize a manager notice (privacy-safe; never a path).
+fn settings_notice_text(
+    notice: filego::presentation::manager::Notice,
+    locale: filego::presentation::i18n::Locale,
+) -> String {
+    let msg = match notice {
+        filego::presentation::manager::Notice::Saved => Msg::NoticeSaved,
+        filego::presentation::manager::Notice::SaveFailed => Msg::NoticeSaveFailed,
+        filego::presentation::manager::Notice::Removed => Msg::NoticeRemoved,
+        filego::presentation::manager::Notice::Restored => Msg::NoticeRestored,
+        filego::presentation::manager::Notice::UndoExpired => Msg::NoticeUndoExpired,
+        filego::presentation::manager::Notice::CannotUndo => Msg::NoticeCannotUndo,
+        filego::presentation::manager::Notice::DuplicateBlocked => Msg::NoticeDuplicateBlocked,
+        filego::presentation::manager::Notice::InvalidPath => Msg::NoticeInvalidPath,
+        filego::presentation::manager::Notice::InvalidName => Msg::NoticeInvalidName,
+        filego::presentation::manager::Notice::NotFound => Msg::NoticeNotFound,
+        filego::presentation::manager::Notice::PathAccessible => Msg::NoticePathAccessible,
+        filego::presentation::manager::Notice::PathInaccessible => Msg::NoticePathInaccessible,
+        filego::presentation::manager::Notice::ImportLimited => Msg::NoticeImportLimited,
+    };
+    msg.tr(locale)
+}
+
 /// The results-count label for the current rows, through the i18n catalog.
 /// F001 fix: the count is derived from `rows.len()` on every `sync_ui`, never a
 /// constant, so the window never renders a stale "0 results".
@@ -423,23 +761,258 @@ fn results_count_label(
         .into()
 }
 
-fn demo_entry(id: u128, name: &str, path: &str, pinned: bool) -> filego::search::SearchEntry {
-    filego::search::SearchEntry {
-        id: filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id)),
-        display_name: name.to_owned(),
-        aliases: Vec::new(),
-        path: path.to_owned(),
-        category_name: None,
-        tag_names: Vec::new(),
-        note: String::new(),
-        pinned,
-        favorite: false,
-        manual_weight: 0,
-        open_count: 0,
-        last_opened_at: Some("2026-09-21T00:00:00Z".parse().expect("fixed date")),
-        accessibility: filego::search::Accessibility::Unknown,
-        origin: filego::search::Origin::Unknown,
+/// The FileGo data directory: `%LOCALAPPDATA%\FileGo`. Pure helper; the app
+/// falls back to a portable path when the env var is missing (M05 keeps data
+/// local and private).
+fn data_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("FileGo-portable"));
+    base.join("FileGo")
+}
+
+/// Open (or create) the shared repository at `data_dir()`. A first run has no
+/// document: we seed an empty (but valid) one so the whole flow (add/edit/
+/// category/tag) is available immediately. Corruption/pending-recovery is kept
+/// explicit: the repository reports it and the app starts with an empty
+/// working copy rather than destroying the corrupt file.
+fn open_repository()
+-> std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>> {
+    let base = data_dir();
+    let paths = filego::storage::location::DocumentPaths::from_base_dir(&base);
+    let mut repo = filego::storage::repository::DocumentRepository::new(paths);
+    let result = repo.load();
+    // On first run (`NotFound`) we seed a valid empty document through the
+    // public `save` so the revision/lock machinery is exercised exactly like a
+    // real first save. On corruption we keep the file untouched and start with
+    // an empty working copy the user can repair via the normal recovery path.
+    if matches!(
+        result,
+        Err(filego::storage::repository::RepositoryError::NotFound)
+    ) {
+        let empty = empty_document();
+        if repo.save(&empty).is_err() {
+            eprintln!("FileGo could not create its data file");
+        }
+    } else if result.is_err() {
+        // Corrupt/unreadable: keep the file, start with no working copy. The
+        // repository recovery paths (backup/repair) remain the only writers.
+        eprintln!("FileGo could not load stored data; recovery is pending");
     }
+    let _ = base;
+    std::rc::Rc::new(std::cell::RefCell::new(repo))
+}
+
+/// Push the settings-window i18n strings into the shared `UiStrings` global.
+/// The settings window reuses the app window's `UiStrings` global (`in-out`
+/// properties are shared across components in one compiled module).
+fn apply_settings_localization(
+    window: &SettingsWindow,
+    locale: filego::presentation::i18n::Locale,
+) {
+    let entries: &[(&str, Msg)] = &[
+        ("settings_title", Msg::SettingsTitle),
+        ("page_folders", Msg::SettingsFolders),
+        ("page_categories", Msg::SettingsCategories),
+        ("page_tags", Msg::SettingsTags),
+        ("col_name", Msg::ColName),
+        ("col_path", Msg::ColPath),
+        ("col_status", Msg::ColStatus),
+        ("col_actions", Msg::ColActions),
+        ("action_add", Msg::ActionAdd),
+        ("action_edit", Msg::ActionEdit),
+        ("action_remove", Msg::ActionRemoveRecord),
+        ("action_toggle_enabled", Msg::ActionAdd),
+        ("action_toggle_pin", Msg::PinnedLabel),
+        ("action_check", Msg::ActionCheck),
+        ("filter_name_placeholder", Msg::FilterNamePlaceholder),
+        ("uncategorized_label", Msg::Uncategorized),
+        ("enabled_label", Msg::EnabledLabel),
+        ("disabled_label", Msg::DisabledLabel),
+        ("pinned_label", Msg::PinnedLabel),
+        ("notice_saved", Msg::NoticeSaved),
+        ("notice_save_failed", Msg::NoticeSaveFailed),
+        ("notice_removed", Msg::NoticeRemoved),
+        ("notice_restored", Msg::NoticeRestored),
+        ("notice_undo_expired", Msg::NoticeUndoExpired),
+        ("notice_cannot_undo", Msg::NoticeCannotUndo),
+        ("notice_duplicate_blocked", Msg::NoticeDuplicateBlocked),
+        ("notice_invalid_path", Msg::NoticeInvalidPath),
+        ("notice_invalid_name", Msg::NoticeInvalidName),
+        ("notice_not_found", Msg::NoticeNotFound),
+        ("notice_path_accessible", Msg::NoticePathAccessible),
+        ("notice_path_inaccessible", Msg::NoticePathInaccessible),
+        ("notice_import_limited", Msg::NoticeImportLimited),
+        ("remove_confirm", Msg::RemoveConfirm),
+        ("remove_never_deletes", Msg::RemoveNeverDeletes),
+        ("undo", Msg::Undo),
+        ("add_dialog_title", Msg::AddDialogTitle),
+        ("edit_dialog_title", Msg::EditDialogTitle),
+        ("field_name", Msg::FieldName),
+        ("field_path", Msg::FieldPath),
+        ("save", Msg::Save),
+        ("cancel", Msg::Cancel),
+        ("paste", Msg::ActionPaste),
+        ("browse", Msg::ActionBrowse),
+        ("import_offer_title", Msg::ImportOfferTitle),
+        ("import_parent_only", Msg::ImportParentOnly),
+        ("import_children", Msg::ImportChildren),
+        ("import_second_confirm", Msg::ImportSecondConfirm),
+        ("import_max_hint", Msg::ImportChildren),
+        ("batch_preview_title", Msg::BatchPreviewTitle),
+        ("batch_add", Msg::BatchAdd),
+        ("batch_status_duplicate", Msg::BatchStatusDuplicate),
+        ("batch_status_invalid", Msg::BatchStatusInvalid),
+        ("category_create", Msg::CategoryCreate),
+        ("category_rename", Msg::CategoryCreate),
+        ("category_delete", Msg::CategoryDelete),
+        ("tag_create", Msg::TagCreate),
+        ("tag_rename", Msg::TagCreate),
+        ("tag_merge_to", Msg::TagMerge),
+        ("tag_delete", Msg::TagDelete),
+        ("usage_suffix", Msg::UsageSuffix),
+    ];
+    for (field, msg) in entries {
+        let value = msg.tr(locale);
+        // The generated setters are named `set_<field>`.
+        call_string_setter(window, field, value);
+    }
+}
+
+/// Route a string property value to the right generated setter. The settings
+/// window's properties were generated from the `UiStrings` global, so the
+/// setter lives on the global accessor, not the window.
+fn call_string_setter(window: &SettingsWindow, field: &str, value: String) {
+    let strings = window.global::<UiStrings>();
+    let value = slint::SharedString::from(&value);
+    match field {
+        "settings_title" => strings.set_settings_title(value),
+        "page_folders" => strings.set_page_folders(value),
+        "page_categories" => strings.set_page_categories(value),
+        "page_tags" => strings.set_page_tags(value),
+        "col_name" => strings.set_col_name(value),
+        "col_path" => strings.set_col_path(value),
+        "col_status" => strings.set_col_status(value),
+        "col_actions" => strings.set_col_actions(value),
+        "action_add" => strings.set_action_add(value),
+        "action_edit" => strings.set_action_edit(value),
+        "action_remove" => strings.set_action_remove(value),
+        "action_toggle_enabled" => strings.set_action_toggle_enabled(value),
+        "action_toggle_pin" => strings.set_action_toggle_pin(value),
+        "action_check" => strings.set_action_check(value),
+        "filter_name_placeholder" => strings.set_filter_name_placeholder(value),
+        "uncategorized_label" => strings.set_uncategorized_label(value),
+        "enabled_label" => strings.set_enabled_label(value),
+        "disabled_label" => strings.set_disabled_label(value),
+        "pinned_label" => strings.set_pinned_label(value),
+        "notice_saved" => strings.set_notice_saved(value),
+        "notice_save_failed" => strings.set_notice_save_failed(value),
+        "notice_removed" => strings.set_notice_removed(value),
+        "notice_restored" => strings.set_notice_restored(value),
+        "notice_undo_expired" => strings.set_notice_undo_expired(value),
+        "notice_cannot_undo" => strings.set_notice_cannot_undo(value),
+        "notice_duplicate_blocked" => strings.set_notice_duplicate_blocked(value),
+        "notice_invalid_path" => strings.set_notice_invalid_path(value),
+        "notice_invalid_name" => strings.set_notice_invalid_name(value),
+        "notice_not_found" => strings.set_notice_not_found(value),
+        "notice_path_accessible" => strings.set_notice_path_accessible(value),
+        "notice_path_inaccessible" => strings.set_notice_path_inaccessible(value),
+        "notice_import_limited" => strings.set_notice_import_limited(value),
+        "remove_confirm" => strings.set_remove_confirm(value),
+        "remove_never_deletes" => strings.set_remove_never_deletes(value),
+        "undo" => strings.set_undo(value),
+        "add_dialog_title" => strings.set_add_dialog_title(value),
+        "edit_dialog_title" => strings.set_edit_dialog_title(value),
+        "field_name" => strings.set_field_name(value),
+        "field_path" => strings.set_field_path(value),
+        "save" => strings.set_save(value),
+        "cancel" => strings.set_cancel(value),
+        "paste" => strings.set_paste(value),
+        "browse" => strings.set_browse(value),
+        "import_offer_title" => strings.set_import_offer_title(value),
+        "import_parent_only" => strings.set_import_parent_only(value),
+        "import_children" => strings.set_import_children(value),
+        "import_second_confirm" => strings.set_import_second_confirm(value),
+        "import_max_hint" => strings.set_import_max_hint(value),
+        "batch_preview_title" => strings.set_batch_preview_title(value),
+        "batch_add" => strings.set_batch_add(value),
+        "batch_status_duplicate" => strings.set_batch_status_duplicate(value),
+        "batch_status_invalid" => strings.set_batch_status_invalid(value),
+        "category_create" => strings.set_category_create(value),
+        "category_rename" => strings.set_category_rename(value),
+        "category_delete" => strings.set_category_delete(value),
+        "tag_create" => strings.set_tag_create(value),
+        "tag_rename" => strings.set_tag_rename(value),
+        "tag_merge_to" => strings.set_tag_merge_to(value),
+        "tag_delete" => strings.set_tag_delete(value),
+        "usage_suffix" => strings.set_usage_suffix(value),
+        _ => {}
+    }
+}
+
+fn empty_document() -> filego::storage::schema::StoredDocumentV1 {
+    use filego::storage::schema::StoredDocumentV1;
+    StoredDocumentV1::new(filego::domain::document::AppData {
+        settings: AppSettings::default(),
+        folders: Vec::new(),
+        categories: Vec::new(),
+        tags: Vec::new(),
+        revision: 1,
+    })
+}
+
+/// Build the search-resolved entries from the repository document (M05).
+fn resolved_from_repository(
+    repo: &std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>>,
+) -> Vec<ResolvedEntry> {
+    let Some(document) = repo.borrow().document().cloned() else {
+        return Vec::new();
+    };
+    let categories = &document.data.categories;
+    let tags = &document.data.tags;
+    let category_name = |id: filego::domain::ids::CategoryId| -> Option<String> {
+        categories
+            .iter()
+            .find(|category| category.id == id)
+            .map(|category| category.name.clone())
+    };
+    let tag_names = |ids: &[filego::domain::ids::TagId]| -> Vec<String> {
+        tags.iter()
+            .filter(|tag| ids.contains(&tag.id))
+            .map(|tag| tag.name.clone())
+            .collect()
+    };
+
+    let searchable: Vec<filego::search::SearchEntry> = document
+        .data
+        .folders
+        .iter()
+        .filter(|folder| folder.enabled)
+        .map(|folder| filego::search::SearchEntry {
+            id: folder.id,
+            display_name: folder.display_name.clone(),
+            aliases: folder.aliases.clone(),
+            path: folder.path.clone(),
+            category_name: folder.category_id.and_then(category_name),
+            tag_names: tag_names(&folder.tag_ids),
+            note: folder.note.clone(),
+            pinned: folder.pinned,
+            favorite: folder.favorite,
+            manual_weight: folder.manual_weight,
+            open_count: folder.open_count,
+            last_opened_at: folder.last_opened_at,
+            accessibility: filego::search::Accessibility::Unknown,
+            origin: filego::search::Origin::Unknown,
+        })
+        .collect();
+    filego::presentation::view_model::resolved_from_search(&searchable, |entry| {
+        entry
+            .path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&entry.path)
+            .to_owned()
+    })
 }
 
 fn color_from_hex(hex: &str) -> slint::Color {
@@ -692,17 +1265,39 @@ fn run() -> Result<(), slint::PlatformError> {
     );
     tray.set_pause_hotkeys_glyph(if native.borrow().paused() { "✓ " } else { "" }.into());
 
+    // ---- M05: shared repository + settings window + shared adapter -----
+    let repo = open_repository();
+    let (context_tx, context_rx) = std::sync::mpsc::channel();
+    let settings_window = SettingsWindow::new()?;
+    apply_settings_localization(
+        &settings_window,
+        filego::presentation::i18n::Locale::default(),
+    );
+    let store = filego::presentation::manager::SharedStore::new(Rc::clone(&repo));
+    let settings_adapter = Rc::new(RefCell::new(SettingsWindowController::new(
+        settings_window.as_weak(),
+        store,
+        context_rx,
+    )));
+
     {
-        let app_weak = app.as_weak();
+        let settings = Rc::clone(&settings_adapter);
         tray.on_add_folder(move || {
-            // M05 wires the folder picker; M04 keeps the menu item present but
-            // does nothing (no pseudo-action).
-            let _ = app_weak;
+            // M05.2: tray "添加文件夹" opens the settings window and runs the
+            // native folder picker directly (user-initiated, no scan).
+            settings.borrow_mut().browse();
+            if let Some(window) = settings.borrow().window.upgrade() {
+                let _ = window.show();
+            }
         });
     }
     {
+        let settings = Rc::clone(&settings_adapter);
         tray.on_open_settings(move || {
-            // M06 wires the settings window.
+            // M05/M06: tray "设置" opens the settings window.
+            if let Some(window) = settings.borrow().window.upgrade() {
+                let _ = window.show();
+            }
         });
     }
     {
@@ -762,7 +1357,16 @@ fn run() -> Result<(), slint::PlatformError> {
     };
     let _native_drain = native_drain; // the timer lives for the whole event loop
 
-    // ---- M03: ViewModel adapter wiring --------------------------------
+    // ---- M03/M05: shared repository-backed ViewModel adapter wiring -----
+    let resolved = resolved_from_repository(&repo);
+    let settings = AppSettings {
+        one_level_import: repo
+            .borrow()
+            .document()
+            .map(|document| document.data.settings.one_level_import)
+            .unwrap_or(false),
+        ..AppSettings::default()
+    };
     let (open_tx, open_rx) = std::sync::mpsc::channel();
     let shell = ShellHandle::real();
     let main = Rc::new(RefCell::new(MainWindowController::new(
@@ -770,6 +1374,9 @@ fn run() -> Result<(), slint::PlatformError> {
         open_rx,
         open_tx,
         shell,
+        context_tx,
+        resolved,
+        settings,
     )));
 
     let main_ui = Rc::clone(&main);
@@ -856,6 +1463,269 @@ fn run() -> Result<(), slint::PlatformError> {
         timer
     };
     let _open_drain = open_drain; // the timer lives for the whole event loop
+
+    // ---- M05: settings window callback wiring ---------------------------
+    // The settings Slint window forwards gestures as MCommand; the adapter
+    // applies them against the manager and re-pushes the observable state. All
+    // closures are UI-thread FnMut (Rc<RefCell<_>>, no Send needed).
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_close_settings(move || {
+            if let Some(window) = settings.borrow().window.upgrade() {
+                let _ = window.hide();
+            }
+        });
+    }
+    // Wire the settings callbacks. Each forwards an MCommand to the adapter
+    // and re-pushes the observable state (the adapter's `handle` already
+    // syncs_ui; a refresh of the search window happens via a shared repo only
+    // when the manager mutated data, which the settings adapter performs
+    // through `refresh_search`).
+    {
+        let settings = Rc::clone(&settings_adapter);
+        let main = Rc::clone(&main);
+        settings_window.on_command_show_page(move |page| {
+            let cmd = match page {
+                1 => MCommand::ShowPage(filego::presentation::manager::Page::Categories),
+                2 => MCommand::ShowPage(filego::presentation::manager::Page::Tags),
+                _ => MCommand::ShowPage(filego::presentation::manager::Page::Folders),
+            };
+            settings.borrow_mut().handle(cmd);
+            let repo = settings.borrow().manager_repo();
+            main.borrow_mut().refresh_from_repository(&repo);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_add(move || {
+            settings.borrow_mut().handle(MCommand::OpenManual);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_paste(move || {
+            settings.borrow_mut().paste_into_path();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_browse(move || {
+            settings.borrow_mut().browse();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_edit(move |id| {
+            let folder_id =
+                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
+            settings
+                .borrow_mut()
+                .handle(MCommand::EditFolder(folder_id));
+            if let Some(window) = settings.borrow().window.upgrade() {
+                let _ = window.show();
+            }
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_remove(move |id| {
+            let folder_id =
+                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
+            settings
+                .borrow_mut()
+                .handle(MCommand::StartRemove(folder_id));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_toggle_enabled(move |id| {
+            let folder_id =
+                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
+            settings
+                .borrow_mut()
+                .handle(MCommand::ToggleEnable(folder_id));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_toggle_pin(move |id| {
+            let folder_id =
+                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
+            settings.borrow_mut().handle(MCommand::TogglePin(folder_id));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_check(move |id| {
+            let folder_id =
+                filego::domain::ids::FolderId::from_uuid(uuid::Uuid::from_u128(id as u128));
+            settings.borrow_mut().handle(MCommand::CheckPath(folder_id));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_filter_name(move |text| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::SetFilterName(text.to_string()));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_create_category(move |name| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::CreateCategory(name.to_string()));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_delete_category(move |index| {
+            let category_id = {
+                let s = settings.borrow();
+                s.manager
+                    .view()
+                    .categories
+                    .get(index as usize)
+                    .map(|c| c.id)
+            };
+            if let Some(category_id) = category_id {
+                settings
+                    .borrow_mut()
+                    .handle(MCommand::DeleteCategory(category_id));
+            }
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_create_tag(move |name| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::CreateTag(name.to_string()));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_delete_tag(move |index| {
+            let tag_id = {
+                let s = settings.borrow();
+                s.manager.view().tags.get(index as usize).map(|t| t.id)
+            };
+            if let Some(tag_id) = tag_id {
+                settings.borrow_mut().handle(MCommand::DeleteTag(tag_id));
+            }
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_confirm_remove(move || {
+            settings.borrow_mut().handle(MCommand::ConfirmRemove);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_cancel_remove(move || {
+            settings.borrow_mut().handle(MCommand::CancelRemove);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_undo_remove(move || {
+            settings.borrow_mut().handle(MCommand::UndoRemove);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_save_draft(move || {
+            settings.borrow_mut().handle(MCommand::SaveDraft);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_cancel_draft(move || {
+            settings.borrow_mut().handle(MCommand::CancelDraft);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_set_draft_name(move |name| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::EditName(name.to_string()));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_set_draft_path(move |path| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::EditPath(path.to_string()));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_toggle_pinned(move || {
+            settings.borrow_mut().handle(MCommand::ToggleDraftPinned);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_set_enabled(move |enabled| {
+            settings
+                .borrow_mut()
+                .handle(MCommand::SetDraftEnabled(enabled));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_import_parent_only(move || {
+            settings.borrow_mut().handle(MCommand::ChooseImport(
+                filego::presentation::management::ChildImportChoice::ParentOnly,
+            ));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_import_children(move || {
+            settings.borrow_mut().handle(MCommand::ChooseImport(
+                filego::presentation::management::ChildImportChoice::DirectChildren,
+            ));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_import_dismiss(move || {
+            settings.borrow_mut().handle(MCommand::DismissImport);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_apply_batch(move || {
+            settings.borrow_mut().handle(MCommand::ApplyBatch);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_command_cancel_batch(move || {
+            settings.borrow_mut().handle(MCommand::CancelBatch);
+        });
+    }
+
+    // Push the initial settings view once.
+    settings_adapter.borrow_mut().sync_ui();
+
+    // ---- M05: context-effect drain (search → settings) -----------------
+    let context_drain = {
+        let settings = Rc::clone(&settings_adapter);
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(50),
+            move || settings.borrow_mut().drain_context(),
+        );
+        timer
+    };
+    let _context_drain = context_drain; // the timer lives for the whole event loop
 
     // M00 shell starts in the tray. The visible SystemTrayIcon keeps the Slint
     // event loop alive until the explicit tray Exit command is handled.
