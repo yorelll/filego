@@ -16,6 +16,13 @@ on:
       - main
       - "feature/**"
       - "fix/**"
+    # Doc-only pushes do not trigger the benchmark (they cannot change search
+    # performance inputs). Workflow files (.github/**) are intentionally NOT
+    # ignored so their changes still run this workflow for validation.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "review/**"
   workflow_dispatch:
 
 permissions:

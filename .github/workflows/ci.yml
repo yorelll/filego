@@ -7,6 +7,14 @@ on:
       - main
       - "feature/**"
       - "fix/**"
+    # Doc-only pushes do not trigger the full MSVC gate (they cannot change the
+    # build inputs). PRs always run full CI regardless of path. Workflow files
+    # themselves (.github/**) are intentionally NOT ignored, so any workflow
+    # change still triggers a real run (CLAUDE.md §3.4).
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "review/**"
   workflow_dispatch:
 
 permissions:

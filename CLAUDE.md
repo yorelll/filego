@@ -103,8 +103,13 @@ cargo build --workspace --all-features --release --locked --target x86_64-pc-win
 ### 3.4 CI 操作纪律
 
 - CI 必须由已推送到 GitHub 的提交触发；仅本地未提交/未推送的代码不能形成有效 CI 证据。
+- **纯文档推送不触发 CI（节省时间）**：`ci.yml` 与 `benchmark.yml` 的 `push` 触发器配置了 `paths-ignore`（`**/*.md`、`docs/**`、`review/**`）。仅改动这些文档文件（如 review/response 文档、README、docs）的推送**不会**触发 CI，agent 不得等待其 run、也不得以“无 run”标记阻塞或引入额外提交。仍需保证：
+  - 文档本身属于审计证据，仍必须提交 Git；其正确性由 reviewer 在 re-review 时核验，不依赖托管的构建门禁。
+  - **任何代码、Cargo、`src/`、`.github/workflows/` 或构建输入变更都必须触发并监控 CI**（workflow 文件不在 `paths-ignore` 内，改动会触发真实 run，符合 §3.4 “workflow 自身变更也必须通过一次实际运行验证”）。
+  - 若文档变更与代码变更混在同一提交，则该提交会因代码路径而触发 CI（`paths-ignore` 只匹配“全部变更均为文档”的提交），属正常。
+  - 评审证据记录时：文档-only 提交记录为“无 CI run（纯文档，按规则跳过）”，不得伪装成有 run；代码提交按下方要求正常记录 run。
 - 推送、创建 tag、创建 release 等外部操作遵循用户授权；没有授权时，implementation agent 应停在“需要推送验证”并明确说明。
-- 每次实现或修复后，定位该提交对应的 run ID，并用上述绝对路径监控到结束。
+- 每次实现或修复代码后，定位该提交对应的 run ID，并用上述绝对路径监控到结束；纯文档提交不等待 CI。
 - 若 CI 失败，必须查看失败日志、修复根因、再次触发并获得新的成功 run；不得只重跑以掩盖不稳定问题。
 - 报告 CI 时至少记录：commit SHA、workflow、run ID/URL、结论、关键 job、产物名称。不得把其他提交或旧 run 的成功冒充当前变更证据。
 - workflow 自身变更也必须通过一次实际运行验证。
