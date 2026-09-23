@@ -18,6 +18,18 @@
 //!
 //! The CI `benchmark.yml` workflow runs exactly that command.
 //!
+//! # Classes
+//!
+//! Five text classes exercise the ranked engine (`search`) plus one empty-query
+//! class. A sixth class (`filtered-with-clone`) exercises the M02-B
+//! `search_with_filter` combination path: the filter is applied, the surviving
+//! `Vec<SearchEntry>` is cloned, then the clone is ranked — mirroring what a
+//! presenter pays per keystroke under an active filter. This closes
+//! `m02-filter-bench-review-r01` F002, which noted no benchmark class measured
+//! that clone cost. The filter keeps a large subset (origin: Local, ~70% => ~7k
+//! entries), so the clone actually materializes thousands of entries instead of
+//! taking the all-filtered-out fast path.
+//!
 //! # Bound
 //!
 //! The CI regression bound is a lenient `median < 500ms`; the product target
@@ -179,15 +191,34 @@ fn percentile(sorted: &[f64], percentile: f64) -> f64 {
     sorted[index.min(sorted.len() - 1)]
 }
 
+/// The filter used by the `filtered-with-clone` class: origin Local keeps
+/// roughly 7/10 of the fixture (indices with `index % 10 <= 6`), so
+/// `search_with_filter` clones thousands of entries — never a degenerate
+/// all-filtered-out fast path. See the `filtered_with_clone_keeps_a_meaningful_subset`
+/// test below.
+const FILTERED_WITH_CLONE_LABEL: &str = "filtered-with-clone";
+fn filtered_clone_filter() -> FilterSet {
+    FilterSet {
+        origin: Some(Origin::Local),
+        ..FilterSet::default()
+    }
+}
+
 /// Run a query over the full fixture. Empty queries go through the
-/// empty-query strategy path; non-empty through the full ranked engine.
-fn run_query(entries: &[SearchEntry], settings: &AppSettings, query_text: &str) {
+/// empty-query strategy path; non-empty through the full ranked engine. The
+/// `filtered-with-clone` class goes through the M02-B `search_with_filter`
+/// combination path (filter -> clone -> rank) so the clone cost of a filtered
+/// `Vec<SearchEntry>` is measured like every other class.
+fn run_query(entries: &[SearchEntry], settings: &AppSettings, label: &str, query_text: &str) {
     let parser = QueryParser;
     let query = parser.parse(query_text);
     let options = HighlightOptions {
         compute_highlights: true,
     };
-    if query.tokens().is_empty() {
+    if label == FILTERED_WITH_CLONE_LABEL {
+        let filter = filtered_clone_filter();
+        let _ = crate::search::search_with_filter(entries, &query, &filter, settings, &options);
+    } else if query.tokens().is_empty() {
         let _ = crate::search::empty_query(entries, &FilterSet::default(), settings);
     } else {
         let _ = crate::search::search(entries, &query, settings, &options);
@@ -195,8 +226,9 @@ fn run_query(entries: &[SearchEntry], settings: &AppSettings, query_text: &str) 
 }
 
 /// Benchmark classes: label and raw query text.
-const QUERIES: [(&str, &str); 5] = [
+const QUERIES: [(&str, &str); 6] = [
     ("empty-query-default", ""),
+    ("filtered-with-clone", "project alpha"),
     ("pinyin-heavy", "zhongwen"),
     ("english-initials", "md"),
     ("edit-distance", "driber"),
@@ -204,15 +236,20 @@ const QUERIES: [(&str, &str); 5] = [
 ];
 
 /// Measure one query class and return its per-run milliseconds.
-fn time_query_class(entries: &[SearchEntry], settings: &AppSettings, query_text: &str) -> Vec<f64> {
+fn time_query_class(
+    entries: &[SearchEntry],
+    settings: &AppSettings,
+    label: &str,
+    query_text: &str,
+) -> Vec<f64> {
     // Warm-up: exclude first-run initialization / allocation laziness.
     for _ in 0..WARMUP_RUNS {
-        run_query(entries, settings, query_text);
+        run_query(entries, settings, label, query_text);
     }
     let mut samples = Vec::with_capacity(SAMPLE_RUNS);
     for _ in 0..SAMPLE_RUNS {
         let start = Instant::now();
-        run_query(entries, settings, query_text);
+        run_query(entries, settings, label, query_text);
         let elapsed = start.elapsed();
         samples.push(elapsed.as_secs_f64() * 1000.0);
     }
@@ -228,7 +265,7 @@ fn measure_all() -> Vec<(&'static str, f64, f64, f64)> {
     QUERIES
         .iter()
         .map(|(label, query_text)| {
-            let samples = time_query_class(&entries, &settings, query_text);
+            let samples = time_query_class(&entries, &settings, label, query_text);
             let median = samples[samples.len() / 2];
             let p95 = percentile(&samples, 0.95);
             let max = *samples.last().expect("samples must be non-empty");
@@ -240,9 +277,10 @@ fn measure_all() -> Vec<(&'static str, f64, f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FIXTURE_SIZE, LENIENT_MEDIAN_BOUND_MS, QUERIES, deterministic_fixture, measure_all,
-        percentile,
+        FILTERED_WITH_CLONE_LABEL, FIXTURE_SIZE, LENIENT_MEDIAN_BOUND_MS, QUERIES,
+        deterministic_fixture, filtered_clone_filter, measure_all, percentile,
     };
+    use crate::search::{HighlightOptions, QueryParser, SearchDisplay, filter::Origin};
 
     #[test]
     fn fixture_is_deterministic_and_representative() {
@@ -288,10 +326,11 @@ mod tests {
     }
 
     #[test]
-    fn query_classes_cover_pinyin_initial_edit_and_multi_token() {
+    fn query_classes_cover_pinyin_initial_edit_multi_token_and_filtered_clone() {
         let labels: Vec<&str> = QUERIES.iter().map(|(label, _)| *label).collect();
         for expected in [
             "empty-query-default",
+            FILTERED_WITH_CLONE_LABEL,
             "pinyin-heavy",
             "english-initials",
             "edit-distance",
@@ -302,6 +341,62 @@ mod tests {
                 "missing benchmark query {expected}"
             );
         }
+    }
+
+    /// The filtered-with-clone class must NOT be a degenerate all-filtered-out
+    /// fast path: the filter keeps a meaningful subset, and the query produces
+    /// ranked results through the real filter -> clone -> rank path.
+    #[test]
+    fn filtered_with_clone_keeps_a_meaningful_subset() {
+        let entries = deterministic_fixture(FIXTURE_SIZE);
+        let filter = filtered_clone_filter();
+        let kept = filter.apply(&entries);
+        let kept_fraction = kept.len() as f64 / entries.len() as f64;
+        assert!(
+            kept_fraction > 0.5,
+            "origin: Local must keep a majority of the fixture, got {kept_fraction:.2}"
+        );
+        assert!(kept.len() > 5_000, "keep count {}", kept.len());
+        // And every kept entry really satisfies the local origin filter, so the
+        // number is not an artifact of an inactive filter.
+        assert!(
+            kept.iter()
+                .all(|&index| entries[index].origin == Origin::Local)
+        );
+
+        // The mirror of the benchmark call (filter -> clone -> rank) returns
+        // real ranked results for the benchmark query text. "project alpha" is
+        // the English-name pool shared by many Local-origin fixture rows, so
+        // matches genuinely come from the kept subset.
+        let settings = crate::domain::settings::AppSettings::default();
+        let parser = QueryParser;
+        let query = parser.parse("project alpha");
+        let options = HighlightOptions {
+            compute_highlights: true,
+        };
+        let response =
+            crate::search::search_with_filter(&entries, &query, &filter, &settings, &options);
+        let SearchDisplay::Ranked(ranked) = &response.display else {
+            panic!("filtered clone class must go through the ranked path");
+        };
+        assert!(
+            !ranked.is_empty(),
+            "the benchmark query must match at least one kept entry"
+        );
+        // Every ranked entry must come from the kept subset: the search ran
+        // over the CLONED slice, so ranks cannot produce a filtered-out entry.
+        for result in ranked {
+            assert!(
+                kept.iter()
+                    .any(|&index| entries[index].id.as_uuid() == result.entry_id.as_uuid()),
+                "ranked entry must originate from the filtered (kept) subset"
+            );
+        }
+        assert_ne!(
+            ranked.len(),
+            kept.len(),
+            "the ranked slice is the truncated *max_results* output, not the full kept subset"
+        );
     }
 
     #[test]
