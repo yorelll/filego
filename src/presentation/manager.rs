@@ -664,6 +664,13 @@ impl<S: ManagementStore> ManagementController<S> {
         &self.view
     }
 
+    /// Re-read the shared document and rebuild the management list (M06: an
+    /// import/backup-restore/clear-all that lands through the settings
+    /// controller must be reflected in the folder/category/tag pages too).
+    pub fn reload_from_store(&mut self) {
+        self.refresh_view();
+    }
+
     pub fn handle(&mut self, command: MCommand) {
         match command {
             MCommand::ShowPage(page) => {

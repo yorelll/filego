@@ -224,15 +224,34 @@ fn origin_order(field: SearchField) -> u64 {
 /// Stable, documented tie-break for two entries whose `total_score` is zapped
 /// equal. Never time- or random-dependent.
 ///
-/// Order: manual_weight descending → pinned (true first) → open_count
+/// Base order: manual_weight descending → pinned (true first) → open_count
 /// descending → entry id ascending. `manual_weight` here is the final
 /// within-tier discriminator and cannot cross a tier.
-pub(crate) fn tiebreak(left: &SearchEntry, right: &SearchEntry) -> std::cmp::Ordering {
+///
+/// M06.4 "最近时间排序" (`recent_sort_first`): when the user opts in, entries
+/// that were opened more recently rank first within equal relevance — the
+/// `last_opened_at` descending key is inserted right after `pinned`. The order
+/// remains fully deterministic (a `None` last-opened falls back to open_count
+/// then id; all inputs are persisted, never wall-clock).
+pub(crate) fn tiebreak(
+    left: &SearchEntry,
+    right: &SearchEntry,
+    recent_sort_first: bool,
+) -> std::cmp::Ordering {
     right
         .manual_weight
         .cmp(&left.manual_weight)
         .then_with(|| right.pinned.cmp(&left.pinned))
-        .then_with(|| right.open_count.cmp(&left.open_count))
+        .then_with(|| {
+            if recent_sort_first {
+                right
+                    .last_opened_at
+                    .cmp(&left.last_opened_at)
+                    .then_with(|| right.open_count.cmp(&left.open_count))
+            } else {
+                right.open_count.cmp(&left.open_count)
+            }
+        })
         .then_with(|| left.id.as_uuid().cmp(&right.id.as_uuid()))
 }
 
@@ -279,7 +298,7 @@ mod tests {
 
     /// Asserts the full documented tie-break order between two entries.
     fn assert_order(left: &SearchEntry, right: &SearchEntry, expect: Ordering) {
-        assert_eq!(tiebreak(left, right), expect);
+        assert_eq!(tiebreak(left, right, false), expect);
     }
 
     #[test]
@@ -416,6 +435,39 @@ mod tests {
         // Equal counts fall through to entry id ascending: lower id first.
         assert_order(&entry(1), &entry(2), Ordering::Less);
         assert_order(&entry(2), &entry(1), Ordering::Greater);
+    }
+
+    #[test]
+    fn recent_sort_first_orders_by_last_opened_within_equal_relevance() {
+        // Two entries identical otherwise; one was opened more recently.
+        let mut older = entry(1);
+        older.last_opened_at = Some(utc("2026-09-20T00:00:00Z"));
+        let mut newer = entry(2);
+        newer.last_opened_at = Some(utc("2026-09-21T00:00:00Z"));
+
+        // Default (off): the recency does not decide; open_count ties → id asc.
+        assert_eq!(tiebreak(&older, &newer, false), Ordering::Less);
+        // Opt-in: the more-recently-opened entry ranks first.
+        assert_eq!(tiebreak(&newer, &older, true), Ordering::Less);
+        // An entry with no last-opened falls behind one that was opened.
+        assert_eq!(
+            tiebreak(&entry(3), &newer, true),
+            Ordering::Greater,
+            "no-last-opened ranks after a recently-opened entry"
+        );
+        // manual_weight and pinned still dominate recency (never cross tiers).
+        let mut heavier = entry(9);
+        heavier.manual_weight = 100;
+        heavier.last_opened_at = Some(utc("2026-09-19T00:00:00Z"));
+        assert_eq!(
+            tiebreak(&newer, &heavier, true),
+            Ordering::Greater,
+            "manual weight outranks recency within a tier"
+        );
+    }
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        s.parse().expect("fixed fixture parses")
     }
 
     #[test]

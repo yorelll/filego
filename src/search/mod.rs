@@ -78,7 +78,7 @@ pub fn search(
             .1
             .total_score
             .cmp(&left.1.total_score)
-            .then_with(|| scoring::tiebreak(left.0, right.0))
+            .then_with(|| scoring::tiebreak(left.0, right.0, settings.recent_sort_first))
     });
 
     matches

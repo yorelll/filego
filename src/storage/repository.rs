@@ -69,9 +69,11 @@
 use std::fmt;
 
 use crate::domain::{
+    document::AppData,
     folder::{Category, FolderEntry, Tag},
     ids::{CategoryId, FolderId, TagId},
     path_semantics::same_path,
+    settings::AppSettings,
 };
 
 use super::{
@@ -661,6 +663,40 @@ impl DocumentRepository {
         };
         document.data.settings.one_level_import = enabled;
         Ok(())
+    }
+
+    /// Replace the whole settings block of the in-memory working copy (M06).
+    /// The caller persists with `save_at`. Returns `Err(NotFound)` when no
+    /// document is loaded.
+    pub fn set_settings(&mut self, settings: AppSettings) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        document.data.settings = settings;
+        Ok(())
+    }
+
+    /// Replace the whole `AppData` (M06 import/restore). The caller persists
+    /// with `save_at`. Returns `Err(NotFound)` when no document is loaded.
+    pub fn set_data(&mut self, data: AppData) -> Result<(), RepositoryError> {
+        let Some(document) = self.document.as_mut() else {
+            return Err(RepositoryError::NotFound);
+        };
+        document.data = data;
+        Ok(())
+    }
+
+    /// Remove every folder RECORD from the working copy (M06.5 "clear all
+    /// records"). Never touches any real directory — record-level only, the
+    /// no-delete invariant holds. Returns `false` when nothing changed (no
+    /// document or zero records).
+    pub fn clear_all_records(&mut self) -> bool {
+        let Some(document) = self.document.as_mut() else {
+            return false;
+        };
+        let before = document.data.folders.len();
+        document.data.folders.clear();
+        document.data.folders.len() != before
     }
 
     /// Insert or replace one category record in the in-memory working copy.

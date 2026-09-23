@@ -3,7 +3,9 @@
 //! M01-A keeps this module free of filesystem side effects. M01-B will add
 //! atomic, recoverable persistence behind a separate repository boundary.
 
+pub mod backup;
 pub mod codec;
+pub mod import_export;
 pub mod io;
 pub mod location;
 pub mod repository;
@@ -11,6 +13,8 @@ pub mod schema;
 
 #[cfg(test)]
 mod m05_tests;
+#[cfg(test)]
+mod m06_tests;
 #[cfg(test)]
 mod repository_tests;
 #[cfg(test)]

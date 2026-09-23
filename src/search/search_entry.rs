@@ -83,7 +83,14 @@ impl SearchEntry {
             .aliases
             .iter()
             .enumerate()
-            .map(|(index, alias)| FieldKeys::new(SearchField::Alias(index), alias, true, settings))
+            .map(|(index, alias)| {
+                FieldKeys::new(
+                    SearchField::Alias(index),
+                    alias,
+                    settings.search_aliases,
+                    settings,
+                )
+            })
             .collect();
         let path = FieldKeys::new(
             SearchField::Path,

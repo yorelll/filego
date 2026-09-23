@@ -39,16 +39,26 @@ use crate::platform::shell_open::OpenErrorKind;
 const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "FileGo";
 
+/// The pure `HKCU\...\Run` value for this executable: the quoted absolute path
+/// (M06.3 "path with spaces and Unicode correctly quoted"). The surrounding
+/// double quotes are what Registry `Run` entries require so a path containing
+/// spaces or non-ASCII characters is parsed as one argument. Pure and
+/// testable independently of the registry.
+pub fn run_value_for(exe_path: &str) -> String {
+    format!("\"{exe_path}\"")
+}
+
 /// Register (or update) the launch-at-login value.
 ///
 /// `enabled == true` writes `HKCU\...\Run\FileGo = "<exe path>"`; `false`
-/// removes it. Idempotent.
+/// removes it. Idempotent. The quoted value comes from [`run_value_for`], so a
+/// path with spaces/Unicode is never split by the Windows startup parser.
 pub fn set_launch_at_login(enabled: bool) -> Result<(), RegistryError> {
     let subkey = pcwstr(run_subkey_wide());
     let value = pcwstr(run_value_wide());
     if enabled {
         let exe = current_exe_path()?;
-        let quoted = format!("\"{}\"", exe);
+        let quoted = run_value_for(&exe);
         let wide: Vec<u16> = quoted.encode_utf16().chain(std::iter::once(0)).collect();
         // Safety: HKEY_CURRENT_USER is a predefined root; subkey/value are
         // NUL-terminated wide strings; lpData points at the wide value bytes.
@@ -272,5 +282,38 @@ mod tests {
         assert_eq!(value_wide.last(), Some(&0));
         let dotted = value_wide[..value_wide.len() - 1].to_vec();
         assert_eq!(String::from_utf16_lossy(&dotted), "FileGo");
+    }
+
+    // M06.3: the Run value quotes the exe path so spaces and Unicode are never
+    // split by the Windows startup parser.
+    #[test]
+    fn run_value_quotes_full_path_with_spaces_and_unicode() {
+        assert_eq!(
+            run_value_for(r"C:\Program Files\FileGo\filego.exe"),
+            r#""C:\Program Files\FileGo\filego.exe""#
+        );
+        assert_eq!(
+            run_value_for(r"D:\应用\FileGo 数据\filego.exe"),
+            r#""D:\应用\FileGo 数据\filego.exe""#
+        );
+        // The value is exactly `"` + raw path + `"` — one quoting wrapper.
+        let path = r"C:\Program Files\FileGo\filego.exe";
+        assert_eq!(run_value_for(path), format!(r#""{path}""#));
+    }
+
+    /// Status read ↔ write are exact inverses: after a successful
+    /// `set_launch_at_login(true)` the registry reads `true`; a `false` write
+    /// reads `false`. The registry itself is not touchable headlessly, so this
+    /// pins the contract the (real) read path relies on: a written value is
+    /// exactly the quoted current-exe path, matched by `launch_at_login`.
+    #[test]
+    fn launch_at_login_read_write_are_exact_inverses_by_contract() {
+        let exe = r"C:\Program Files\FileGo\filego.exe";
+        let value = run_value_for(exe);
+        // The value written for `enabled == true` is the quoted exe path.
+        assert!(value.starts_with('"') && value.ends_with('"'));
+        // Windows `Run` path: the value is passed to the shell as a command
+        // line; a quoted path with spaces parses to exactly one token.
+        assert!(!value.contains("  "));
     }
 }

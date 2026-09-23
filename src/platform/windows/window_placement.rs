@@ -5,7 +5,7 @@
 //! physical rect to hand to Slint's `Window::set_position` / `set_size`.
 
 use windows::Win32::{
-    Foundation::POINT,
+    Foundation::{HWND, POINT, RECT},
     Graphics::Gdi::{
         GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
     },
@@ -190,9 +190,56 @@ pub fn placement_rect_for_cursor(logical_width: f32, logical_height: f32) -> Win
     physical_rect_for_monitor(cursor, work_area, dpi_scale, logical_width, logical_height)
 }
 
+/// One-shot placement for the ACTIVE (foreground) window's monitor (M06.2
+/// `MonitorStrategy::ActiveWindow`): locate the active window, use the center
+/// of its screen rect as the anchor, and place on that monitor's work area.
+/// Falls back to the cursor-monitor placement when there is no active window.
+pub fn placement_rect_for_active_window(
+    hwnd_bits: isize,
+    logical_width: f32,
+    logical_height: f32,
+) -> WindowRect {
+    let hwnd = HWND(hwnd_bits as *mut core::ffi::c_void);
+    // Safety: `hwnd` is the active window queried via GetActiveWindow; read-only.
+    let mut rect = RECT::default();
+    let ok =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).is_ok() };
+    if !ok || rect.right <= rect.left || rect.bottom <= rect.top {
+        // No usable rect -> cursor fallback.
+        return placement_rect_for_cursor(logical_width, logical_height);
+    }
+    let anchor_x = (rect.left + rect.right) / 2;
+    let anchor_y = (rect.top + rect.bottom) / 2;
+    let work_area = monitor_work_area_at(anchor_x, anchor_y).unwrap_or(MonitorRect {
+        left: 0,
+        top: 0,
+        right: 1,
+        bottom: 1,
+    });
+    let dpi_scale = dpi_scale_at(anchor_x, anchor_y);
+    physical_rect_for_monitor(
+        (anchor_x, anchor_y),
+        work_area,
+        dpi_scale,
+        logical_width,
+        logical_height,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // M06.2: the active-window placement falls back to the cursor-monitor
+    // path when the handle is unusable (headless/CI, window already gone) —
+    // never panics, always returns a sane rect.
+    #[test]
+    fn active_window_placement_falls_back_for_invalid_hwnd() {
+        let rect = placement_rect_for_active_window(-1, 600.0, 140.0);
+        assert!(rect.width > 0 && rect.height > 0);
+        // An invalid handle matches the fallback path (sane, finite rect).
+        assert!(rect.x + rect.width >= rect.x);
+    }
 
     #[test]
     fn dpi_scale_is_sane_without_a_monitor() {

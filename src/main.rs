@@ -8,8 +8,12 @@ use filego::{
     domain::settings::AppSettings,
     presentation::{
         commands::{RowAction, SearchKey, ViewCommand},
-        i18n::Msg,
+        i18n::{Locale, Msg},
         manager::{MCommand, ManagementController, ManagementStore},
+        settings_controller::{
+            CategoryNameCommand, SCommand, SNotice, SettingsController, SettingsSharedStore,
+            TagNameCommand,
+        },
         state::SelectionMove,
         view_model::{ExternalEffect, NoopEffects, ResolvedEntry, SearchViewModel, default_runner},
     },
@@ -49,17 +53,54 @@ impl WindowPort for SlintWindowPort {
     }
 }
 
-/// Compute and apply the M04.4 window placement (cursor monitor, centered,
+/// The monitor-placement strategy for the search window (M06.2). Written by the
+/// settings adapter when the user changes the 常规 page; read on every show by
+/// `place_window`. 0 = Mouse (default), 1 = ActiveWindow. A plain atomic cell is
+/// enough: the UI thread is the only writer and all readers are on the same
+/// thread.
+static MONITOR_STRATEGY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Apply the persisted monitor strategy (set from the settings adapter).
+fn set_monitor_strategy(strategy: filego::domain::settings::MonitorStrategy) {
+    let value = match strategy {
+        filego::domain::settings::MonitorStrategy::Mouse => 0,
+        filego::domain::settings::MonitorStrategy::ActiveWindow => 1,
+    };
+    MONITOR_STRATEGY.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The persisted search-window width override (logical px; M06.4). 0 = use the
+/// window component default (600). Written by the settings adapter on change
+/// and at startup; read by `place_window` so the width applies on every show.
+static SEARCH_WINDOW_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Apply the persisted search-window width override (0 = component default).
+fn set_search_window_width(width: Option<u16>) {
+    SEARCH_WINDOW_WIDTH.store(width.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Compute and apply the M04.4 window placement (monitor, centered,
 /// top ≈ 10%, clamped to the work area) before showing.
 ///
-/// F003: the physical size is derived from the TARGET (cursor) monitor's DPI
-/// scale — never the window's current `scale_factor()`, which may describe a
-/// different monitor in a mixed-DPI layout. `placement_rect_for_cursor` queries
-/// the cursor position, the target monitor's work area, and its `GetDpiForMonitor`
-/// scale, then computes the physical rect. Re-computed on every show so monitor
-/// count/DPI changes are picked up deterministically.
+/// M06.2: which monitor is targeted follows the persisted `MonitorStrategy` —
+/// the cursor monitor (default) or the active window's monitor. F003: the
+/// physical size is derived from the TARGET monitor's DPI scale — never the
+/// window's current `scale_factor()`, which may describe a different monitor in
+/// a mixed-DPI layout. Re-computed on every show so monitor count/DPI changes
+/// are picked up deterministically.
 fn place_window(app: &AppWindow) {
     let window = app.window();
+    // M06.4: the width override (if set) replaces the window's own width on
+    // every placement; the height stays dynamic (140 → results expand).
+    let width_override = SEARCH_WINDOW_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+    if (filego::domain::settings::MIN_WINDOW_WIDTH..=filego::domain::settings::MAX_WINDOW_WIDTH)
+        .contains(&width_override)
+    {
+        let scale = window.scale_factor();
+        let physical_width = (f32::from(width_override) * scale).round() as u32;
+        let physical_height = window.size().height;
+        window.set_size(slint::PhysicalSize::new(physical_width, physical_height));
+    }
     // Slint's `window.size()` is already physical for the window's own monitor;
     // converting to logical and re-scaling by the TARGET monitor's DPI is what
     // F003 fixes (the old code scaled the logical size by the window's current
@@ -71,9 +112,24 @@ fn place_window(app: &AppWindow) {
         // Default first-show size (600x140 logical).
         (600.0, 140.0)
     };
-    let rect = filego::platform::windows::window_placement::placement_rect_for_cursor(
-        logical_w, logical_h,
-    );
+    let rect =
+        match MONITOR_STRATEGY.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => {
+                let active_bits = filego::platform::windows::window_focus::active_window()
+                    .map(|hwnd| hwnd.0 as isize);
+                match active_bits {
+                Some(bits) => filego::platform::windows::window_placement::
+                    placement_rect_for_active_window(bits, logical_w, logical_h),
+                None => filego::platform::windows::window_placement::placement_rect_for_cursor(
+                    logical_w,
+                    logical_h,
+                ),
+            }
+            }
+            _ => filego::platform::windows::window_placement::placement_rect_for_cursor(
+                logical_w, logical_h,
+            ),
+        };
     // Apply through Slint's public physical-position API.
     window.set_position(slint::WindowPosition::Physical(
         slint::PhysicalPosition::new(rect.x, rect.y),
@@ -201,6 +257,27 @@ impl MainWindowController {
         self.resolved = resolved_from_repository(repo);
         let entries = self.resolved.clone();
         self.view_model.set_resolved_entries(entries);
+        self.sync_ui();
+    }
+
+    /// Replace the search settings and re-run the current query (M06: a
+    /// search/appearance toggle takes effect immediately on the main window).
+    fn apply_settings(&mut self, settings: AppSettings) {
+        self.settings = settings.clone();
+        let query = self.view_model.state().query.clone();
+        self.view_model = SearchViewModel::new(
+            settings.clone(),
+            self.resolved.clone(),
+            Box::new(default_runner),
+            Box::new(NoopEffects),
+        );
+        self.view_model.handle(ViewCommand::QueryEdited(query));
+        self.sync_ui();
+    }
+
+    /// Set the UI locale on the running ViewModel (re-read strings on next sync).
+    fn set_locale(&mut self, locale: Locale) {
+        self.view_model.set_locale(locale);
         self.sync_ui();
     }
 
@@ -515,6 +592,9 @@ impl ContextEffect {
 /// manager's [`MView`] into the Slint `SettingsWindow`.
 struct SettingsWindowController {
     manager: ManagementController<filego::presentation::manager::SharedStore>,
+    /// M06 settings controller (decision layer for the settings pages), over
+    /// the same shared repository.
+    settings: SettingsController<SettingsSharedStore>,
     window: slint::Weak<SettingsWindow>,
     /// Receiver for context-menu effects from the search window (drained by a
     /// UI-thread timer).
@@ -523,13 +603,27 @@ struct SettingsWindowController {
     picker: fn() -> filego::platform::windows::folder_picker::PickOutcome,
     /// Shared repository (the search window rebuilds its entries from it).
     repo: std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>>,
+    /// The native platform for hotkey record/pause/clear side effects.
+    native: std::rc::Rc<std::cell::RefCell<filego::platform::windows::NativePlatform>>,
+    /// The FileGo data directory (shown on the Data page + opened on request).
+    data_dir: std::path::PathBuf,
+    /// A parsed import document held between the preview and the apply step.
+    pending_import: Option<filego::domain::document::AppData>,
+    /// The main-window controller clone used to refresh the search results
+    /// after a settings/management change (rebuilt settings make search take
+    /// effect immediately).
+    main: std::rc::Rc<std::cell::RefCell<MainWindowController>>,
 }
 
 impl SettingsWindowController {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         window: slint::Weak<SettingsWindow>,
         store: filego::presentation::manager::SharedStore,
         context_rx: std::sync::mpsc::Receiver<ContextEffect>,
+        native: std::rc::Rc<std::cell::RefCell<filego::platform::windows::NativePlatform>>,
+        data_dir: std::path::PathBuf,
+        main: std::rc::Rc<std::cell::RefCell<MainWindowController>>,
     ) -> Self {
         let repo = store.repo().clone();
         let one_level_import_setting = store
@@ -537,12 +631,18 @@ impl SettingsWindowController {
             .map(|document| document.data.settings.one_level_import)
             .unwrap_or(false);
         let manager = ManagementController::new(store, one_level_import_setting);
+        let settings = SettingsController::new(SettingsSharedStore::new(repo.clone()));
         Self {
             manager,
+            settings,
             window,
             context_rx,
             picker: filego::platform::windows::folder_picker::pick_folder_dialog,
             repo,
+            native,
+            data_dir,
+            pending_import: None,
+            main,
         }
     }
 
@@ -551,12 +651,640 @@ impl SettingsWindowController {
         self.sync_ui();
     }
 
+    /// Apply one M06 settings command; the pure controller persists, then the
+    /// adapter performs platform side effects (registry/hotkey/theme/locale).
+    /// Side effects for a given command run AFTER the controller accepted it
+    /// so a rejected/clamped value never triggers a fake platform action.
+    fn handle_settings(&mut self, command: SCommand) {
+        self.settings.handle(command.clone());
+        self.apply_settings_side_effects(&command);
+        self.sync_settings_ui();
+        self.sync_ui();
+    }
+
+    /// Platform side effects that must happen after the controller persisted.
+    fn apply_settings_side_effects(&mut self, command: &SCommand) {
+        match command {
+            SCommand::SetTheme(_) => {
+                let theme = self.settings.view().settings.theme;
+                let resolved = filego::presentation::theme::ResolvedTheme::resolve(
+                    theme,
+                    filego::presentation::theme::ResolvedColorScheme::Light,
+                );
+                if let Some(window) = self.window.upgrade() {
+                    ui_set_theme_for_settings(&window, resolved);
+                }
+                // The main window shares the UiTheme global.
+                self.settings_clear_notice_after_apply();
+            }
+            SCommand::SetMonitorStrategy(strategy) => {
+                // The next `place_window` call targets the chosen monitor.
+                set_monitor_strategy(*strategy);
+            }
+            SCommand::SetLanguage(language) => {
+                let locale = locale_for(*language);
+                if let Some(window) = self.window.upgrade() {
+                    apply_settings_localization(&window, locale);
+                }
+                // The search window re-localizes too (shared UiStrings global is
+                // set separately from run()'s main window; push only the locale).
+                if let Some(app) = self.main.borrow().window.upgrade() {
+                    apply_localization_and_theme(&app, locale);
+                }
+                self.main.borrow_mut().set_locale(locale);
+            }
+            SCommand::SetSearchPaths(_)
+            | SCommand::SetSearchCategories(_)
+            | SCommand::SetSearchTags(_)
+            | SCommand::SetSearchNotes(_)
+            | SCommand::SetSearchAliases(_)
+            | SCommand::SetFuzzyMatching(_)
+            | SCommand::SetSearchPinyin(_)
+            | SCommand::SetSearchEnglishInitials(_)
+            | SCommand::SetMaxEditDistance(_)
+            | SCommand::SetMaxResults(_)
+            | SCommand::SetEmptyQueryStrategy(_)
+            | SCommand::SetHighlightResults(_)
+            | SCommand::SetRecentSort(_) => {
+                // The search settings feed the ViewModel rebuild.
+                self.refresh_search_settings();
+            }
+            SCommand::SetShowPathInResults(_) | SCommand::SetShowCategoryTagInResults(_) => {
+                if let Some(app) = self.main.borrow().window.upgrade() {
+                    app.set_show_path(self.settings.view().settings.show_path_in_results);
+                    app.set_show_cat_tag(
+                        self.settings.view().settings.show_category_tag_in_results,
+                    );
+                }
+            }
+            SCommand::SetFontScalePercent(_) => {
+                let scale = f32::from(self.settings.view().settings.font_scale_percent) / 100.0;
+                if let Some(window) = self.window.upgrade() {
+                    window.global::<UiTheme>().set_font_scale(scale);
+                }
+            }
+            SCommand::SetSearchWindowWidth(_) => {
+                // Applied on the next placement of the search window.
+                set_search_window_width(self.settings.view().settings.search_window_width);
+            }
+            SCommand::SetSettingsWindowWidth(_) => {
+                if let (Some(window), Some(width)) = (
+                    self.window.upgrade(),
+                    self.settings.view().settings.settings_window_width,
+                ) {
+                    apply_settings_window_width(&window, width);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Refresh the search window after a search-affecting settings change.
+    fn refresh_search_settings(&mut self) {
+        let settings = self.settings.view().settings.clone();
+        self.main.borrow_mut().apply_settings(settings);
+    }
+
+    fn settings_clear_notice_after_apply(&self) {
+        // Theme application is immediate; the Saved notice is pushed by the
+        // controller's persist, nothing to clear here.
+    }
+
     /// The shared repository (used by the search window to rebuild entries
     /// after a management change).
     fn manager_repo(
         &self,
     ) -> std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>> {
         self.repo.clone()
+    }
+
+    /// Sync the M06 settings view into the Slint window.
+    fn sync_settings_ui(&self) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let view = self.settings.view();
+        let settings = &view.settings;
+        let locale = locale_for(settings.language_preference);
+
+        // NOTE: `page` is pushed by the nav handlers (`on_command_show_page` /
+        // `on_s_show_page`) — the settings controller and the manager each own a
+        // sub-range, and having both syncs write `page` would let one overwrite
+        // the other. One source of truth.
+
+        window.set_s_launch_at_login(view.launch_at_login_os.unwrap_or(settings.launch_at_login));
+        window.set_s_silent_start(settings.silent_start);
+        window.set_s_show_main(settings.show_main_window_at_startup);
+        window.set_s_hide_after_open(settings.hide_after_open);
+        window.set_s_clear_after_open(settings.clear_after_open);
+        window.set_s_hide_on_focus_loss(settings.hide_on_focus_loss);
+        window.set_s_monitor_strategy(settings.monitor_strategy as i32);
+        window.set_s_language(settings.language_preference as i32);
+
+        window.set_s_search_paths(settings.search_paths);
+        window.set_s_search_categories(settings.search_categories);
+        window.set_s_search_tags(settings.search_tags);
+        window.set_s_search_notes(settings.search_notes);
+        window.set_s_search_aliases(settings.search_aliases);
+        window.set_s_fuzzy(settings.fuzzy_matching);
+        window.set_s_pinyin(settings.search_pinyin);
+        window.set_s_english_initials(settings.search_english_initials);
+        window.set_s_edit_distance(i32::from(settings.max_edit_distance));
+        window.set_s_max_results(i32::from(settings.max_results));
+        window.set_s_empty_query(settings.empty_query_strategy as i32);
+        window.set_s_highlight(settings.highlight_results);
+        window.set_s_recent_sort(settings.recent_sort_first);
+
+        window.set_s_theme(settings.theme as i32);
+        window.set_s_row_height(settings.row_height_preference as i32);
+        window.set_s_search_width(i32::from(settings.search_window_width_or_default()));
+        window.set_s_settings_width(i32::from(
+            settings
+                .settings_window_width
+                .unwrap_or(filego::domain::settings::DEFAULT_SETTINGS_WIDTH),
+        ));
+        window.set_s_font_scale(i32::from(settings.font_scale_percent));
+        window.set_s_show_path(settings.show_path_in_results);
+        window.set_s_show_cat_tag(settings.show_category_tag_in_results);
+
+        window.set_s_hotkey_runtime(match view.hotkey_runtime {
+            filego::presentation::settings_controller::HotkeyRuntime::Disabled => 0,
+            filego::presentation::settings_controller::HotkeyRuntime::Active => 1,
+            filego::presentation::settings_controller::HotkeyRuntime::Paused => 2,
+        });
+        window.set_s_hotkey_text(hotkey_display_text(settings.hotkey).into());
+        window.set_s_hotkey_error(
+            view.hotkey_last_error
+                .map(|error| hotkey_error_text(error, locale))
+                .unwrap_or_default()
+                .into(),
+        );
+        window.set_s_recording(
+            view.hotkey_record_phase
+                == filego::presentation::settings_controller::HotkeyRecordPhase::Listening,
+        );
+        window.set_s_record_draft(
+            view.hotkey_draft
+                .map(hotkey_combo_text)
+                .unwrap_or_default()
+                .into(),
+        );
+
+        window.set_s_data_location(self.data_dir.to_string_lossy().to_string().into());
+        let folder_count = self
+            .repo
+            .borrow()
+            .document()
+            .map(|document| document.data.folders.len() as i32)
+            .unwrap_or(0);
+        window.set_s_folder_count(folder_count);
+        window.set_s_backups(ModelRc::new(VecModel::from(
+            view.backups
+                .iter()
+                .cloned()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        )));
+        let previewing = matches!(
+            view.data_flow,
+            filego::presentation::settings_controller::DataFlow::ImportPreview { .. }
+        );
+        window.set_s_import_preview(previewing);
+        if let filego::presentation::settings_controller::DataFlow::ImportPreview { plan, mode } =
+            &view.data_flow
+        {
+            window.set_s_import_added(plan.added.len() as i32);
+            window.set_s_import_updated(plan.updated.len() as i32);
+            window.set_s_import_skipped(plan.skipped.len() as i32);
+            window.set_s_import_conflicts(plan.conflicts.len() as i32);
+            window.set_s_import_mode(import_mode_index(*mode));
+            window.set_s_import_added_names(ModelRc::new(VecModel::from(
+                plan.added
+                    .clone()
+                    .into_iter()
+                    .map(slint::SharedString::from)
+                    .collect::<Vec<_>>(),
+            )));
+            window.set_s_import_updated_names(ModelRc::new(VecModel::from(
+                plan.updated
+                    .clone()
+                    .into_iter()
+                    .map(slint::SharedString::from)
+                    .collect::<Vec<_>>(),
+            )));
+            window.set_s_import_skipped_names(ModelRc::new(VecModel::from(
+                plan.skipped
+                    .clone()
+                    .into_iter()
+                    .map(slint::SharedString::from)
+                    .collect::<Vec<_>>(),
+            )));
+        } else {
+            window.set_s_import_added(0);
+            window.set_s_import_updated(0);
+            window.set_s_import_skipped(0);
+            window.set_s_import_conflicts(0);
+            window.set_s_import_mode(0);
+            window.set_s_import_added_names(ModelRc::new(VecModel::from(Vec::new())));
+            window.set_s_import_updated_names(ModelRc::new(VecModel::from(Vec::new())));
+            window.set_s_import_skipped_names(ModelRc::new(VecModel::from(Vec::new())));
+        }
+
+        window.set_s_about_version(filego::version::display().into());
+        window.set_s_about_arch("x86-64".into());
+        window.set_s_about_project("https://github.com/yorelll/filego".into());
+        window.set_s_about_license("MIT".into());
+        window.set_s_about_privacy(Msg::MonoAboutPrivacy.tr(locale).into());
+
+        // Notice (localized; anonymous).
+        let notice = view
+            .notice
+            .map(|notice| snotice_text(notice, locale))
+            .unwrap_or_default();
+        window.set_notice_text(notice.into());
+    }
+
+    /// Project the native hotkey machine's runtime state into the settings
+    /// controller (Active/Paused/Disabled + last error), then refresh the UI.
+    fn sync_hotkey_from_native(&mut self) {
+        use filego::platform::hotkey::HotkeyState;
+        let native = self.native.borrow();
+        let runtime = match native.hotkey_state() {
+            HotkeyState::Disabled => {
+                filego::presentation::settings_controller::HotkeyRuntime::Disabled
+            }
+            HotkeyState::Active(_) => {
+                filego::presentation::settings_controller::HotkeyRuntime::Active
+            }
+            HotkeyState::Paused(_) => {
+                filego::presentation::settings_controller::HotkeyRuntime::Paused
+            }
+        };
+        let error = native.hotkey_last_error();
+        drop(native);
+        self.settings
+            .handle(SCommand::SyncHotkeyRuntime(runtime, error));
+        self.sync_settings_ui();
+    }
+
+    /// Re-apply persisted appearance (theme + font scale + locale) on the open
+    /// of the settings window so the UI matches the stored settings.
+    fn refresh_settings_appearance(&mut self) {
+        let settings = self.settings.view().settings.clone();
+        let resolved = filego::presentation::theme::ResolvedTheme::resolve(
+            settings.theme,
+            filego::presentation::theme::ResolvedColorScheme::Light,
+        );
+        if let Some(window) = self.window.upgrade() {
+            ui_set_theme_for_settings(&window, resolved);
+            let scale = f32::from(settings.font_scale_percent) / 100.0;
+            window.global::<UiTheme>().set_font_scale(scale);
+        }
+        if let (Some(width), Some(window)) = (settings.settings_window_width, self.window.upgrade())
+        {
+            apply_settings_window_width(&window, width);
+        }
+    }
+
+    /// "打开数据目录": shell-open the data directory (reuses the folder-open
+    /// boundary; never builds a command string).
+    fn open_data_dir(&mut self) {
+        let path = self.data_dir.to_string_lossy().to_string();
+        if filego::platform::windows::tray_open::open_folder(&path).is_ok() {
+            self.settings.set_notice(SNotice::DataDirOpened);
+        } else {
+            self.settings.set_notice(SNotice::DataDirOpenFailed);
+        }
+        self.settings.handle(SCommand::DismissDataFlow);
+        self.sync_settings_ui();
+    }
+
+    /// Export: prompt a target file (the OS dialog enforces the overwrite
+    /// prompt), write the versioned JSON document bytes, and notice the result.
+    fn export_data(&mut self) {
+        use filego::platform::windows::file_dialog::{FileDialogOutcome, pick_save_path};
+        let Some(document) = self.settings.document() else {
+            self.settings.set_notice(SNotice::ExportFailed);
+            self.sync_settings_ui();
+            return;
+        };
+        let outcome = pick_save_path("filego-export.json");
+        let path = match outcome {
+            FileDialogOutcome::Picked(path) => path,
+            FileDialogOutcome::Cancelled => return,
+            FileDialogOutcome::Failed => {
+                self.settings.set_notice(SNotice::ExportFailed);
+                self.sync_settings_ui();
+                return;
+            }
+        };
+        let bytes = match filego::storage::import_export::export_bytes(&document) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.settings.set_notice(SNotice::ExportFailed);
+                self.sync_settings_ui();
+                return;
+            }
+        };
+        match std::fs::write(&path, bytes) {
+            Ok(()) => self.settings.set_notice(SNotice::ExportWritten),
+            Err(_) => self.settings.set_notice(SNotice::ExportFailed),
+        }
+        self.sync_settings_ui();
+    }
+
+    /// Import: pick a file, parse + validate it, plan against the current
+    /// document, and push the preview into the settings controller (nothing is
+    /// applied yet — all-or-nothing apply happens on the explicit Preview Apply).
+    fn import_data(&mut self) {
+        use filego::platform::windows::file_dialog::{FileDialogOutcome, pick_open_path};
+        use filego::storage::import_export::{self, ImportMode};
+        let outcome = pick_open_path("json");
+        let path = match outcome {
+            FileDialogOutcome::Picked(path) => path,
+            FileDialogOutcome::Cancelled => return,
+            FileDialogOutcome::Failed => {
+                self.settings.set_notice(SNotice::ImportPreviewFailed);
+                self.sync_settings_ui();
+                return;
+            }
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.settings.set_notice(SNotice::ImportParseFailed);
+                self.sync_settings_ui();
+                return;
+            }
+        };
+        let parsed = match import_export::parse_import(&bytes) {
+            Ok(document) => document,
+            Err(error) => {
+                use filego::storage::import_export::ImportErrorKind;
+                let notice = match error.kind {
+                    ImportErrorKind::InvalidJson | ImportErrorKind::InvalidDocument => {
+                        SNotice::ImportInvalidDocument
+                    }
+                    ImportErrorKind::FutureSchema => SNotice::ImportFutureSchema,
+                    ImportErrorKind::MigrationNeeded => SNotice::ImportMigrationNeeded,
+                    ImportErrorKind::UnresolvedReference => SNotice::ImportUnresolvedReference,
+                    ImportErrorKind::EncodeFailed => SNotice::ImportParseFailed,
+                };
+                self.settings.set_notice(notice);
+                self.settings.handle(SCommand::DismissDataFlow);
+                self.sync_settings_ui();
+                return;
+            }
+        };
+        let Some(current) = self.settings.document() else {
+            self.settings.set_notice(SNotice::ImportPreviewFailed);
+            self.sync_settings_ui();
+            return;
+        };
+        let mode = self
+            .window
+            .upgrade()
+            .map(|w| import_mode_from_index(w.get_s_import_mode()))
+            .unwrap_or(ImportMode::Merge);
+        let plan = import_export::plan_import(&current.data, &parsed.data, mode);
+        self.pending_import = Some(parsed.data);
+        self.settings.push_import_preview(plan, mode);
+        self.sync_settings_ui();
+    }
+
+    /// Apply the previewed import (all-or-nothing): the union must re-validate
+    /// (apply_import enforces it), then the repository document is replaced and
+    /// saved atomically as one revision. Real directories are never touched.
+    fn apply_import(&mut self) {
+        use filego::storage::import_export;
+        let Some(incoming) = self.pending_import.take() else {
+            return;
+        };
+        let Some(current) = self.settings.document() else {
+            return;
+        };
+        let mode = self
+            .window
+            .upgrade()
+            .map(|w| import_mode_from_index(w.get_s_import_mode()))
+            .unwrap_or(import_export::ImportMode::Merge);
+        match import_export::apply_import(&current.data, &incoming, mode) {
+            Ok((applied, _)) => {
+                let revision = {
+                    let mut repo = self.repo.borrow_mut();
+                    if repo.set_data(applied.data).is_err() {
+                        self.settings.set_notice(SNotice::ImportUnresolvedReference);
+                        self.sync_settings_ui();
+                        return;
+                    }
+                    let _ = applied;
+                    repo.save_at()
+                };
+                match revision {
+                    Ok(_) => {
+                        self.settings.handle(SCommand::ApplyImport);
+                    }
+                    Err(_) => {
+                        self.settings.set_notice(SNotice::ImportPreviewFailed);
+                    }
+                }
+            }
+            Err(_) => {
+                self.settings.set_notice(SNotice::ImportUnresolvedReference);
+            }
+        }
+        self.sync_settings_ui();
+        self.refresh_search_settings();
+        // The manager's folder list re-reads the shared doc on next sync.
+        self.manager.reload_from_store();
+        self.sync_ui();
+    }
+
+    /// Restore a listed backup: decode it, validate, replace the working copy
+    /// and save atomically. Never touches a real directory.
+    fn restore_backup(&mut self, index: i32) {
+        use filego::storage::backup;
+        let backups = self.settings.view().backups.clone();
+        let Some(name) = backups.get(index as usize).cloned() else {
+            self.settings.set_notice(SNotice::BackupRestoreFailed);
+            self.sync_settings_ui();
+            return;
+        };
+        let decoded = match backup::read_backup(&self.data_dir, &name) {
+            Ok(document) => document,
+            Err(_) => {
+                self.settings.set_notice(SNotice::BackupRestoreFailed);
+                self.sync_settings_ui();
+                return;
+            }
+        };
+        let revision = {
+            let mut repo = self.repo.borrow_mut();
+            if repo.set_data(decoded.data).is_err() {
+                self.settings.set_notice(SNotice::BackupRestoreFailed);
+                self.sync_settings_ui();
+                return;
+            }
+            repo.save_at()
+        };
+        match revision {
+            Ok(_) => self.settings.set_notice(SNotice::BackupRestoreApplied),
+            Err(_) => self.settings.set_notice(SNotice::BackupRestoreFailed),
+        }
+        self.sync_settings_ui();
+        self.refresh_search_settings();
+        self.manager.reload_from_store();
+        self.sync_ui();
+    }
+
+    /// Create a user-facing backup snapshot (a new `backup-*.json` sibling).
+    fn create_backup(&mut self) {
+        use filego::storage::backup;
+        let Some(document) = self.settings.document() else {
+            self.settings.set_notice(SNotice::BackupRestoreFailed);
+            self.sync_settings_ui();
+            return;
+        };
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+        match backup::create_backup(&self.data_dir, &document, &stamp) {
+            Ok(_) => {
+                let names = backup::list_backups(&self.data_dir).unwrap_or_default();
+                self.settings.set_backups(names);
+                self.settings.set_notice(SNotice::BackupCreated);
+            }
+            Err(_) => self.settings.set_notice(SNotice::BackupRestoreFailed),
+        }
+        self.sync_settings_ui();
+    }
+
+    /// List the user-facing backups (newest first) and refresh the Data page.
+    fn list_backups(&mut self) {
+        use filego::storage::backup;
+        match backup::list_backups(&self.data_dir) {
+            Ok(names) => {
+                self.settings.set_backups(names);
+                if self.settings.view().backups.is_empty() {
+                    self.settings.set_notice(SNotice::BackupsNone);
+                }
+            }
+            Err(_) => self.settings.set_notice(SNotice::BackupListFailed),
+        }
+        self.sync_settings_ui();
+    }
+
+    /// "清除最近使用": clears the recently-used statistics of every folder
+    /// record (open_count + last_opened_at reset) and saves. Search history is
+    /// not persisted in 0.0.1, so there is nothing else to clear — the Data
+    /// page states this honestly.
+    fn clear_recent(&mut self) {
+        let mut repo = self.repo.borrow_mut();
+        let Some(document) = repo.document() else {
+            return;
+        };
+        let mut document = document.clone();
+        let mut any = false;
+        for folder in &mut document.data.folders {
+            if folder.open_count != 0 || folder.last_opened_at.is_some() {
+                folder.open_count = 0;
+                folder.last_opened_at = None;
+                any = true;
+            }
+        }
+        if !any {
+            return;
+        }
+        if repo.set_data(document.data).is_err() || repo.save_at().is_err() {
+            self.settings.set_notice(SNotice::SaveFailed);
+            self.sync_settings_ui();
+            return;
+        }
+        drop(repo);
+        self.settings.set_notice(SNotice::Saved);
+        self.sync_settings_ui();
+        self.refresh_search_settings();
+        self.sync_ui();
+    }
+
+    /// "重置全部设置": restore the default settings snapshot WITHOUT touching
+    /// folder records; the settings changes are persisted and the UI re-applies
+    /// theme/locale/font-scale/hotkey. This is the pure controller's
+    /// `RestoreDefaultSettings`, routed through the adapter so the live
+    /// platform effects are re-applied.
+    fn reset_settings(&mut self) {
+        self.settings.handle(SCommand::RestoreDefaultSettings);
+        self.refresh_settings_appearance();
+        self.refresh_search_settings();
+        self.sync_settings_ui();
+        self.sync_ui();
+    }
+
+    /// "删除全部文件夹记录": two-step-confirmed clear of EVERY folder RECORD.
+    /// `clear_all_records` on the repository is record-only (the real folders
+    /// stay on disk — the canary covers it); the document is saved atomically.
+    fn clear_all_records(&mut self) {
+        {
+            let mut repo = self.repo.borrow_mut();
+            let changed = repo.clear_all_records();
+            if !changed {
+                return;
+            }
+            if repo.save_at().is_err() {
+                self.settings.set_notice(SNotice::SaveFailed);
+                self.sync_settings_ui();
+                return;
+            }
+        }
+        self.settings.set_notice(SNotice::ClearAllApplied);
+        self.sync_settings_ui();
+        self.refresh_search_settings();
+        self.manager.reload_from_store();
+        self.sync_ui();
+    }
+
+    /// Drive a recorded hotkey key (from the Hotkey page FocusScope) through
+    /// the pure controller; on a valid draft the adapter registers it with the
+    /// native machine and keeps old-on-conflict.
+    fn record_hotkey_key(&mut self, control: bool, alt: bool, shift: bool, win: bool, text: &str) {
+        let Some(key) = filego::presentation::settings_controller::hotkey_from_text(text) else {
+            return;
+        };
+        self.settings
+            .handle(SCommand::SetRecordedModifiers(control, alt, shift, win));
+        self.settings.handle(SCommand::FinishRecording(key));
+        // A valid draft is then registered against the native machine; a
+        // conflict keeps the old hotkey (machine semantics) and reports it.
+        let draft = self.settings.view().hotkey_draft;
+        if let Some(combo) = draft {
+            let registered = self.native.borrow().set_hotkey(combo);
+            match registered {
+                Ok(()) => {
+                    self.settings.handle(SCommand::PersistHotkey(Some(combo)));
+                    self.settings.handle(SCommand::SyncHotkeyRuntime(
+                        filego::presentation::settings_controller::HotkeyRuntime::Active,
+                        None,
+                    ));
+                }
+                Err(kind) => {
+                    // Keep-old: the machine already restored the previous
+                    // combo; report anonymous conflict/unavailable.
+                    let notice = match kind {
+                        filego::platform::hotkey::HotkeyErrorKind::Conflict => {
+                            SNotice::HotkeyConflict
+                        }
+                        filego::platform::hotkey::HotkeyErrorKind::Unavailable => {
+                            SNotice::HotkeyUnavailable
+                        }
+                    };
+                    self.settings.set_notice(notice);
+                    self.settings.handle(SCommand::SyncHotkeyRuntime(
+                        filego::presentation::settings_controller::HotkeyRuntime::Disabled,
+                        Some(kind),
+                    ));
+                    self.settings.handle(SCommand::CancelRecording);
+                }
+            }
+        }
+        self.sync_settings_ui();
     }
 
     /// Drain context-menu effects from the search window.
@@ -617,11 +1345,9 @@ impl SettingsWindowController {
         };
         let view = self.manager.view();
 
-        window.set_page(match view.page {
-            filego::presentation::manager::Page::Folders => 0,
-            filego::presentation::manager::Page::Categories => 1,
-            filego::presentation::manager::Page::Tags => 2,
-        });
+        // NOTE: `page` is pushed by the nav handlers; the manager controls the
+        // 1/2/3 range and the settings controller the 0/4..8 range. See
+        // `on_command_show_page` / `on_s_show_page`.
 
         window.set_rows_count(view.rows.len() as i32);
         window.set_rows_name(string_model(
@@ -853,6 +1579,189 @@ fn results_count_label(
         .into()
 }
 
+/// Localize an M06 settings notice (anonymous — never a path or query).
+fn snotice_text(
+    notice: filego::presentation::settings_controller::SNotice,
+    locale: filego::presentation::i18n::Locale,
+) -> String {
+    let msg = match notice {
+        filego::presentation::settings_controller::SNotice::Saved => Msg::NoticeSaved,
+        filego::presentation::settings_controller::SNotice::SaveFailed => Msg::NoticeSaveFailed,
+        filego::presentation::settings_controller::SNotice::StartupWriteFailed => {
+            Msg::MonoNoticeStartupWriteFailed
+        }
+        filego::presentation::settings_controller::SNotice::StartupReadFailed => {
+            Msg::MonoNoticeStartupReadFailed
+        }
+        filego::presentation::settings_controller::SNotice::HotkeyConflict => Msg::NoticeSaveFailed,
+        filego::presentation::settings_controller::SNotice::HotkeyUnavailable => {
+            Msg::NoticeSaveFailed
+        }
+        filego::presentation::settings_controller::SNotice::HotkeyInvalid => Msg::NoticeSaveFailed,
+        filego::presentation::settings_controller::SNotice::ImportParseFailed => {
+            Msg::MonoNoticeImportParseFailed
+        }
+        filego::presentation::settings_controller::SNotice::ImportFutureSchema => {
+            Msg::MonoNoticeImportFutureSchema
+        }
+        filego::presentation::settings_controller::SNotice::ImportMigrationNeeded => {
+            Msg::MonoNoticeImportMigrationNeeded
+        }
+        filego::presentation::settings_controller::SNotice::ImportInvalidDocument => {
+            Msg::MonoNoticeImportInvalidDocument
+        }
+        filego::presentation::settings_controller::SNotice::ImportUnresolvedReference => {
+            Msg::MonoNoticeImportUnresolvedReference
+        }
+        filego::presentation::settings_controller::SNotice::ImportApplied => {
+            Msg::MonoNoticeImportApplied
+        }
+        filego::presentation::settings_controller::SNotice::ImportPreviewFailed => {
+            Msg::MonoNoticeImportPreviewFailed
+        }
+        filego::presentation::settings_controller::SNotice::ExportFailed => {
+            Msg::MonoNoticeExportFailed
+        }
+        filego::presentation::settings_controller::SNotice::ExportTargetExists => {
+            Msg::MonoNoticeExportTargetExists
+        }
+        filego::presentation::settings_controller::SNotice::BackupsNone => {
+            Msg::MonoNoticeBackupsNone
+        }
+        filego::presentation::settings_controller::SNotice::BackupCreated => {
+            Msg::MonoNoticeBackupCreated
+        }
+        filego::presentation::settings_controller::SNotice::BackupRestoreFailed => {
+            Msg::MonoNoticeBackupRestoreFailed
+        }
+        filego::presentation::settings_controller::SNotice::BackupRestoreApplied => {
+            Msg::MonoNoticeBackupRestoreApplied
+        }
+        filego::presentation::settings_controller::SNotice::BackupListFailed => {
+            Msg::MonoNoticeBackupListFailed
+        }
+        filego::presentation::settings_controller::SNotice::ResetDefaultApplied => {
+            Msg::MonoNoticeResetDefaultApplied
+        }
+        filego::presentation::settings_controller::SNotice::ClearAllApplied => {
+            Msg::MonoNoticeClearAllApplied
+        }
+        filego::presentation::settings_controller::SNotice::DataDirOpened => {
+            Msg::MonoNoticeDataDirOpened
+        }
+        filego::presentation::settings_controller::SNotice::DataDirOpenFailed => {
+            Msg::MonoNoticeDataDirOpenFailed
+        }
+        filego::presentation::settings_controller::SNotice::ExportWritten => {
+            Msg::MonoNoticeExportWritten
+        }
+    };
+    msg.tr(locale)
+}
+
+/// The UI locale for a language preference (M06.2). `System` follows the OS
+/// default through `Locale::detect` (no live system-locale notification hook in
+/// 0.0.1; the preference is persisted and re-applied on each open).
+fn locale_for(preference: filego::domain::settings::LanguagePreference) -> Locale {
+    match preference {
+        filego::domain::settings::LanguagePreference::System => Locale::detect(None),
+        filego::domain::settings::LanguagePreference::ZhCN => Locale::ZhCN,
+        filego::domain::settings::LanguagePreference::EnUS => Locale::EnUS,
+    }
+}
+
+/// Render a hotkey setting as a human string (for the Hotkey page + the tray).
+fn hotkey_combo_text(setting: filego::domain::settings::HotkeySetting) -> String {
+    let mods = setting.modifiers;
+    let mut parts: Vec<String> = Vec::new();
+    if mods.control {
+        parts.push("Ctrl".into());
+    }
+    if mods.alt {
+        parts.push("Alt".into());
+    }
+    if mods.shift {
+        parts.push("Shift".into());
+    }
+    if mods.win {
+        parts.push("Win".into());
+    }
+    let key = hotkey_key_text(setting.key);
+    parts.push(key);
+    parts.join("+")
+}
+
+fn hotkey_key_text(key: filego::domain::settings::HotkeyKey) -> String {
+    match key {
+        filego::domain::settings::HotkeyKey::Vk { vk: 0x20 } => "Space".into(),
+        filego::domain::settings::HotkeyKey::Vk { vk } => {
+            if vk.is_ascii_uppercase() {
+                (vk as char).to_string()
+            } else {
+                format!("VK-{vk}")
+            }
+        }
+        filego::domain::settings::HotkeyKey::Function { index } => format!("F{index}"),
+    }
+}
+
+fn hotkey_display_text(setting: Option<filego::domain::settings::HotkeySetting>) -> String {
+    setting
+        .map(hotkey_combo_text)
+        .unwrap_or_else(|| Msg::MonoHotkeyNone.tr(Locale::ZhCN))
+}
+
+/// Localize a hotkey error (anonymous kind).
+fn hotkey_error_text(kind: filego::platform::hotkey::HotkeyErrorKind, _locale: Locale) -> String {
+    kind.as_detail().to_owned()
+}
+
+/// The import-mode combo index for a mode.
+fn import_mode_index(mode: filego::storage::import_export::ImportMode) -> i32 {
+    match mode {
+        filego::storage::import_export::ImportMode::Overwrite => 0,
+        filego::storage::import_export::ImportMode::Merge => 1,
+        filego::storage::import_export::ImportMode::SkipDuplicates => 2,
+    }
+}
+
+fn import_mode_from_index(index: i32) -> filego::storage::import_export::ImportMode {
+    match index {
+        1 => filego::storage::import_export::ImportMode::Merge,
+        2 => filego::storage::import_export::ImportMode::SkipDuplicates,
+        _ => filego::storage::import_export::ImportMode::Overwrite,
+    }
+}
+
+/// Push the M06 theme tokens into the settings window's global (shared with the
+/// main window in the same compiled module).
+fn ui_set_theme_for_settings(
+    window: &SettingsWindow,
+    theme: filego::presentation::theme::ResolvedTheme,
+) {
+    let theme_global = window.global::<UiTheme>();
+    theme_global.set_background(color_from_hex(theme.background));
+    theme_global.set_surface(color_from_hex(theme.surface));
+    theme_global.set_border(color_from_hex(theme.border));
+    theme_global.set_text(color_from_hex(theme.text));
+    theme_global.set_text_secondary(color_from_hex(theme.text_secondary));
+    theme_global.set_accent(color_from_hex(theme.accent));
+    theme_global.set_on_accent(color_from_hex(theme.on_accent));
+    theme_global.set_warning(color_from_hex(theme.warning));
+    theme_global.set_selection(color_from_hex(theme.selection));
+}
+
+/// Apply the persisted settings-window width override (physical px = logical ×
+/// the window's current scale; Slint 1.18 has no logical `set_width`).
+fn apply_settings_window_width(window: &SettingsWindow, logical_width: u16) {
+    let scale = window.window().scale_factor();
+    let physical = slint::PhysicalSize::new(
+        (f32::from(logical_width) * scale).round() as u32,
+        window.window().size().height,
+    );
+    window.window().set_size(physical);
+}
+
 /// The FileGo data directory: `%LOCALAPPDATA%\FileGo`. Pure helper; the app
 /// falls back to a portable path when the env var is missing (M05 keeps data
 /// local and private).
@@ -990,6 +1899,269 @@ fn apply_settings_localization(
         // M05 review H3: category/tag delete confirmation.
         ("confirm_delete_category", Msg::ConfirmDeleteCategory),
         ("confirm_delete_tag", Msg::ConfirmDeleteTag),
+        // ---- M06 settings pages ----
+        ("settings_general", Msg::SettingsGeneral),
+        ("settings_search", Msg::SettingsSearch),
+        ("settings_appearance", Msg::SettingsAppearance),
+        ("settings_hotkey", Msg::SettingsHotkey),
+        ("settings_data", Msg::SettingsData),
+        ("settings_about", Msg::SettingsAbout),
+        ("settings_mono_launch_at_login", Msg::MonoLaunchAtLogin),
+        ("settings_mono_silent_start", Msg::MonoSilentStart),
+        ("settings_mono_show_main", Msg::MonoShowMainWindowAtStartup),
+        (
+            "settings_mono_start_notification",
+            Msg::MonoStartNotification,
+        ),
+        (
+            "settings_mono_start_notification_none",
+            Msg::MonoStartNotificationNone,
+        ),
+        ("settings_mono_hide_after_open", Msg::MonoHideAfterOpen),
+        ("settings_mono_clear_after_open", Msg::MonoClearAfterOpen),
+        ("settings_mono_hide_on_focus_loss", Msg::MonoHideOnFocusLoss),
+        ("settings_mono_monitor_strategy", Msg::MonoMonitorStrategy),
+        ("settings_mono_monitor_mouse", Msg::MonoMonitorMouse),
+        (
+            "settings_mono_monitor_active_window",
+            Msg::MonoMonitorActiveWindow,
+        ),
+        ("settings_mono_language", Msg::MonoLanguage),
+        ("settings_mono_language_system", Msg::MonoLanguageSystem),
+        ("settings_mono_language_zhcn", Msg::MonoLanguageZhCN),
+        ("settings_mono_language_enus", Msg::MonoLanguageEnUS),
+        ("settings_mono_restore_defaults", Msg::MonoRestoreDefaults),
+        (
+            "settings_mono_restore_defaults_impact",
+            Msg::MonoRestoreDefaultsImpact,
+        ),
+        (
+            "settings_mono_restore_defaults_confirm",
+            Msg::MonoRestoreDefaultsConfirm,
+        ),
+        ("settings_search_paths", Msg::MonoSearchPaths),
+        ("settings_search_categories", Msg::MonoSearchCategories),
+        ("settings_search_tags", Msg::MonoSearchTags),
+        ("settings_search_notes", Msg::MonoSearchNotes),
+        ("settings_search_aliases", Msg::MonoSearchAliases),
+        ("settings_search_fuzzy", Msg::MonoFuzzyMatching),
+        ("settings_search_pinyin", Msg::MonoSearchPinyin),
+        (
+            "settings_search_english_initials",
+            Msg::MonoSearchEnglishInitials,
+        ),
+        (
+            "settings_search_max_edit_distance",
+            Msg::MonoMaxEditDistance,
+        ),
+        ("settings_search_max_results", Msg::MonoMaxResults),
+        ("settings_search_empty_query", Msg::MonoEmptyQueryStrategy),
+        (
+            "settings_search_empty_query_favorites_first",
+            Msg::MonoEmptyQueryFavoritesFirst,
+        ),
+        ("settings_search_empty_query_all", Msg::MonoEmptyQueryAll),
+        (
+            "settings_search_empty_query_pinned_only",
+            Msg::MonoEmptyQueryPinnedOnly,
+        ),
+        (
+            "settings_search_empty_query_blank",
+            Msg::MonoEmptyQueryBlank,
+        ),
+        ("settings_search_highlight", Msg::MonoHighlightResults),
+        ("settings_search_recent_sort", Msg::MonoRecentSort),
+        ("settings_search_recent_sort_hint", Msg::MonoRecentSortHint),
+        (
+            "settings_search_history_future",
+            Msg::MonoSearchHistoryFuture,
+        ),
+        ("settings_appearance_theme", Msg::MonoTheme),
+        ("settings_appearance_theme_system", Msg::MonoThemeSystem),
+        ("settings_appearance_theme_light", Msg::MonoThemeLight),
+        ("settings_appearance_theme_dark", Msg::MonoThemeDark),
+        ("settings_appearance_row_height", Msg::MonoRowHeight),
+        (
+            "settings_appearance_row_height_compact",
+            Msg::MonoRowHeightCompact,
+        ),
+        (
+            "settings_appearance_row_height_standard",
+            Msg::MonoRowHeightStandard,
+        ),
+        (
+            "settings_appearance_search_width",
+            Msg::MonoSearchWindowWidth,
+        ),
+        (
+            "settings_appearance_settings_width",
+            Msg::MonoSettingsWindowWidth,
+        ),
+        ("settings_appearance_font_scale", Msg::MonoFontScale),
+        ("settings_appearance_show_path", Msg::MonoShowPathInResults),
+        (
+            "settings_appearance_show_cat_tag",
+            Msg::MonoShowCategoryTagInResults,
+        ),
+        ("settings_appearance_transparency", Msg::MonoTransparency),
+        ("settings_appearance_high_contrast", Msg::MonoHighContrast),
+        ("settings_appearance_future_version", Msg::MonoFutureVersion),
+        ("settings_hotkey_current", Msg::MonoHotkeyCurrentCombo),
+        ("settings_hotkey_none", Msg::MonoHotkeyNone),
+        ("settings_hotkey_record", Msg::MonoHotkeyRecord),
+        (
+            "settings_hotkey_recording_hint",
+            Msg::MonoHotkeyRecordingHint,
+        ),
+        (
+            "settings_hotkey_cancel_recording",
+            Msg::MonoHotkeyCancelRecording,
+        ),
+        ("settings_hotkey_pause", Msg::MonoHotkeyPause),
+        ("settings_hotkey_resume", Msg::MonoHotkeyResume),
+        ("settings_hotkey_clear", Msg::MonoHotkeyClear),
+        (
+            "settings_hotkey_restore_default",
+            Msg::MonoHotkeyRestoreDefault,
+        ),
+        (
+            "settings_hotkey_state_disabled",
+            Msg::MonoHotkeyStateDisabled,
+        ),
+        ("settings_hotkey_state_active", Msg::MonoHotkeyStateActive),
+        ("settings_hotkey_state_paused", Msg::MonoHotkeyStatePaused),
+        ("settings_data_location", Msg::MonoDataLocation),
+        ("settings_data_open_dir", Msg::MonoOpenDataDir),
+        ("settings_data_folder_count", Msg::MonoFolderCount),
+        ("settings_data_export", Msg::MonoExport),
+        ("settings_data_import", Msg::MonoImport),
+        (
+            "settings_data_import_preview_title",
+            Msg::MonoImportPreviewTitle,
+        ),
+        ("settings_data_import_added", Msg::MonoImportAdded),
+        ("settings_data_import_updated", Msg::MonoImportUpdated),
+        ("settings_data_import_skipped", Msg::MonoImportSkipped),
+        ("settings_data_import_conflicts", Msg::MonoImportConflicts),
+        ("settings_data_import_mode", Msg::MonoImportMode),
+        (
+            "settings_data_import_mode_overwrite",
+            Msg::MonoImportModeOverwrite,
+        ),
+        ("settings_data_import_mode_merge", Msg::MonoImportModeMerge),
+        ("settings_data_import_mode_skip", Msg::MonoImportModeSkip),
+        ("settings_data_import_apply", Msg::MonoImportApply),
+        ("settings_data_import_cancel", Msg::MonoImportCancel),
+        ("settings_data_backup_create", Msg::MonoBackupCreate),
+        ("settings_data_backup_list", Msg::MonoBackupList),
+        ("settings_data_backup_restore", Msg::MonoBackupRestore),
+        ("settings_data_backup_none", Msg::MonoBackupNone),
+        ("settings_data_clear_recent", Msg::MonoClearRecentlyUsed),
+        (
+            "settings_data_clear_recent_note",
+            Msg::MonoClearRecentlyUsedNote,
+        ),
+        ("settings_data_reset_settings", Msg::MonoResetSettings),
+        (
+            "settings_data_reset_settings_confirm",
+            Msg::MonoResetSettingsConfirm,
+        ),
+        ("settings_data_clear_all_records", Msg::MonoClearAllRecords),
+        (
+            "settings_data_clear_all_records_confirm",
+            Msg::MonoClearAllRecordsConfirm,
+        ),
+        (
+            "settings_data_clear_all_never_deletes",
+            Msg::MonoClearAllNeverDeletes,
+        ),
+        ("settings_about_version", Msg::MonoAboutVersion),
+        ("settings_about_arch", Msg::MonoAboutArch),
+        ("settings_about_project", Msg::MonoAboutProject),
+        ("settings_about_license", Msg::MonoAboutLicense),
+        ("settings_about_privacy", Msg::MonoAboutPrivacy),
+        ("settings_category_rename", Msg::MonoCategoryRename),
+        ("settings_tag_rename", Msg::MonoTagRename),
+        ("settings_tag_merge_into", Msg::MonoTagMergeInto),
+        ("settings_tag_merge_confirm", Msg::MonoMergeConfirm),
+        (
+            "settings_notice_startup_write_failed",
+            Msg::MonoNoticeStartupWriteFailed,
+        ),
+        (
+            "settings_notice_startup_read_failed",
+            Msg::MonoNoticeStartupReadFailed,
+        ),
+        (
+            "settings_notice_data_dir_open_failed",
+            Msg::MonoNoticeDataDirOpenFailed,
+        ),
+        (
+            "settings_notice_import_parse_failed",
+            Msg::MonoNoticeImportParseFailed,
+        ),
+        (
+            "settings_notice_import_future_schema",
+            Msg::MonoNoticeImportFutureSchema,
+        ),
+        (
+            "settings_notice_import_migration_needed",
+            Msg::MonoNoticeImportMigrationNeeded,
+        ),
+        (
+            "settings_notice_import_invalid_document",
+            Msg::MonoNoticeImportInvalidDocument,
+        ),
+        (
+            "settings_notice_import_unresolved_reference",
+            Msg::MonoNoticeImportUnresolvedReference,
+        ),
+        (
+            "settings_notice_import_applied",
+            Msg::MonoNoticeImportApplied,
+        ),
+        (
+            "settings_notice_import_preview_failed",
+            Msg::MonoNoticeImportPreviewFailed,
+        ),
+        ("settings_notice_export_failed", Msg::MonoNoticeExportFailed),
+        (
+            "settings_notice_export_target_exists",
+            Msg::MonoNoticeExportTargetExists,
+        ),
+        ("settings_notice_backups_none", Msg::MonoNoticeBackupsNone),
+        (
+            "settings_notice_backup_created",
+            Msg::MonoNoticeBackupCreated,
+        ),
+        (
+            "settings_notice_backup_restore_failed",
+            Msg::MonoNoticeBackupRestoreFailed,
+        ),
+        (
+            "settings_notice_backup_restore_applied",
+            Msg::MonoNoticeBackupRestoreApplied,
+        ),
+        (
+            "settings_notice_backup_list_failed",
+            Msg::MonoNoticeBackupListFailed,
+        ),
+        (
+            "settings_notice_reset_default_applied",
+            Msg::MonoNoticeResetDefaultApplied,
+        ),
+        (
+            "settings_notice_clear_all_applied",
+            Msg::MonoNoticeClearAllApplied,
+        ),
+        (
+            "settings_notice_data_dir_opened",
+            Msg::MonoNoticeDataDirOpened,
+        ),
+        (
+            "settings_notice_export_written",
+            Msg::MonoNoticeExportWritten,
+        ),
     ];
     for (field, msg) in entries {
         let value = msg.tr(locale);
@@ -1084,6 +2256,192 @@ fn call_string_setter(window: &SettingsWindow, field: &str, value: String) {
         "discard_no" => strings.set_discard_no(value),
         "confirm_delete_category" => strings.set_confirm_delete_category(value),
         "confirm_delete_tag" => strings.set_confirm_delete_tag(value),
+        // ---- M06 ----
+        "settings_general" => strings.set_settings_general(value),
+        "settings_search" => strings.set_settings_search(value),
+        "settings_appearance" => strings.set_settings_appearance(value),
+        "settings_hotkey" => strings.set_settings_hotkey(value),
+        "settings_data" => strings.set_settings_data(value),
+        "settings_about" => strings.set_settings_about(value),
+        "settings_mono_launch_at_login" => strings.set_settings_mono_launch_at_login(value),
+        "settings_mono_silent_start" => strings.set_settings_mono_silent_start(value),
+        "settings_mono_show_main" => strings.set_settings_mono_show_main(value),
+        "settings_mono_start_notification" => strings.set_settings_mono_start_notification(value),
+        "settings_mono_start_notification_none" => {
+            strings.set_settings_mono_start_notification_none(value)
+        }
+        "settings_mono_hide_after_open" => strings.set_settings_mono_hide_after_open(value),
+        "settings_mono_clear_after_open" => strings.set_settings_mono_clear_after_open(value),
+        "settings_mono_hide_on_focus_loss" => strings.set_settings_mono_hide_on_focus_loss(value),
+        "settings_mono_monitor_strategy" => strings.set_settings_mono_monitor_strategy(value),
+        "settings_mono_monitor_mouse" => strings.set_settings_mono_monitor_mouse(value),
+        "settings_mono_monitor_active_window" => {
+            strings.set_settings_mono_monitor_active_window(value)
+        }
+        "settings_mono_language" => strings.set_settings_mono_language(value),
+        "settings_mono_language_system" => strings.set_settings_mono_language_system(value),
+        "settings_mono_language_zhcn" => strings.set_settings_mono_language_zhcn(value),
+        "settings_mono_language_enus" => strings.set_settings_mono_language_enus(value),
+        "settings_mono_restore_defaults" => strings.set_settings_mono_restore_defaults(value),
+        "settings_mono_restore_defaults_impact" => {
+            strings.set_settings_mono_restore_defaults_impact(value)
+        }
+        "settings_mono_restore_defaults_confirm" => {
+            strings.set_settings_mono_restore_defaults_confirm(value)
+        }
+        "settings_search_paths" => strings.set_settings_search_paths(value),
+        "settings_search_categories" => strings.set_settings_search_categories(value),
+        "settings_search_tags" => strings.set_settings_search_tags(value),
+        "settings_search_notes" => strings.set_settings_search_notes(value),
+        "settings_search_aliases" => strings.set_settings_search_aliases(value),
+        "settings_search_fuzzy" => strings.set_settings_search_fuzzy(value),
+        "settings_search_pinyin" => strings.set_settings_search_pinyin(value),
+        "settings_search_english_initials" => strings.set_settings_search_english_initials(value),
+        "settings_search_max_edit_distance" => strings.set_settings_search_max_edit_distance(value),
+        "settings_search_max_results" => strings.set_settings_search_max_results(value),
+        "settings_search_empty_query" => strings.set_settings_search_empty_query(value),
+        "settings_search_empty_query_favorites_first" => {
+            strings.set_settings_search_empty_query_favorites_first(value)
+        }
+        "settings_search_empty_query_all" => strings.set_settings_search_empty_query_all(value),
+        "settings_search_empty_query_pinned_only" => {
+            strings.set_settings_search_empty_query_pinned_only(value)
+        }
+        "settings_search_empty_query_blank" => strings.set_settings_search_empty_query_blank(value),
+        "settings_search_highlight" => strings.set_settings_search_highlight(value),
+        "settings_search_recent_sort" => strings.set_settings_search_recent_sort(value),
+        "settings_search_recent_sort_hint" => strings.set_settings_search_recent_sort_hint(value),
+        "settings_search_history_future" => strings.set_settings_search_history_future(value),
+        "settings_appearance_theme" => strings.set_settings_appearance_theme(value),
+        "settings_appearance_theme_system" => strings.set_settings_appearance_theme_system(value),
+        "settings_appearance_theme_light" => strings.set_settings_appearance_theme_light(value),
+        "settings_appearance_theme_dark" => strings.set_settings_appearance_theme_dark(value),
+        "settings_appearance_row_height" => strings.set_settings_appearance_row_height(value),
+        "settings_appearance_row_height_compact" => {
+            strings.set_settings_appearance_row_height_compact(value)
+        }
+        "settings_appearance_row_height_standard" => {
+            strings.set_settings_appearance_row_height_standard(value)
+        }
+        "settings_appearance_search_width" => strings.set_settings_appearance_search_width(value),
+        "settings_appearance_settings_width" => {
+            strings.set_settings_appearance_settings_width(value)
+        }
+        "settings_appearance_font_scale" => strings.set_settings_appearance_font_scale(value),
+        "settings_appearance_show_path" => strings.set_settings_appearance_show_path(value),
+        "settings_appearance_show_cat_tag" => strings.set_settings_appearance_show_cat_tag(value),
+        "settings_appearance_transparency" => strings.set_settings_appearance_transparency(value),
+        "settings_appearance_high_contrast" => strings.set_settings_appearance_high_contrast(value),
+        "settings_appearance_future_version" => {
+            strings.set_settings_appearance_future_version(value)
+        }
+        "settings_hotkey_current" => strings.set_settings_hotkey_current(value),
+        "settings_hotkey_none" => strings.set_settings_hotkey_none(value),
+        "settings_hotkey_record" => strings.set_settings_hotkey_record(value),
+        "settings_hotkey_recording_hint" => strings.set_settings_hotkey_recording_hint(value),
+        "settings_hotkey_cancel_recording" => strings.set_settings_hotkey_cancel_recording(value),
+        "settings_hotkey_pause" => strings.set_settings_hotkey_pause(value),
+        "settings_hotkey_resume" => strings.set_settings_hotkey_resume(value),
+        "settings_hotkey_clear" => strings.set_settings_hotkey_clear(value),
+        "settings_hotkey_restore_default" => strings.set_settings_hotkey_restore_default(value),
+        "settings_hotkey_state_disabled" => strings.set_settings_hotkey_state_disabled(value),
+        "settings_hotkey_state_active" => strings.set_settings_hotkey_state_active(value),
+        "settings_hotkey_state_paused" => strings.set_settings_hotkey_state_paused(value),
+        "settings_data_location" => strings.set_settings_data_location(value),
+        "settings_data_open_dir" => strings.set_settings_data_open_dir(value),
+        "settings_data_folder_count" => strings.set_settings_data_folder_count(value),
+        "settings_data_export" => strings.set_settings_data_export(value),
+        "settings_data_import" => strings.set_settings_data_import(value),
+        "settings_data_import_preview_title" => {
+            strings.set_settings_data_import_preview_title(value)
+        }
+        "settings_data_import_added" => strings.set_settings_data_import_added(value),
+        "settings_data_import_updated" => strings.set_settings_data_import_updated(value),
+        "settings_data_import_skipped" => strings.set_settings_data_import_skipped(value),
+        "settings_data_import_conflicts" => strings.set_settings_data_import_conflicts(value),
+        "settings_data_import_mode" => strings.set_settings_data_import_mode(value),
+        "settings_data_import_mode_overwrite" => {
+            strings.set_settings_data_import_mode_overwrite(value)
+        }
+        "settings_data_import_mode_merge" => strings.set_settings_data_import_mode_merge(value),
+        "settings_data_import_mode_skip" => strings.set_settings_data_import_mode_skip(value),
+        "settings_data_import_apply" => strings.set_settings_data_import_apply(value),
+        "settings_data_import_cancel" => strings.set_settings_data_import_cancel(value),
+        "settings_data_backup_create" => strings.set_settings_data_backup_create(value),
+        "settings_data_backup_list" => strings.set_settings_data_backup_list(value),
+        "settings_data_backup_restore" => strings.set_settings_data_backup_restore(value),
+        "settings_data_backup_none" => strings.set_settings_data_backup_none(value),
+        "settings_data_clear_recent" => strings.set_settings_data_clear_recent(value),
+        "settings_data_clear_recent_note" => strings.set_settings_data_clear_recent_note(value),
+        "settings_data_reset_settings" => strings.set_settings_data_reset_settings(value),
+        "settings_data_reset_settings_confirm" => {
+            strings.set_settings_data_reset_settings_confirm(value)
+        }
+        "settings_data_clear_all_records" => strings.set_settings_data_clear_all_records(value),
+        "settings_data_clear_all_records_confirm" => {
+            strings.set_settings_data_clear_all_records_confirm(value)
+        }
+        "settings_data_clear_all_never_deletes" => {
+            strings.set_settings_data_clear_all_never_deletes(value)
+        }
+        "settings_about_version" => strings.set_settings_about_version(value),
+        "settings_about_arch" => strings.set_settings_about_arch(value),
+        "settings_about_project" => strings.set_settings_about_project(value),
+        "settings_about_license" => strings.set_settings_about_license(value),
+        "settings_about_privacy" => strings.set_settings_about_privacy(value),
+        "settings_category_rename" => strings.set_settings_category_rename(value),
+        "settings_tag_rename" => strings.set_settings_tag_rename(value),
+        "settings_tag_merge_into" => strings.set_settings_tag_merge_into(value),
+        "settings_tag_merge_confirm" => strings.set_settings_tag_merge_confirm(value),
+        "settings_notice_startup_write_failed" => {
+            strings.set_settings_notice_startup_write_failed(value)
+        }
+        "settings_notice_startup_read_failed" => {
+            strings.set_settings_notice_startup_read_failed(value)
+        }
+        "settings_notice_data_dir_open_failed" => {
+            strings.set_settings_notice_data_dir_open_failed(value)
+        }
+        "settings_notice_import_parse_failed" => {
+            strings.set_settings_notice_import_parse_failed(value)
+        }
+        "settings_notice_import_future_schema" => {
+            strings.set_settings_notice_import_future_schema(value)
+        }
+        "settings_notice_import_migration_needed" => {
+            strings.set_settings_notice_import_migration_needed(value)
+        }
+        "settings_notice_import_invalid_document" => {
+            strings.set_settings_notice_import_invalid_document(value)
+        }
+        "settings_notice_import_unresolved_reference" => {
+            strings.set_settings_notice_import_unresolved_reference(value)
+        }
+        "settings_notice_import_applied" => strings.set_settings_notice_import_applied(value),
+        "settings_notice_import_preview_failed" => {
+            strings.set_settings_notice_import_preview_failed(value)
+        }
+        "settings_notice_export_failed" => strings.set_settings_notice_export_failed(value),
+        "settings_notice_export_target_exists" => {
+            strings.set_settings_notice_export_target_exists(value)
+        }
+        "settings_notice_backups_none" => strings.set_settings_notice_backups_none(value),
+        "settings_notice_backup_created" => strings.set_settings_notice_backup_created(value),
+        "settings_notice_backup_restore_failed" => {
+            strings.set_settings_notice_backup_restore_failed(value)
+        }
+        "settings_notice_backup_restore_applied" => {
+            strings.set_settings_notice_backup_restore_applied(value)
+        }
+        "settings_notice_backup_list_failed" => {
+            strings.set_settings_notice_backup_list_failed(value)
+        }
+        "settings_notice_reset_default_applied" => {
+            strings.set_settings_notice_reset_default_applied(value)
+        }
+        "settings_notice_clear_all_applied" => strings.set_settings_notice_clear_all_applied(value),
+        "settings_notice_data_dir_opened" => strings.set_settings_notice_data_dir_opened(value),
+        "settings_notice_export_written" => strings.set_settings_notice_export_written(value),
         _ => {}
     }
 }
@@ -1356,10 +2714,19 @@ fn run() -> Result<(), slint::PlatformError> {
     let app = AppWindow::new()?;
     let tray = AppTray::new()?;
 
+    // ---- M05: shared repository (opened early so M06 can read the persisted
+    // settings for the hotkey + startup behavior) --------------------------
+    let repo = open_repository();
+
     // ---- M04.2/M04.3 native platform --------------------------------
-    let settings = AppSettings::default();
+    // M06: the hotkey is the PERSISTED one (from the shared repository), not a
+    // hardcoded default. A failed worker still degrades to `disabled`.
+    let persisted_hotkey = repo
+        .borrow()
+        .document()
+        .and_then(|document| document.data.settings.hotkey);
     let native =
-        filego::platform::windows::NativePlatform::start(settings.hotkey).unwrap_or_else(|_| {
+        filego::platform::windows::NativePlatform::start(persisted_hotkey).unwrap_or_else(|_| {
             // A failed native worker must not prevent the tray shell from
             // running; hotkey/IPC degrade gracefully.
             filego::platform::windows::NativePlatform::disabled()
@@ -1374,7 +2741,43 @@ fn run() -> Result<(), slint::PlatformError> {
         window: app.as_weak(),
     }));
 
-    apply_localization_and_theme(&app, filego::presentation::i18n::Locale::default());
+    // M06: startup locale follows the persisted language preference; the theme
+    // and font scale are applied from the repository's settings.
+    let startup_locale = locale_for(
+        repo.borrow()
+            .document()
+            .map(|document| document.data.settings.language_preference)
+            .unwrap_or_default(),
+    );
+    apply_localization_and_theme(&app, startup_locale);
+    let startup_window_visible = {
+        let document = repo.borrow().document().cloned();
+        document
+            .map(|document| {
+                let settings = document.data.settings;
+                let resolved = filego::presentation::theme::ResolvedTheme::resolve(
+                    settings.theme,
+                    filego::presentation::theme::ResolvedColorScheme::Light,
+                );
+                let theme_global = app.global::<UiTheme>();
+                theme_global.set_font_scale(f32::from(settings.font_scale_percent) / 100.0);
+                ui_set_theme(&app, resolved);
+                set_monitor_strategy(settings.monitor_strategy);
+                set_search_window_width(settings.search_window_width);
+                !settings.silent_start || settings.show_main_window_at_startup
+            })
+            .unwrap_or(false)
+    };
+
+    // M06: show the main window at startup when the persisted settings ask for
+    // it (default is silent tray-only).
+    if startup_window_visible {
+        let controller = Rc::clone(&controller);
+        let port = Rc::clone(&port);
+        let _ = controller
+            .borrow_mut()
+            .handle(LifecycleCommand::Show, &mut *port.borrow_mut());
+    }
 
     {
         let controller = Rc::clone(&controller);
@@ -1450,7 +2853,6 @@ fn run() -> Result<(), slint::PlatformError> {
     tray.set_pause_hotkeys_glyph(if native.borrow().paused() { "✓ " } else { "" }.into());
 
     // ---- M05: shared repository + settings window + shared adapter -----
-    let repo = open_repository();
     let (context_tx, context_rx) = std::sync::mpsc::channel();
     let settings_window = SettingsWindow::new()?;
     apply_settings_localization(
@@ -1458,32 +2860,9 @@ fn run() -> Result<(), slint::PlatformError> {
         filego::presentation::i18n::Locale::default(),
     );
     let store = filego::presentation::manager::SharedStore::new(Rc::clone(&repo));
-    let settings_adapter = Rc::new(RefCell::new(SettingsWindowController::new(
-        settings_window.as_weak(),
-        store,
-        context_rx,
-    )));
-
-    {
-        let settings = Rc::clone(&settings_adapter);
-        tray.on_add_folder(move || {
-            // M05.2: tray "添加文件夹" opens the settings window and runs the
-            // native folder picker directly (user-initiated, no scan).
-            settings.borrow_mut().browse();
-            if let Some(window) = settings.borrow().window.upgrade() {
-                let _ = window.show();
-            }
-        });
-    }
-    {
-        let settings = Rc::clone(&settings_adapter);
-        tray.on_open_settings(move || {
-            // M05/M06: tray "设置" opens the settings window.
-            if let Some(window) = settings.borrow().window.upgrade() {
-                let _ = window.show();
-            }
-        });
-    }
+    // `settings_adapter` is defined AFTER `main` (below) because the settings
+    // controller needs a clone of the main controller to refresh the search
+    // window when search settings change; `main` only needs `context_tx`.
     {
         let tray_weak = tray.as_weak();
         tray.on_toggle_launch_at_login(move || {
@@ -1542,15 +2921,15 @@ fn run() -> Result<(), slint::PlatformError> {
     let _native_drain = native_drain; // the timer lives for the whole event loop
 
     // ---- M03/M05: shared repository-backed ViewModel adapter wiring -----
+    // M06: the search window runs on the FULL persisted settings (search
+    // toggles, empty-query strategy, widths, theme, ...) so settings changes
+    // take effect immediately when the adapter rebuilds the ViewModel.
     let resolved = resolved_from_repository(&repo);
-    let settings = AppSettings {
-        one_level_import: repo
-            .borrow()
-            .document()
-            .map(|document| document.data.settings.one_level_import)
-            .unwrap_or(false),
-        ..AppSettings::default()
-    };
+    let settings = repo
+        .borrow()
+        .document()
+        .map(|document| document.data.settings.clone())
+        .unwrap_or_default();
     let (open_tx, open_rx) = std::sync::mpsc::channel();
     let shell = ShellHandle::real();
     let main = Rc::new(RefCell::new(MainWindowController::new(
@@ -1666,6 +3045,51 @@ fn run() -> Result<(), slint::PlatformError> {
     };
     let _open_drain = open_drain; // the timer lives for the whole event loop
 
+    // ---- M05/M06: real settings adapter (needs `main` for search refresh) ----
+    // The settings controller shares the same repository; the adapter also
+    // holds the native platform (hotkey + tray) and the data directory.
+    let settings_adapter = Rc::new(RefCell::new(SettingsWindowController::new(
+        settings_window.as_weak(),
+        store,
+        context_rx,
+        Rc::clone(&native),
+        data_dir(),
+        Rc::clone(&main),
+    )));
+    // Push the initial settings view + apply persisted startup appearance.
+    {
+        let mut adapter = settings_adapter.borrow_mut();
+        // Launch-at-login OS state (read from HKCU; failure = None → the toggle
+        // is driven by the persisted flag with an honest "unread" fallback).
+        adapter
+            .settings
+            .set_launch_at_login_os(filego::platform::windows::tray_open::launch_at_login().ok());
+        // Hotkey runtime from the native machine (Active/Paused/Disabled).
+        adapter.sync_hotkey_from_native();
+        // Persisted theme + locale + font-scale applied on open.
+        adapter.refresh_settings_appearance();
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        tray.on_add_folder(move || {
+            // M05.2: tray "添加文件夹" opens the settings window and runs the
+            // native folder picker directly (user-initiated, no scan).
+            settings.borrow_mut().browse();
+            if let Some(window) = settings.borrow().window.upgrade() {
+                let _ = window.show();
+            }
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        tray.on_open_settings(move || {
+            // M05/M06: tray "设置" opens the settings window (M06 pages included).
+            if let Some(window) = settings.borrow().window.upgrade() {
+                let _ = window.show();
+            }
+        });
+    }
+
     // ---- M05: settings window callback wiring ---------------------------
     // The settings Slint window forwards gestures as MCommand; the adapter
     // applies them against the manager and re-pushes the observable state. All
@@ -1687,12 +3111,56 @@ fn run() -> Result<(), slint::PlatformError> {
         let settings = Rc::clone(&settings_adapter);
         let main = Rc::clone(&main);
         settings_window.on_command_show_page(move |page| {
-            let cmd = match page {
-                1 => MCommand::ShowPage(filego::presentation::manager::Page::Categories),
-                2 => MCommand::ShowPage(filego::presentation::manager::Page::Tags),
-                _ => MCommand::ShowPage(filego::presentation::manager::Page::Folders),
-            };
-            settings.borrow_mut().handle(cmd);
+            // M06: pages 1/2/3 stay on the M05 management controller; pages
+            // 0/4/5/6/7/8 route to the M06 settings controller.
+            match page {
+                1 => settings.borrow_mut().handle(MCommand::ShowPage(
+                    filego::presentation::manager::Page::Folders,
+                )),
+                2 => settings.borrow_mut().handle(MCommand::ShowPage(
+                    filego::presentation::manager::Page::Categories,
+                )),
+                3 => settings.borrow_mut().handle(MCommand::ShowPage(
+                    filego::presentation::manager::Page::Tags,
+                )),
+                other => {
+                    settings
+                        .borrow_mut()
+                        .handle_settings(SCommand::ShowPage(other as u8));
+                }
+            }
+            // One source of truth for the current page.
+            if let Some(window) = settings.borrow().window.upgrade() {
+                window.set_page(page);
+            }
+            let repo = settings.borrow().manager_repo();
+            main.borrow_mut().refresh_from_repository(&repo);
+        });
+    }
+    // M06 nav buttons call `s-show-page`; route them identically.
+    {
+        let settings = Rc::clone(&settings_adapter);
+        let main = Rc::clone(&main);
+        settings_window.on_s_show_page(move |page| {
+            match page {
+                1 => settings.borrow_mut().handle(MCommand::ShowPage(
+                    filego::presentation::manager::Page::Folders,
+                )),
+                2 => settings.borrow_mut().handle(MCommand::ShowPage(
+                    filego::presentation::manager::Page::Categories,
+                )),
+                3 => settings.borrow_mut().handle(MCommand::ShowPage(
+                    filego::presentation::manager::Page::Tags,
+                )),
+                other => {
+                    settings
+                        .borrow_mut()
+                        .handle_settings(SCommand::ShowPage(other as u8));
+                }
+            }
+            if let Some(window) = settings.borrow().window.upgrade() {
+                window.set_page(page);
+            }
             let repo = settings.borrow().manager_repo();
             main.borrow_mut().refresh_from_repository(&repo);
         });
@@ -2110,8 +3578,529 @@ fn run() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // Push the initial settings view once.
+    // ---- M06: settings-page callbacks --------------------------------------
+    // Each Slint control forwards an SCommand; the adapter persists through the
+    // settings controller and performs the platform side effect.
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_close(move || {
+            if let Some(window) = settings.borrow().window.upgrade() {
+                let _ = window.hide();
+            }
+        });
+    }
+    // 常规
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_launch_at_login(move |on| {
+            // HKCU first; only a successful registry write persists + confirms
+            // (no fake success). On failure the toggle snaps back to the old.
+            let written = filego::platform::windows::tray_open::set_launch_at_login(on).is_ok();
+            let mut adapter = settings.borrow_mut();
+            if written {
+                adapter.settings.handle(SCommand::SetLaunchAtLogin(on));
+                adapter.settings.set_launch_at_login_os(Some(on));
+                // Keep the tray menu glyph in sync (M06.3 status↔menu synced).
+                if let Some(tray) = tray.as_weak().upgrade() {
+                    tray.set_launch_at_login_glyph(if on { "✓ " } else { "" }.into());
+                }
+            } else {
+                adapter.settings.set_notice(SNotice::StartupWriteFailed);
+            }
+            adapter.sync_settings_ui();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_silent_start(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSilentStart(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_show_main(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetShowMainWindowAtStartup(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hide_after_open(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetHideAfterOpen(on));
+            let repo = settings.borrow().manager_repo();
+            settings
+                .borrow()
+                .main
+                .borrow_mut()
+                .refresh_from_repository(&repo);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_clear_after_open(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetClearAfterOpen(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hide_on_focus_loss(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetHideOnFocusLoss(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_monitor_strategy(move |index| {
+            let strategy = if index == 1 {
+                filego::domain::settings::MonitorStrategy::ActiveWindow
+            } else {
+                filego::domain::settings::MonitorStrategy::Mouse
+            };
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetMonitorStrategy(strategy));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_language(move |index| {
+            let language = match index {
+                1 => filego::domain::settings::LanguagePreference::ZhCN,
+                2 => filego::domain::settings::LanguagePreference::EnUS,
+                _ => filego::domain::settings::LanguagePreference::System,
+            };
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetLanguage(language));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_restore_defaults(move || {
+            settings.borrow_mut().reset_settings();
+        });
+    }
+    // 搜索
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_search_paths(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSearchPaths(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_search_categories(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSearchCategories(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_search_tags(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSearchTags(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_search_notes(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSearchNotes(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_search_aliases(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSearchAliases(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_fuzzy(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetFuzzyMatching(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_pinyin(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSearchPinyin(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_english_initials(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSearchEnglishInitials(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_highlight(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetHighlightResults(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_recent_sort(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetRecentSort(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_edit_distance(move |distance| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetMaxEditDistance(distance as u8));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_max_results(move |count| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetMaxResults(count as u16));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_empty_query(move |index| {
+            let strategy = match index {
+                1 => filego::domain::settings::EmptyQueryStrategy::All,
+                2 => filego::domain::settings::EmptyQueryStrategy::PinnedOnly,
+                3 => filego::domain::settings::EmptyQueryStrategy::Blank,
+                _ => filego::domain::settings::EmptyQueryStrategy::FavoritesFirst,
+            };
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetEmptyQueryStrategy(strategy));
+        });
+    }
+    // 外观
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_theme(move |index| {
+            let theme = match index {
+                1 => filego::domain::settings::ThemePreference::Light,
+                2 => filego::domain::settings::ThemePreference::Dark,
+                _ => filego::domain::settings::ThemePreference::System,
+            };
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetTheme(theme));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_row_height(move |index| {
+            let preference = if index == 1 {
+                filego::domain::settings::RowHeightPreference::Standard
+            } else {
+                filego::domain::settings::RowHeightPreference::Compact
+            };
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetRowHeight(preference));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_search_width(move |width| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSearchWindowWidth(width as u16));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_settings_width(move |width| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetSettingsWindowWidth(width as u16));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_font_scale(move |percent| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetFontScalePercent(percent as u16));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_show_path(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetShowPathInResults(on));
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_show_cat_tag(move |on| {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::SetShowCategoryTagInResults(on));
+        });
+    }
+    // 快捷键
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hotkey_record(move || {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::StartRecording);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hotkey_cancel(move || {
+            settings
+                .borrow_mut()
+                .handle_settings(SCommand::CancelRecording);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hotkey_pause(move || {
+            settings.borrow().native.borrow().toggle_pause();
+            settings.borrow_mut().sync_hotkey_from_native();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hotkey_resume(move || {
+            settings.borrow().native.borrow().toggle_pause();
+            settings.borrow_mut().sync_hotkey_from_native();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hotkey_clear(move || {
+            let mut adapter = settings.borrow_mut();
+            let _ = adapter.native.borrow().clear_hotkey();
+            adapter.settings.handle(SCommand::PersistHotkey(None));
+            adapter.sync_hotkey_from_native();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hotkey_restore(move || {
+            let default_combo = filego::domain::settings::HotkeySetting {
+                modifiers: filego::domain::settings::DEFAULT_HOTKEY_MODIFIERS,
+                key: filego::domain::settings::DEFAULT_HOTKEY_KEY,
+            };
+            let mut adapter = settings.borrow_mut();
+            let registered = adapter.native.borrow().set_hotkey(default_combo);
+            if registered.is_ok() {
+                adapter.settings.handle(SCommand::RestoreDefaultHotkey);
+            } else {
+                adapter.settings.set_notice(SNotice::HotkeyConflict);
+                adapter.settings.handle(SCommand::SyncHotkeyRuntime(
+                    filego::presentation::settings_controller::HotkeyRuntime::Disabled,
+                    Some(filego::platform::hotkey::HotkeyErrorKind::Conflict),
+                ));
+            }
+            adapter.sync_hotkey_from_native();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_hotkey_key(move |control, alt, shift, win, text| {
+            settings
+                .borrow_mut()
+                .record_hotkey_key(control, alt, shift, win, text.as_str());
+        });
+    }
+    // 数据
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_open_data_dir(move || {
+            settings.borrow_mut().open_data_dir();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_export(move || {
+            settings.borrow_mut().export_data();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_import(move || {
+            settings.borrow_mut().import_data();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_set_import_mode(move |index| {
+            let mode = import_mode_from_index(index);
+            // Re-plan the preview with the new mode.
+            let adapter = settings.borrow_mut();
+            let plan = {
+                let incoming = adapter.pending_import.clone();
+                let current = adapter.settings.document();
+                match (incoming, current) {
+                    (Some(incoming), Some(current)) => Some(
+                        filego::storage::import_export::plan_import(&current.data, &incoming, mode),
+                    ),
+                    _ => None,
+                }
+            };
+            drop(adapter);
+            let mut adapter = settings.borrow_mut();
+            if let Some(plan) = plan {
+                adapter.settings.push_import_preview(plan, mode);
+            }
+            adapter.sync_settings_ui();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_apply_import(move || {
+            settings.borrow_mut().apply_import();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_cancel_import(move || {
+            let mut adapter = settings.borrow_mut();
+            adapter.pending_import = None;
+            adapter.settings.handle(SCommand::DismissDataFlow);
+            adapter.sync_settings_ui();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_create_backup(move || {
+            settings.borrow_mut().create_backup();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_list_backups(move || {
+            settings.borrow_mut().list_backups();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_restore_backup(move |index| {
+            settings.borrow_mut().restore_backup(index);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_clear_recent(move || {
+            settings.borrow_mut().clear_recent();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_confirm_reset(move || {
+            settings.borrow_mut().reset_settings();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_confirm_clear_all(move || {
+            settings.borrow_mut().clear_all_records();
+        });
+    }
+    // M05-deferral 重命名 / 合并（row 索引 → 控制器命令）。
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_rename_category(move |index, name| {
+            let category_id = {
+                let s = settings.borrow();
+                s.manager
+                    .view()
+                    .categories
+                    .get(index as usize)
+                    .map(|c| c.id)
+            };
+            if let Some(category_id) = category_id {
+                settings
+                    .borrow_mut()
+                    .handle_settings(SCommand::RenameCategory(CategoryNameCommand {
+                        id: category_id,
+                        name: name.to_string(),
+                    }));
+            }
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_rename_tag(move |index, name| {
+            let tag_id = {
+                let s = settings.borrow();
+                s.manager.view().tags.get(index as usize).map(|t| t.id)
+            };
+            if let Some(tag_id) = tag_id {
+                settings
+                    .borrow_mut()
+                    .handle_settings(SCommand::RenameTag(TagNameCommand {
+                        id: tag_id,
+                        name: name.to_string(),
+                    }));
+            }
+            let repo = settings.borrow().manager_repo();
+            settings
+                .borrow()
+                .main
+                .borrow_mut()
+                .refresh_from_repository(&repo);
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_merge_tag(move |index, target_name| {
+            let source_id = {
+                let s = settings.borrow();
+                s.manager.view().tags.get(index as usize).map(|t| t.id)
+            };
+            if let Some(source_id) = source_id {
+                settings.borrow_mut().handle_settings(SCommand::MergeTag {
+                    source: source_id,
+                    target_name: target_name.to_string(),
+                });
+            }
+            let repo = settings.borrow().manager_repo();
+            settings
+                .borrow()
+                .main
+                .borrow_mut()
+                .refresh_from_repository(&repo);
+        });
+    }
+
+    // Push the initial settings view once. Initial page = 常规 (the settings
+    // controller's default; the nav handlers drive it from then on).
+    settings_window.set_page(0);
     settings_adapter.borrow_mut().sync_ui();
+    settings_adapter.borrow_mut().sync_settings_ui();
 
     // ---- M05: context-effect drain (search → settings) -----------------
     let context_drain = {
