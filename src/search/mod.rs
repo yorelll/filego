@@ -28,10 +28,14 @@ use crate::domain::settings::AppSettings;
 /// Run a deterministic search over `entries`.
 ///
 /// Every token must match at least one searchable field (multi-token AND);
-/// different tokens may match different fields. Scoring is tier-based and
-/// fully deterministic; a documented tie-break and truncation by
-/// `settings.max_results` are applied after full scoring so the limit never
-/// distorts ranking.
+/// different tokens may match different fields. For multi-token queries the
+/// result's tier is determined by the **weakest matched token** (the worst
+/// tier among the matched tokens), while every matched token still contributes
+/// its points — so a result whose second token only hits an editable field is
+/// ranked as that (weaker) tier, never promoted by the stronger token.
+/// Scoring is tier-based and fully deterministic; a documented tie-break and
+/// truncation by `settings.max_results` are applied after full scoring so the
+/// limit never distorts ranking.
 pub fn search(
     entries: &[SearchEntry],
     query: &Query,

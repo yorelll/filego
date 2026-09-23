@@ -12,7 +12,8 @@
 //! * `Subsequence` — ordered, non-contiguous characters on the case-folded key.
 //! * `EditDistance` — typo tolerance: Levenshtein within
 //!   `settings.max_edit_distance` of any word of the folded key (or of the
-//!   whole key).
+//!   whole key). See [`MAX_EDIT_DISTANCE_LEN`] for the length bound that keeps
+//!   the whole-key branch from running on path-length inputs.
 //!
 //! Every range is computed in **characters** of the ORIGINAL display string
 //! (never bytes); multi-char derived keys map back through each key's `origin`
@@ -26,6 +27,17 @@ use super::{
     scoring,
     search_entry::SearchField,
 };
+
+/// Upper bound (in chars) for the whole-key edit-distance branch.
+///
+/// The whole-key Levenshtein DP is O(|pattern| · |key|). Without a bound a
+/// pasted paragraph token against a MAX_PATH_LEN (32_767 char) path would cost
+/// ~10^9 cells per entry. 64 chars is far above any real typo tolerance window
+/// (a 2-edit misspelling of a ~20-char word), so skipping the whole-key branch
+/// for longer inputs does not change the return value for reachable typo
+/// tolerances — and keeps a single query bounded. This is the cheap M02-B
+/// guard; per-word edit distance on short words is unaffected.
+pub(crate) const MAX_EDIT_DISTANCE_LEN: usize = 64;
 
 /// The strategy that produced a hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,17 +184,28 @@ fn levenshtein(a: &str, b: &str) -> u64 {
 /// the useful "编辑距离容错" semantic for multi-word names: "driber" within 1
 /// of "driver", and a single-word key compares as a whole. `max` is capped by
 /// `AppSettings::MAX_EDIT_DISTANCE` (2) at the settings layer.
+///
+/// Both the whole-key branch and the per-word pass are bounded by
+/// [`MAX_EDIT_DISTANCE_LEN`]: any string longer than that (a path-length key,
+/// an unspaced 32k-char path chunk, or a pasted-paragraph token) never runs the
+/// O(len·len) DP. At `max ≤ 2` a distance match over a >64-char string is not
+/// a realistic typo, so this bound does not change reachable results while it
+/// keeps a single query bounded (M02-B guard; short-word tolerance is intact).
 fn edit_distance_match(pattern: &str, key_text: &str, max: u64) -> bool {
     if max == 0 {
         // At distance 0 the substring strategy already covers exact words; an
         // exact whole-key match is also covered by the Exact strategy.
         return false;
     }
-    if levenshtein(pattern, key_text) <= max {
+    if pattern.chars().count() <= MAX_EDIT_DISTANCE_LEN
+        && key_text.chars().count() <= MAX_EDIT_DISTANCE_LEN
+        && levenshtein(pattern, key_text) <= max
+    {
         return true;
     }
     key_text
         .split_whitespace()
+        .filter(|word| word.chars().count() <= MAX_EDIT_DISTANCE_LEN)
         .any(|word| levenshtein(pattern, word) <= max)
 }
 
@@ -352,7 +375,9 @@ pub(crate) fn best_hit_for_all_tokens(
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_distance_match, levenshtein, map_key_range, subsequence};
+    use super::{
+        MAX_EDIT_DISTANCE_LEN, edit_distance_match, levenshtein, map_key_range, subsequence,
+    };
     use crate::search::keys::MappedText;
 
     #[test]
@@ -411,5 +436,42 @@ mod tests {
         let key = MappedText::char_fold("abc");
         assert!(subsequence(&key, "ac").is_some());
         assert!(subsequence(&key, "ca").is_none());
+    }
+
+    #[test]
+    fn whole_key_edit_distance_is_bounded_by_length_guard() {
+        // A long unspaced whole key (e.g. a path) whose leading chunk still
+        // contains a reachable short word: the per-word pass matches it while
+        // the whole-key DP is skipped by the guard.
+        let long_path = format!("{}{}", "C:\\x".repeat(2000), " driver");
+        assert!(long_path.chars().count() > MAX_EDIT_DISTANCE_LEN);
+        assert!(
+            edit_distance_match("driber", &long_path, 1),
+            "short word inside a long key must still match"
+        );
+
+        // A long pattern that edit distance CANNOT fix (four edits away from the
+        // only close word) must not be claimed against a long key: the guard
+        // skips the whole-key DP for both long sides.
+        let long_token = format!("{}driver", "y".repeat(MAX_EDIT_DISTANCE_LEN + 1));
+        assert!(long_token.chars().count() > MAX_EDIT_DISTANCE_LEN);
+        assert!(
+            !edit_distance_match(&long_token, r"C:\another\zzz", 2),
+            "long token vs long key must not run an unbounded whole-key DP"
+        );
+
+        // The guard does not weaken normal short-string typo tolerance.
+        assert!(
+            edit_distance_match("driber", "usb driver", 1),
+            "short-key typo tolerance must be unchanged"
+        );
+        // A long unspaced key (single "word" over the bound) is skipped entirely
+        // — matching cannot be claimed where the whole-key DP would have been the
+        // only path.
+        let long_word = "y".repeat(MAX_EDIT_DISTANCE_LEN + 1);
+        assert!(
+            !edit_distance_match(&long_word, &long_word, 2),
+            "long unspaced key must be guarded (no unbounded DP)"
+        );
     }
 }

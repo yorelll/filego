@@ -228,17 +228,54 @@ fn origin_order(field: SearchField) -> u64 {
 /// descending → entry id ascending. `manual_weight` here is the final
 /// within-tier discriminator and cannot cross a tier.
 pub(crate) fn tiebreak(left: &SearchEntry, right: &SearchEntry) -> std::cmp::Ordering {
-    left.manual_weight
-        .cmp(&right.manual_weight)
+    right
+        .manual_weight
+        .cmp(&left.manual_weight)
         .then_with(|| right.pinned.cmp(&left.pinned))
-        .then_with(|| left.open_count.cmp(&right.open_count))
+        .then_with(|| right.open_count.cmp(&left.open_count))
         .then_with(|| left.id.as_uuid().cmp(&right.id.as_uuid()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Tier, candidate_rank, manual_weight_bias, tier_of, weights};
-    use crate::search::{matching::MatchStrategy, search_entry::SearchField};
+    use super::{Tier, candidate_rank, manual_weight_bias, tiebreak, tier_of, weights};
+    use crate::domain::ids::FolderId;
+    use crate::search::{
+        matching::MatchStrategy, search_entry::SearchEntry, search_entry::SearchField,
+    };
+    use std::cmp::Ordering;
+    use uuid::Uuid;
+
+    /// Entry with a single difference from a pair of canonical same-score
+    /// entries: `id` = 100 + `offset`, everything else zeroed.
+    fn entry(offset: u128) -> SearchEntry {
+        SearchEntry {
+            id: FolderId::from_uuid(Uuid::from_u128(100 + offset)),
+            display_name: "same".to_owned(),
+            aliases: Vec::new(),
+            path: "C:\\same".to_owned(),
+            category_name: None,
+            tag_names: Vec::new(),
+            note: String::new(),
+            pinned: false,
+            favorite: false,
+            manual_weight: 0,
+            open_count: 0,
+            last_opened_at: None,
+        }
+    }
+
+    /// Differs from the canonical entry by the given `manual_weight`.
+    fn weighted(offset: u128, manual_weight: i16) -> SearchEntry {
+        let mut e = entry(offset);
+        e.manual_weight = manual_weight;
+        e
+    }
+
+    /// Asserts the full documented tie-break order between two entries.
+    fn assert_order(left: &SearchEntry, right: &SearchEntry, expect: Ordering) {
+        assert_eq!(tiebreak(left, right), expect);
+    }
 
     #[test]
     fn tier_rules_match_required_weight_order() {
@@ -346,5 +383,54 @@ mod tests {
         assert!(pinyin < path);
         assert!(path < subsequence);
         assert!(subsequence < edited);
+    }
+
+    #[test]
+    fn tiebreak_sorts_manual_weight_descending_then_pinned() {
+        // manual_weight descending: higher weight first.
+        assert_order(&weighted(1, 100), &weighted(2, 0), Ordering::Less);
+        assert_order(&weighted(1, -100), &weighted(2, 0), Ordering::Greater);
+        // Equal weight falls through to pinned: pinned (true) first.
+        let mut pinned_left = entry(1);
+        pinned_left.pinned = true;
+        let mut pinned_right = entry(2);
+        pinned_right.pinned = true;
+        assert_order(&pinned_left, &entry(2), Ordering::Less);
+        assert_order(&entry(1), &pinned_right, Ordering::Greater);
+    }
+
+    #[test]
+    fn tiebreak_sorts_open_count_descending_then_id_ascending() {
+        // open_count descending: higher count first.
+        let mut open_a = entry(1);
+        open_a.open_count = 100;
+        let mut open_b = entry(2);
+        open_b.open_count = 0;
+        assert_order(&open_a, &open_b, Ordering::Less);
+        assert_order(&open_b, &open_a, Ordering::Greater);
+        // Equal counts fall through to entry id ascending: lower id first.
+        assert_order(&entry(1), &entry(2), Ordering::Less);
+        assert_order(&entry(2), &entry(1), Ordering::Greater);
+    }
+
+    #[test]
+    fn tiebreak_order_is_total_and_consistent() {
+        // The full documented order: manual_weight desc → pinned first →
+        // open_count desc → id ascending, exercised in one comparison chain.
+        let mut most_used = entry(1);
+        most_used.open_count = 10;
+        let mut pinned_star = entry(2);
+        pinned_star.pinned = true;
+        let mut heavy = entry(3);
+        heavy.manual_weight = 100;
+        // heavy (weight) < pinned_star (pinned, then id) < most_used (open_count,
+        // then id) < entry(4).
+        assert_order(&heavy, &pinned_star, Ordering::Less);
+        assert_order(&pinned_star, &most_used, Ordering::Less);
+        assert_order(&most_used, &entry(4), Ordering::Less);
+        // And antisymmetric: pair flipped gives the mirrored result.
+        assert_order(&pinned_star, &heavy, Ordering::Greater);
+        assert_order(&most_used, &pinned_star, Ordering::Greater);
+        assert_order(&entry(4), &most_used, Ordering::Greater);
     }
 }

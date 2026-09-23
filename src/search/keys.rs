@@ -19,6 +19,14 @@
 //! pinyin keys from names and aliases"). Path/category/tag/note participate
 //! with direct text strategies through their folded keys. Derived keys are
 //! computed per search and are never persisted.
+//!
+//! Pinyin uses the **first reading** of each character (`pinyin 0.11.0`,
+//! `plain` feature, no `heteronym` table): multi-reading characters such as
+//! 「乐」 always map to one fixed reading (deterministic for scoring), and
+//! retroflex initials take only the first letter (`zh` → `z`). This is a
+//! known product limitation — a name/path pinyin-searched under a non-first
+//! reading may not match — and is recorded as a manual-acceptance item (M02-B
+//! may optionally enable `heteronym`).
 
 use pinyin::ToPinyin;
 

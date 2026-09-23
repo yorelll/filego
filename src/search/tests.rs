@@ -476,35 +476,90 @@ fn pinned_boost_does_not_jump_tier() {
 #[test]
 fn manual_weight_does_not_overpower_name_exact() {
     let settings = default_settings();
-    // A heavily positively-weighted entry whose only hit is the name-exact,
-    // versus a heavily negatively-weighted entry with the same name-exact.
-    // manual_weight is only a within-tier tie-break; it must not reorder
-    // different tiers, but here both are name-exact so the weight decides.
-    let unweighted = make_entry(1, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
-    let weighted = make_entry(2, "USB Driver2", &[], r"C:\USB Driver2", None, &[], "");
-    let _ = (unweighted, weighted);
-
-    // The real contract: a strong alias match must never beat a name-exact hit.
-    let alias_boosted = make_entry(3, "Zeta", &["USB Driver"], r"C:\Zeta", None, &[], "");
-    alias_boosted_manual_weight(&settings, &alias_boosted);
-}
-
-fn alias_boosted_manual_weight(settings: &AppSettings, alias_entry: &SearchEntry) {
-    let mut boosted = alias_entry.clone();
+    // The real contract: a strong (pinned + max weight) alias match must never
+    // beat a name-exact hit — a different-tier relationship, decided by the
+    // tier before any tie-break runs.
+    let alias_boosted = make_entry(1, "Zeta", &["USB Driver"], r"C:\Zeta", None, &[], "");
+    let mut boosted = alias_boosted.clone();
     boosted.pinned = true;
     boosted.manual_weight = 100;
-    let name_exact = make_entry(4, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
+    let name_exact = make_entry(2, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
     let results = run(
         &[&boosted, &name_exact],
         "usb driver",
-        settings,
+        &settings,
         &HighlightOptions::default(),
     );
     assert_eq!(
         ids(&results),
-        vec![4, 3],
+        vec![2, 1],
         "a pinned + max-weight alias hit must not beat a name-exact hit"
     );
+}
+
+#[test]
+fn manual_weight_is_a_bounded_within_tier_tie_break() {
+    // manual_weight is a within-tier bonus, never a cross-tier mover: two
+    // same-name-exact entries with different weights rank by weight descending
+    // via the bonus bits of total_score (the cross-tier "alias can't beat
+    // name-exact" half of the contract is covered by
+    // `manual_weight_does_not_overpower_name_exact` above). Their total_scores
+    // differ, so `tiebreak` is NOT the decider here; the equal-score tiebreak
+    // paths (open_count / id) are covered separately in
+    // `same_score_tie_break_uses_open_count_then_id`, and the pure `tiebreak`
+    // manual_weight/pinned branches are covered by the scoring unit tests.
+    let settings = default_settings();
+    let mut heavy = make_entry(1, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
+    heavy.manual_weight = 100;
+    let mut light = make_entry(2, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
+    light.manual_weight = -100;
+    let results = run(
+        &[&light, &heavy],
+        "usb driver",
+        &settings,
+        &HighlightOptions::default(),
+    );
+    assert_eq!(
+        ids(&results),
+        vec![1, 2],
+        "higher manual_weight must rank first"
+    );
+    assert!(
+        results[0].total_score > results[1].total_score,
+        "weight difference must surface as a total_score difference (bonus bits)"
+    );
+}
+
+#[test]
+fn same_score_tie_break_uses_open_count_then_id() {
+    // All entries match the name exactly AND share manual_weight/pinned, so
+    // tier (Name exact), points (7 × 1 token) and bonus are identical →
+    // total_score is exactly equal and `tiebreak` alone decides the order.
+    // open_count and id are the only tiebreak keys NOT packed into the score,
+    // so they are the tiebreak branches verifiable end-to-end (this is the
+    // branch F001 had reversed: open_count must sort DESCENDING — most used
+    // first).
+    let settings = default_settings();
+    let mut used_high = make_entry(3, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
+    used_high.open_count = 100;
+    let mut used_low = make_entry(4, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
+    used_low.open_count = 1;
+    let plain = make_entry(5, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
+    let mut used_mid = make_entry(2, "USB Driver", &[], r"C:\USB Driver", None, &[], "");
+    used_mid.open_count = 50;
+
+    let results = run(
+        &[&plain, &used_low, &used_high, &used_mid],
+        "usb driver",
+        &settings,
+        &HighlightOptions::default(),
+    );
+    // Equal total_score proves the tie-break — not the score — decided the rank.
+    for pair in results.windows(2) {
+        assert_eq!(pair[0].total_score, pair[1].total_score);
+    }
+    // open_count desc (100 > 50 > 1 > 0), then entry id ascending.
+    assert_eq!(ids(&results), vec![3, 2, 4, 5]);
 }
 
 // ---------------------------------------------------------------------------
