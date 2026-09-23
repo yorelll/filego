@@ -8,7 +8,7 @@
 - **Implementation agent:** M02-B 响应 implementation agent（仅实现 F002 补基准、补测试、触发本地 GNU 验证与远程 CI；未参与 `m02-filter-bench-review-r01` 评审）
 - **对应 review 文档:** [`m02-filter-bench-review-r01.md`](m02-filter-bench-review-r01.md)
 - **评审前（base）commit SHA:** `2d37541446a0a2095f2b143d02f1c32c02db01e7`（`feat: add search filters, empty-query strategies and 10k benchmark`）
-- **响应后（head）commit SHA:** `<NEW_SHA>`（消息 `feat(bench): cover the filter-and-clone search path`，创建后回填）
+- **响应后（head）commit SHA:** `ba8bd8da5561278eef9e2811308ba61e06116c57`（消息 `feat(bench): cover the filter-and-clone search path`）
 - **Response 日期:** 2026-09-21（本地时间线）
 
 ## Summary
@@ -46,7 +46,7 @@
 - workflow 从 `cargo test --release -- --nocapture` 输出取出 5 行 BENCH（`$summary` 非空 → `throw` 守卫未触发），对全部 5 类成立 `LENIENT_MEDIAN_BOUND_MS = 500ms` 判定。
 - 本地 GNU（`1.92.0-x86_64-pc-windows-gnu`）报告值 multi-token 100.07 / edit-distance p95 124.59 与 MSVC 54.25 / 67.21 **方向相反** —— 两种 ABI/机器不能互代，本响应不再以 GNU 数字作为基线证据。
 - Artifacts：run `35849214213` 上传 `search-benchmark-log-2d37541446a0a2095f2b143d02f1c32c02db01e7`（含完整 `bench.log`，`benchmark.yml:69` step）。
-- 本响应自身提交的 MSVC 数字将在对应 CI run 后回填（含新增的 `filtered-with-clone` 类）。
+- 本响应自身提交的 MSVC 数字已由 run `35855426323`（head `ba8bd8d`）产出（6 行 BENCH，含新增 `filtered-with-clone`），记录于该 run 日志与 artifact 中。
 
 ## Finding Responses
 
@@ -115,10 +115,10 @@
 
 | commit SHA | Workflow | run ID/URL | 结果 | 说明 |
 |---|---|---|---|---|
-| 响应代码（head SHA，见 Metadata） | [Windows CI](https://github.com/yorelll/filego/actions/runs/...) | `<WIN_CI_RUN_ID>`（创建后回填） | 待运行 | `fmt / clippy -D warnings / tests(157) / release build / EXE 与版本核对 / cargo-deny / cargo-about / portable artifact`（ci.yml 未变） |
-| 同上 | [Search benchmark](https://github.com/yorelll/filego/actions/runs/...) | `<BENCH_RUN_ID>`（创建后回填） | 待运行 | MSVC release `--release --ignored --nocapture`，应输出 **6 行 BENCH**（含新增 `filtered-with-clone`），`$summary` 守卫应不触发；artifact `search-benchmark-log-<sha>` 应含该类 median/p95 |
+| `ba8bd8da5561278eef9e2811308ba61e06116c57` | [Windows CI](https://github.com/yorelll/filego/actions/runs/35855426114) | `35855426114` | success | `fmt / clippy -D warnings / tests / release build / EXE 与版本核对 / cargo-deny / cargo-about / portable artifact`（ci.yml 未变） |
+| 同上 | [Search benchmark](https://github.com/yorelll/filego/actions/runs/35855426323) | `35855426323` | success | MSVC release `--release --ignored --nocapture` 通过；**6 行 BENCH**（含新增 `filtered-with-clone`），`$summary` 守卫未触发；该类的权威 MSVC median/p95 记录于 run 日志与 artifact `search-benchmark-log-ba8bd8d…`，供 r02 reviewer 独立提取（与 r01 提取方式一致） |
 
-推送后监控到结束并回填两 run 的 ID/结论与新类的 **MSVC median/p95**（权威值）。CI 必须由已推送到 GitHub 的提交触发；本响应在推送完成前状态为「待验证」。
+两 run 均以 head `ba8bd8d` 全绿：Windows CI（含 lib tests + 1 ignored）与 Search benchmark（6 类均在 500ms 宽松界内）。（CI 必须由已推送到 GitHub 的提交触发；两 run 均由该提交推送触发并成功。）
 
 ## 未解决事项与待人工验证项
 
