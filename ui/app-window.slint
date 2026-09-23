@@ -85,6 +85,7 @@ component ResultRow inherits Rectangle {
     in property <int> row-index;
     in property <string> row-name;
     in property <string> row-path;
+    in property <string> row-full-path;
     in property <string> row-category;
     in property <string> row-tags;
     in property <bool> row-inaccessible;
@@ -152,7 +153,8 @@ component ResultRow inherits Rectangle {
             }
         }
 
-        // line 2: path · category · tag with ellipsis and full-path tooltip.
+        // line 2: path label · category · tag with ellipsis; the Tooltip shows
+        // the full path (F002), not the elided label.
         Text {
             text: row-path + (!row-category.is-empty ? " · " + row-category : "")
                    + (!row-tags.is-empty ? " · " + row-tags : "");
@@ -163,7 +165,7 @@ component ResultRow inherits Rectangle {
             vertical-stretch: 1;
             Tooltip {
                 Text {
-                    text: row-path;
+                    text: row-full-path.is-empty ? row-path : row-full-path;
                 }
             }
         }
@@ -197,6 +199,7 @@ export component AppWindow inherits Window {
     in-out property <int> rows-count: 0;
     in-out property <[string]> rows-name: [];
     in-out property <[string]> rows-path: [];
+    in-out property <[string]> rows-full-path: [];
     in-out property <[string]> rows-category: [];
     in-out property <[string]> rows-tags: [];
     in-out property <[bool]> rows-inaccessible: [];
@@ -361,6 +364,7 @@ export component AppWindow inherits Window {
                             row-index: i;
                             row-name: root.rows-name[i];
                             row-path: root.rows-path[i];
+                            row-full-path: root.rows-full-path[i];
                             row-category: root.rows-category[i];
                             row-tags: root.rows-tags[i];
                             row-inaccessible: root.rows-inaccessible[i];

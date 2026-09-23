@@ -146,11 +146,20 @@ impl MainWindowController {
         window.set_ime_composing(state.ime_composition_active);
 
         let rows = state.rows.clone();
-        window.set_rows_count(rows.len() as i32);
+        let row_count = rows.len();
+        window.set_rows_count(row_count as i32);
         window.set_rows_name(string_model(
             rows.iter().map(|row| row.display_name.clone()),
         ));
         window.set_rows_path(string_model(rows.iter().map(|row| row.path_label.clone())));
+        // F002: the full path is carried on each row for the tooltip / Copy-Path
+        // only; the visible row line-2 keeps the short label.
+        window.set_rows_full_path(string_model(rows.iter().map(|row| row.full_path.clone())));
+        // F001: re-derive the results-count label from the actual rows on every
+        // push (never a constant), so the rendered count matches the results.
+        window
+            .global::<UiStrings>()
+            .set_count(results_count_label(&rows, state.locale));
         window.set_rows_category(string_model(
             rows.iter()
                 .map(|row| row.category_name.clone().unwrap_or_default()),
@@ -197,6 +206,18 @@ fn string_model(values: impl Iterator<Item = String>) -> ModelRc<slint::SharedSt
     ModelRc::new(VecModel::from(
         values.map(slint::SharedString::from).collect::<Vec<_>>(),
     ))
+}
+
+/// The results-count label for the current rows, through the i18n catalog.
+/// F001 fix: the count is derived from `rows.len()` on every `sync_ui`, never a
+/// constant, so the window never renders a stale "0 results".
+fn results_count_label(
+    rows: &[filego::presentation::state::ResultRow],
+    locale: filego::presentation::i18n::Locale,
+) -> slint::SharedString {
+    filego::presentation::i18n::Msg::ResultsCount(u16::try_from(rows.len()).unwrap_or(u16::MAX))
+        .tr(locale)
+        .into()
 }
 
 fn demo_entry(id: u128, name: &str, path: &str, pinned: bool) -> filego::search::SearchEntry {
@@ -309,11 +330,11 @@ fn apply_localization_and_theme(window: &AppWindow, locale: filego::presentation
             .tr(locale)
             .into(),
     );
-    strings.set_count(
-        filego::presentation::i18n::Msg::ResultsCount(0)
-            .tr(locale)
-            .into(),
-    );
+    // NOTE(F001): the results-count label is NOT set here — it is re-derived
+    // from `ViewState::rows` on every `sync_ui` push (see
+    // `results_count_label`), so the rendered count always matches the rows.
+    // Setting it once with a constant (the old `ResultsCount(0)`) made the
+    // label stay "0 个结果" forever.
     strings.set_inaccessible(
         filego::presentation::i18n::Msg::Inaccessible
             .tr(locale)
@@ -529,5 +550,38 @@ mod tests {
             color_from_hex("#005FB8"),
             slint::Color::from_rgb_u8(0, 0x5F, 0xB8)
         );
+    }
+
+    #[test]
+    fn results_count_label_is_derived_from_the_row_count() {
+        // F001: the count label must reflect the actual rows, never a hardcoded
+        // 0. Both locales format the number into the {count} placeholder.
+        let locale = filego::presentation::i18n::Locale::ZhCN;
+        assert!(results_count_label(&[], locale).contains('0'));
+
+        let rows = vec![
+            filego::presentation::state::ResultRow {
+                entry_id: uuid::Uuid::from_u128(1),
+                display_name: "Documents".to_owned(),
+                path_label: "Documents".to_owned(),
+                full_path: r"C:\Users\me\Documents".to_owned(),
+                category_name: None,
+                tag_texts: Vec::new(),
+                inaccessible: false,
+            },
+            filego::presentation::state::ResultRow {
+                entry_id: uuid::Uuid::from_u128(2),
+                display_name: "Photos".to_owned(),
+                path_label: "Photos".to_owned(),
+                full_path: r"C:\Users\me\Pictures".to_owned(),
+                category_name: None,
+                tag_texts: Vec::new(),
+                inaccessible: false,
+            },
+        ];
+        let zh = results_count_label(&rows, filego::presentation::i18n::Locale::ZhCN).to_string();
+        let en = results_count_label(&rows, filego::presentation::i18n::Locale::EnUS).to_string();
+        assert_eq!(zh, "2 个结果");
+        assert_eq!(en, "2 results");
     }
 }
