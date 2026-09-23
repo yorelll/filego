@@ -7,7 +7,7 @@
 - **实现 agent**: M05 实现轮（对应 review `m05-management-review-r01.md`）
 - **被回应的 review**: `review/0-0-1/m05-management-review-r01.md`（verdict: CHANGES_REQUESTED）
 - **评审 commit**: `49dbb77`（即 M05 实现提交）
-- **修复后 commit**: `XXXXXXX`（本 response 关闭后的新提交，见文末）
+- **修复后 commit**: `bb8d0c7`（`fix: close M05 review C1/H1/H2/H3/H4 and M1/M2/M4`）
 - **本 agent 声明**: 本 agent 为 implementation agent，**未参与** 该轮 review 的撰写与批准；仅针对 reviewer 的 findings 逐条修改与回应。
 
 ---
@@ -267,13 +267,16 @@ Review 说明项：`remove_file` 仅限 storage/io.rs 的语义与 guard 措辞�
 
 GNU 通过仅为快速反馈；**发布/权威验证以 MSVC CI 为准**（见下）。
 
-## 5. CI 证据（MSVC 门禁 —— 待推送后补充）
+## 5. CI 证据（MSVC 门禁 —— 推送后触发中）
 
-当前提交尚未推送（implementation agent 需推送授权后触发 CI）。推送后补充：
+已推送提交 `bb8d0c7` 后 GitHub Actions 自动触发（见下方 run；推送时 run 为 in_progress，按流程不驻留等待，完成后由主 agent 复核日志并确认结论）：
 
-- run ID / URL：
-- head SHA：
-- 关键 job（fmt / clippy / test / release / EXE 打包 / third-party licenses）结论：
+| Workflow | Run ID / URL | Head | 状态 |
+|---|---|---|---|
+| Windows CI | `35921184606`（https://github.com/yorelll/filego/actions/runs/35921184606 ） | `bb8d0c7` | in_progress（fmt / clippy / test / release / EXE 打包 / third-party licenses） |
+| Search benchmark | `35921184624`（https://github.com/yorelll/filego/actions/runs/35921184624 ） | `bb8d0c7` | in_progress |
+
+GNU 快速验证仅作开发反馈；发布以上述 MSVC CI 为准。
 
 ## 6. 请求复审
 
