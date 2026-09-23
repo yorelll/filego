@@ -97,7 +97,7 @@
 
 | commit SHA | Workflow | run ID/URL | 结果 | 说明 |
 |---|---|---|---|---|
-| 修复代码 `eaba66d` + response 文档 `c0de7e5`..`42b7596`（仅文档，构建输入与 head 相同） | [Windows CI](https://github.com/yorelll/filego/actions/runs/35820539585) | `35820539585` | `进行中`（head `42b7596`，含全部修复代码与文档） | 早期 run（`35820240269`/`35820401923`/`35820488883`）因文档-only 推送被取消；最终 head `42b7596` 的 run 为权威 MSVC 依据，构建输入与修复代码 head `eaba66d` 相同。GNU 全绿仅证明本地快速反馈；MSVC 门禁结论以该 run 为准，监控至结束并回填（CLAUDE.md §3.2/§3.4）。 |
+| 修复代码 `eaba66d` + response 文档 `c0de7e5`..`2142c99`（仅文档，构建输入与 head 相同） | [Windows CI](https://github.com/yorelll/filego/actions/runs/35820614489) | `35820614489` | `进行中`（head `2142c99`，含全部修复代码与文档） | 早期 run（`35820240269`/`35820401923`/`35820488883`/`35820539585`）因文档-only 推送被取消；权威 MSVC 依据为最终推送 head `2142c99` 的 run，构建输入与修复代码 head `eaba66d` 相同。GNU 全绿仅证明本地快速反馈；MSVC 门禁结论以该 run 为准，监控至结束并回填（CLAUDE.md §3.2/§3.4）。 |
 
 ## 未解决事项与待人工验证项
 
