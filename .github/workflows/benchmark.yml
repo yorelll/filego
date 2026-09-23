@@ -1,0 +1,72 @@
+name: Search benchmark
+
+# Release-mode 10k search benchmark (M02.5).
+#
+# This workflow ONLY ADDS to the existing MSVC gates in ci.yml: it does not
+# replace or weaken them. It builds the MSVC release test binary, runs the
+# `#[ignore]`d wall-time benchmark explicitly, and uploads a compact summary
+# artifact. All gates here enforce the same lenient median bound that the
+# ignored test asserts (500ms median) so hosted-runner noise does not create a
+# false regression, while the per-query median/p95 lines are logged for human
+# review of actual headroom against the 50ms product target.
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+      - "fix/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  benchmark:
+    name: release 10k benchmark
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable action commit
+        with:
+          toolchain: 1.92.0
+          targets: x86_64-pc-windows-msvc
+
+      - name: Require checked-in Cargo.lock
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "Cargo.lock" -PathType Leaf)) { throw "Cargo.lock is required" }
+          cargo metadata --frozen --format-version 1 --no-deps > $null
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          shared-key: benchmark-windows-x86_64-msvc
+          cache-on-failure: false
+
+      - name: Run release-mode 10k search benchmark
+        shell: pwsh
+        run: |
+          cargo test --release --workspace --all-features --locked --target x86_64-pc-windows-msvc `
+            search::benchmark::tests::ten_k_release_benchmark_stays_under_lenient_bound `
+            -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath "bench.log"
+          $summary = Select-String -Path "bench.log" -Pattern "BENCH "
+          if ($null -eq $summary) { throw "No BENCH lines found in benchmark output" }
+          $summary | ForEach-Object { Write-Output $_.Line }
+
+      - name: Upload benchmark summary log
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: search-benchmark-log-${{ github.sha }}
+          path: bench.log
+          if-no-files-found: error
+          retention-days: 30

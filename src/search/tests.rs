@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use crate::{
     domain::{ids::FolderId, settings::AppSettings},
-    search::{HighlightOptions, QueryParser, RankedResult, SearchEntry, SearchField},
+    search::{
+        Accessibility, HighlightOptions, Origin, QueryParser, RankedResult, SearchEntry,
+        SearchField,
+    },
 };
 
 fn utc(value: &str) -> DateTime<Utc> {
@@ -35,6 +38,8 @@ fn make_entry(
         manual_weight: 0,
         open_count: 0,
         last_opened_at: Some(utc("2026-09-21T00:00:00Z")),
+        accessibility: Accessibility::Unknown,
+        origin: Origin::Unknown,
     }
 }
 

@@ -241,7 +241,10 @@ mod tests {
     use super::{Tier, candidate_rank, manual_weight_bias, tiebreak, tier_of, weights};
     use crate::domain::ids::FolderId;
     use crate::search::{
-        matching::MatchStrategy, search_entry::SearchEntry, search_entry::SearchField,
+        filter::{Accessibility, Origin},
+        matching::MatchStrategy,
+        search_entry::SearchEntry,
+        search_entry::SearchField,
     };
     use std::cmp::Ordering;
     use uuid::Uuid;
@@ -262,6 +265,8 @@ mod tests {
             manual_weight: 0,
             open_count: 0,
             last_opened_at: None,
+            accessibility: Accessibility::Unknown,
+            origin: Origin::Unknown,
         }
     }
 

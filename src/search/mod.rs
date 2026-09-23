@@ -11,12 +11,24 @@
 //! (favorites/pinned/recent), the filter matrix and the 10k release benchmark
 //! are later slices and intentionally absent.
 
+#[cfg(test)]
+mod benchmark;
 mod highlight;
 pub mod keys;
 mod matching;
 mod query;
 mod scoring;
 mod search_entry;
+
+pub mod empty_query;
+pub mod filter;
+mod generation;
+pub use empty_query::{
+    EmptyQueryResult, EmptyQueryStrategy, NoResultReason, SearchDisplay, SearchResponse,
+    empty_query, empty_query_indices, search_with_filter,
+};
+pub use filter::{Accessibility, FilterSet, Origin};
+pub use generation::QueryGeneration;
 
 pub use highlight::{HighlightOptions, HighlightRange};
 pub use query::{Query, QueryParser, Token, TokenKind};

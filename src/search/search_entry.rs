@@ -3,6 +3,7 @@
 use crate::domain::{ids::FolderId, settings::AppSettings};
 
 use super::{
+    filter::{Accessibility, Origin},
     highlight::HighlightRange,
     keys::{DerivedKeys, FieldKeys},
 };
@@ -50,7 +51,10 @@ impl SearchScore {
 
 /// Searchable view of one folder record. M02-A consumes this; the caller (a
 /// future presenter) builds it from `domain::document::AppData`.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` supports fixture-determinism tests and cheap diffing in tests;
+/// it is not part of ranking.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchEntry {
     pub id: FolderId,
     pub display_name: String,
@@ -64,6 +68,12 @@ pub struct SearchEntry {
     pub manual_weight: i16,
     pub open_count: u64,
     pub last_opened_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Path accessibility state supplied by the presenter (filter input;
+    /// never probed by the search core). See [`Accessibility`].
+    pub accessibility: Accessibility,
+    /// Volume origin supplied by the presenter (filter input). See
+    /// [`Origin`].
+    pub origin: Origin,
 }
 
 impl SearchEntry {

@@ -13,8 +13,8 @@ use crate::{
         },
         ids::{CategoryId, FolderId, TagId},
         settings::{
-            AppSettings, MAX_EDIT_DISTANCE, MAX_MAX_RESULTS, MAX_WINDOW_WIDTH, MIN_MAX_RESULTS,
-            MIN_WINDOW_WIDTH, ThemePreference,
+            AppSettings, EmptyQueryStrategy, MAX_EDIT_DISTANCE, MAX_MAX_RESULTS, MAX_WINDOW_WIDTH,
+            MIN_MAX_RESULTS, MIN_WINDOW_WIDTH, ThemePreference,
         },
     },
     storage::{
@@ -98,7 +98,84 @@ fn settings_defaults_match_product_baseline() {
     assert!(settings.clear_after_open);
     assert!(settings.hide_on_focus_loss);
     assert!(!settings.launch_at_login);
+    assert_eq!(
+        settings.empty_query_strategy,
+        EmptyQueryStrategy::FavoritesFirst
+    );
+    assert!(!settings.remember_last_filter);
     assert!(settings.validate().is_ok());
+}
+
+#[test]
+fn settings_forward_compat_new_fields_default_when_absent() {
+    // schema-v1 JSON WITHOUT the M02-B fields must still decode: the fields
+    // carry #[serde(default)] so old documents keep appending defaultValue.
+    let raw = r#"{
+        "schema_version": 1,
+        "revision": 1,
+        "settings": {
+            "theme": "system",
+            "max_results": 8,
+            "window_width": 600,
+            "search_paths": true,
+            "search_categories": true,
+            "search_tags": true,
+            "search_notes": false,
+            "fuzzy_matching": true,
+            "search_pinyin": true,
+            "search_english_initials": true,
+            "max_edit_distance": 1,
+            "hide_after_open": true,
+            "clear_after_open": true,
+            "hide_on_focus_loss": true,
+            "launch_at_login": false
+        },
+        "folders": [],
+        "categories": [],
+        "tags": []
+    }"#;
+    let decoded = decode(raw.as_bytes()).expect("old settings without new fields must decode");
+    assert_eq!(
+        decoded.data.settings.empty_query_strategy,
+        EmptyQueryStrategy::FavoritesFirst
+    );
+    assert!(!decoded.data.settings.remember_last_filter);
+}
+
+#[test]
+fn settings_forward_compat_new_fields_decode_when_present() {
+    let raw = r#"{
+        "schema_version": 1,
+        "revision": 1,
+        "settings": {
+            "theme": "dark",
+            "max_results": 12,
+            "window_width": 680,
+            "search_paths": true,
+            "search_categories": true,
+            "search_tags": true,
+            "search_notes": false,
+            "fuzzy_matching": true,
+            "search_pinyin": true,
+            "search_english_initials": true,
+            "max_edit_distance": 1,
+            "hide_after_open": true,
+            "clear_after_open": true,
+            "hide_on_focus_loss": true,
+            "launch_at_login": false,
+            "empty_query_strategy": "pinned_only",
+            "remember_last_filter": true
+        },
+        "folders": [],
+        "categories": [],
+        "tags": []
+    }"#;
+    let decoded = decode(raw.as_bytes()).expect("settings with new fields must decode");
+    assert_eq!(
+        decoded.data.settings.empty_query_strategy,
+        EmptyQueryStrategy::PinnedOnly
+    );
+    assert!(decoded.data.settings.remember_last_filter);
 }
 
 #[test]
