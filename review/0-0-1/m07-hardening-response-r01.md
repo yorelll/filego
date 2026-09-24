@@ -38,7 +38,7 @@ M-3 由本 response 文档落盘闭环。
 | MSVC benchmark run（head `367bb8c`） | **Search benchmark `35950631427`**（release 10k bench）→ **success** |
 | 远程测试计数（run `35950631364` 日志直接提取） | `393 passed; 0 failed; 1 ignored`（lib）+ `4 passed`（bin） |
 | head `367bb8c` 的 BENCH 行（run `35950631427`） | empty-query median=0.44ms；filtered-with-clone 35.49ms；pinyin 38.90ms；english-initials 33.02ms；edit-distance 37.34ms；multi-token 29.69ms（全部远低于宽松 500ms 门禁） |
-| 修复 head CI | （`.github/**` 零改动 + 仅代码/文档 diff，见 I-5/备注；推送到 GitHub 后由本 response 记录的 run ID 确认） |
+| 修复 head CI（fix head `e3e86a5`/docs head `596472f`） | **Windows CI `35958301326`** + **Search benchmark `35958301284`**（head `596472f`，推送后由本 response 记录的 run ID 确认；`.github/**` 零改动，见 I-5/备注） |
 | 备注 | 本机 GNU 会话沿用既往 workaround：`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C linker=D:\mingw64\bin\x86_64-w64-mingw32-gcc.exe"` + `D:\mingw64\bin` PATH（`shlwapi`/windres drift），与既往会话一致，本轮无新增 |
 
 ## Findings 逐条回应
