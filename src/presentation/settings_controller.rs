@@ -96,6 +96,11 @@ pub enum SNotice {
     // M06 review M3: an overwrite import was refused because a path would be
     // duplicated (all-or-nothing; nothing was mutated).
     ImportDuplicatePath,
+    // M07.5: an import file exceeded the size or record limits (no mutation).
+    ImportTooLarge,
+    // M07.1: the data file could not be read at startup. The recovery actions
+    // on the Data page stay reachable; the original file is preserved.
+    DataUnreadable,
     BackupsNone,
     BackupCreated,
     BackupRestoreFailed,
@@ -1237,6 +1242,42 @@ mod tests {
             "rolled back to true"
         );
         assert_eq!(controller.view().notice, Some(SNotice::SaveFailed));
+    }
+
+    #[test]
+    fn rapid_toggling_persists_every_command_no_lost_update() {
+        // M07.2: fast consecutive settings toggles (what a user tapping a
+        // switch rapidly, or a burst right before exit, produces) must not lose
+        // any command. Commands are synchronous on the UI thread and each
+        // persists through the store, so the FINAL persisted document reflects
+        // the LAST value of every setting toggled in the burst.
+        let store = MemStore::seed();
+        let mut controller = SettingsController::new(store.clone());
+        // A burst of alternating toggles across several settings.
+        for i in 0..40usize {
+            let on = i % 3 == 0;
+            controller.handle(SCommand::SetSearchNotes(on));
+            controller.handle(SCommand::SetSearchPaths(!on));
+            controller.handle(SCommand::SetHighlightResults(on));
+            controller.handle(SCommand::SetSilentStart(!on));
+        }
+        // The last iteration is i=39 → on = (39 % 3 == 0) = true → notes=true,
+        // paths=false, highlight=true, silent=false.
+        let settings = &controller.view().settings;
+        assert!(settings.search_notes);
+        assert!(!settings.search_paths);
+        assert!(settings.highlight_results);
+        assert!(!settings.silent_start);
+        // No failure surfaced during the burst, and a reload from the same
+        // shared store sees exactly those final values (nothing lost).
+        assert_ne!(controller.view().notice, Some(SNotice::SaveFailed));
+        let mut reopened = second_controller(&store);
+        reopened.reload();
+        let persisted = &reopened.view().settings;
+        assert!(persisted.search_notes);
+        assert!(!persisted.search_paths);
+        assert!(persisted.highlight_results);
+        assert!(!persisted.silent_start);
     }
 
     #[test]

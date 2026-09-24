@@ -46,6 +46,21 @@ use crate::domain::{document::AppData, folder::FolderEntry, path_semantics::same
 
 use super::{codec, codec::StorageError, schema::StoredDocumentV1};
 
+/// Maximum accepted import-file size in bytes (M07.5 resource limit). Guards
+/// against a huge/crafted file being fully buffered into memory by
+/// `std::fs::read` in the adapter. 8 MiB comfortably holds even a 100k-record
+/// document (records are a few hundred bytes each) while bounding RAM.
+pub const MAX_IMPORT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum accepted imported folder records (M07.5 resource limit). Prevents a
+/// crafted file from forcing the all-or-nothing apply to build a document far
+/// beyond any realistic library; the 0.0.1 10k performance baseline is far
+/// below this.
+pub const MAX_IMPORT_RECORDS: usize = 100_000;
+/// Maximum accepted imported category records (M07.5).
+pub const MAX_IMPORT_CATEGORIES: usize = MAX_IMPORT_RECORDS;
+/// Maximum accepted imported tag records (M07.5).
+pub const MAX_IMPORT_TAGS: usize = MAX_IMPORT_RECORDS;
+
 /// Why an import file cannot be used (anonymous, never a path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportErrorKind {
@@ -62,6 +77,11 @@ pub enum ImportErrorKind {
     /// M06 review M3: applying would leave two records with the same path (the
     /// M01.2 path-uniqueness invariant). All-or-nothing: refused, no mutation.
     DuplicatePath,
+    /// M07.5: the file (or the record/category/tag count inside it) exceeds the
+    /// resource limits, so the import is refused up front — no allocation, no
+    /// mutation. Record count alone can be huge even in a small file, so the
+    /// check runs on the parsed document, not just the byte size.
+    ImportTooLarge,
     /// The document could not be encoded (export path).
     EncodeFailed,
 }
@@ -81,6 +101,9 @@ impl fmt::Display for ImportError {
             ImportErrorKind::InvalidDocument => "the file does not form a valid FileGo document",
             ImportErrorKind::UnresolvedReference => "the import would leave unresolved references",
             ImportErrorKind::DuplicatePath => "the import would duplicate a folder path",
+            ImportErrorKind::ImportTooLarge => {
+                "the import file exceeds the supported size or record limits"
+            }
             ImportErrorKind::EncodeFailed => "the current data could not be encoded",
         };
         formatter.write_str(text)
@@ -178,7 +201,37 @@ impl ImportPlan {
 
 /// parse + validate the whole import file; **no** mutation happens here or
 /// later when this fails.
+///
+/// M07.5 resource limits: the byte size is bounded by [`MAX_IMPORT_BYTES`]
+/// (the adapter reads the whole file, so a huge file must be refused before it
+/// is buffered), and the parsed record/category/tag counts are bounded by
+/// [`MAX_IMPORT_RECORDS`] (a small file can still enumerate 100M records).
+///
+/// The count probe runs BEFORE `codec::decode`: a full decode validates while
+/// collecting + deduplicating ids (O(n²) for large inputs), so a crafted file
+/// with a huge array would burn CPU before a post-decode limit even fired. The
+/// probe only parses the JSON structure (linear) and counts the arrays; only
+/// files within every limit reach the expensive full validation. An oversized
+/// import is refused with [`ImportErrorKind::ImportTooLarge`] and nothing is
+/// mutated.
 pub fn parse_import(bytes: &[u8]) -> Result<StoredDocumentV1, ImportError> {
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return Err(ImportError::new(ImportErrorKind::ImportTooLarge));
+    }
+    // Cheap structural count probe (linear JSON parse, no validation).
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        let over_limits = ["folders", "categories", "tags"].iter().any(|array_name| {
+            value
+                .get(array_name)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|array| array.len() > MAX_IMPORT_RECORDS)
+        });
+        if over_limits {
+            return Err(ImportError::new(ImportErrorKind::ImportTooLarge));
+        }
+    }
+    // Within the limits: full decode + validate (O(n²) id checks are bounded by
+    // the count cap above).
     Ok(codec::decode(bytes)?)
 }
 
@@ -481,6 +534,83 @@ mod tests {
         let bytes = export_bytes(&document).expect("export");
         let parsed = parse_import(&bytes).expect("parse");
         assert_eq!(parsed, document);
+    }
+
+    #[test]
+    fn import_file_over_the_byte_limit_is_refused_without_mutation() {
+        // M07.5: an oversized file must be refused by size BEFORE any parsing or
+        // allocation, with a clear anonymous error. No mutation can happen
+        // because parse_import never returns an Ok document.
+        let mut bytes = vec![b' '; super::MAX_IMPORT_BYTES + 1];
+        bytes[0] = b'{';
+        assert_eq!(
+            parse_import(&bytes).unwrap_err().kind,
+            ImportErrorKind::ImportTooLarge
+        );
+        // Exactly at the limit is not refused by the size check (the payload is
+        // not valid JSON here, so it still fails — but with InvalidJson, not
+        // ImportTooLarge, proving the size gate did not break normal parsing).
+        let at_limit = vec![b'x'; super::MAX_IMPORT_BYTES];
+        assert_eq!(
+            parse_import(&at_limit).unwrap_err().kind,
+            ImportErrorKind::InvalidJson
+        );
+    }
+
+    #[test]
+    fn import_with_too_many_records_is_refused() {
+        // M07.5: a small file can still carry a document with a huge record
+        // count; the count probe (linear JSON parse, before the O(n²) decode)
+        // must catch it without ever materializing the document.
+        let over = super::MAX_IMPORT_RECORDS + 2;
+        let mut root = serde_json::Map::new();
+        root.insert("schema_version".into(), serde_json::json!(1));
+        let folders: Vec<serde_json::Value> = (0..over)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("00000000-0000-0000-0000-{:012}", index),
+                    "display_name": "F",
+                    "aliases": [],
+                    "path": format!(r"C:\f{index}"),
+                    "enabled": true,
+                    "favorite": false,
+                    "pinned": false,
+                    "manual_weight": 0,
+                    "category_id": null,
+                    "tag_ids": [],
+                    "note": "",
+                    "color": null,
+                    "sort_order": 0,
+                    "created_at": "2026-09-21T00:00:00Z",
+                    "updated_at": "2026-09-21T00:00:00Z",
+                    "last_opened_at": null,
+                    "open_count": 0,
+                })
+            })
+            .collect();
+        root.insert("folders".into(), serde_json::Value::Array(folders));
+        root.insert("categories".into(), serde_json::Value::Array(Vec::new()));
+        root.insert("tags".into(), serde_json::Value::Array(Vec::new()));
+        root.insert("revision".into(), serde_json::json!(1));
+        let bytes = serde_json::to_vec(&serde_json::Value::Object(root)).expect("json");
+
+        assert_eq!(
+            parse_import(&bytes).unwrap_err().kind,
+            ImportErrorKind::ImportTooLarge
+        );
+        // The error Display is anonymous (no count, no path).
+        let err = parse_import(&bytes).unwrap_err();
+        assert!(!err.to_string().contains('\\'), "no path separator");
+        assert!(!err.to_string().contains("C:"), "no drive letter");
+    }
+
+    #[test]
+    fn import_within_the_limits_still_parses() {
+        // The record-count gate must not break normal documents: far below the
+        // limit a valid export still parses and round-trips.
+        let bytes = export_bytes(&doc(base_data())).expect("export");
+        let parsed = parse_import(&bytes).expect("parse within limits");
+        assert_eq!(parsed.data.folders.len(), 1);
     }
 
     #[test]

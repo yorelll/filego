@@ -766,3 +766,198 @@ fn source_under_storage_and_domain_has_no_fs_delete_api_calls() {
         }
     }
 }
+
+/// M07.5 supply-chain/security source guard: no implementation source may spawn
+/// a shell or command interpreter with user/derived strings, and no full user
+/// path / query may be written to a file log.
+///
+/// The only file logging in the tree is the redacted panic log
+/// (`src/diagnostics.rs`, `impl_log_panic`), which writes fixed anonymous lines
+/// (`PANIC_LOG_*` constants), so the `write_flush_sync`-shaped disk writers in
+/// the storage layer are the ONLY `std::fs::write`/`File::create`-style paths.
+/// We deliberately scan the four non-test trees for:
+///
+/// - process-spawn / command-interpreter tokens. 0.0.1 opens folders purely via
+///   `ShellExecuteExW(lpFile=path)` (no verb, no parameters — see
+///   `platform/windows/tray_open.rs`), so `Command::new`, `std::process::Command`,
+///   `CreateProcess`, `powershell`, and `cmd.exe` must never appear;
+/// - a `set_hook`-adjacent logging pattern that could echo `eprintln!` with a
+///   user value at a call site (guarded structurally by requiring every
+///   `eprintln!`/`println!` argument list in implementation sources to contain
+///   no `path`/`query`/`text` variable usages — too fragile to express as a
+///   token check, so we rely on the anonymous-string review plus this scan for
+///   the dangerous tokens instead).
+#[test]
+fn implementation_sources_do_not_invoke_a_shell_or_command_interpreter() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    let mut pending_dirs = vec![
+        source_root.join("storage"),
+        source_root.join("domain"),
+        source_root.join("presentation"),
+        source_root.join("platform"),
+    ];
+    // Top-level module files (not under one of the above trees) are appended
+    // explicitly so main.rs/app.rs/diagnostics.rs/lib.rs are scanned too.
+    for file in ["app.rs", "diagnostics.rs", "main.rs", "lib.rs"] {
+        sources.push(source_root.join(file));
+    }
+    let mut seen = std::collections::HashSet::new();
+    while let Some(dir) = pending_dirs.pop() {
+        if !seen.insert(dir.clone()) {
+            continue;
+        }
+        let metadata = std::fs::metadata(&dir);
+        if metadata.is_err() || !metadata.unwrap().is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).expect("src tree must be readable") {
+            let entry = entry.expect("directory entry must be readable");
+            let path = entry.path();
+            if path.is_dir() {
+                pending_dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+    let forbidden = [
+        "std::process::Command",
+        "Command::new",
+        "CreateProcess",
+        "powershell",
+        "cmd.exe",
+        "cmd /c",
+        "ShCreateProcess",
+    ];
+    for path in &sources {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name.ends_with("tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(path).expect("source must be readable");
+        for token in forbidden {
+            assert!(
+                !source.contains(token),
+                "command-interpreter token {token:?} must not appear in {}",
+                path.display()
+            );
+        }
+    }
+    // The ShellExecuteExW boundary is the one allowed shell entry; it must keep
+    // passing the path solely via lpFile with NO verb and NO parameters, so a
+    // user path can never be woven into a command line. The `shell_open.rs`
+    // controller asserts the same contract at the API level.
+    let tray_open = std::fs::read_to_string(source_root.join("platform/windows/tray_open.rs"))
+        .expect("tray_open.rs present");
+    assert!(
+        tray_open.contains("ShellExecuteExW"),
+        "shell boundary alive"
+    );
+    assert!(
+        tray_open.contains("lpVerb: windows::core::PCWSTR::null()"),
+        "the shell boundary must not pass a verb"
+    );
+    assert!(
+        tray_open.contains("lpParameters: windows::core::PCWSTR::null()"),
+        "the shell boundary must not pass parameters"
+    );
+}
+
+/// M07.5 supply-chain guard: every GitHub Actions workflow keeps minimal
+/// permissions (`contents: read`), never runs untrusted PR code with write
+/// access, and pins every third-party `uses:` step to a full 40-character
+/// commit SHA (not a floating branch/tag or a short prefix). The Windows CI and
+/// release candidate workflows are the only authenticated shells into this
+/// repo, so their security posture is structural and enforced here.
+#[test]
+fn workflows_pin_actions_and_use_minimal_permissions() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let workflow_files = [
+        root.join("ci.yml"),
+        root.join("benchmark.yml"),
+        root.join("release.yml"),
+    ];
+    for file in &workflow_files {
+        assert!(file.exists(), "workflow {} must exist", file.display());
+        let source = std::fs::read_to_string(file).expect("workflow must be readable");
+
+        // Minimal permissions: require a `permissions:` block with
+        // `contents: read` and never write.
+        assert!(
+            source.contains("permissions:"),
+            "{} must declare a permissions block",
+            file.display()
+        );
+        assert!(
+            source.contains("contents: read"),
+            "{} must have minimal contents: read",
+            file.display()
+        );
+        assert!(
+            !source.contains("contents: write"),
+            "{} must not hold contents write",
+            file.display()
+        );
+
+        // Every `uses:` reference must be pinned to a full 40-char SHA.
+        for line in source.lines() {
+            let line = line.trim();
+            let Some(use_at) = line.find("uses:") else {
+                continue;
+            };
+            let uses = &line[use_at + "uses:".len()..];
+            let spec = uses.split('#').next().unwrap_or("").trim();
+            assert!(
+                spec.starts_with("actions/")
+                    || spec.starts_with("dtolnay/")
+                    || spec.starts_with("Swatinem/")
+                    || spec.starts_with("taiki-e/"),
+                "unexpected action provider in {}: {spec:?}",
+                file.display(),
+            );
+            assert!(
+                spec.len() > 40 && spec.contains('@'),
+                "{}: action must be pinned to a full commit SHA, got {spec:?}",
+                file.display()
+            );
+            let after_at = spec.split('@').nth(1).unwrap_or_default();
+            assert!(
+                after_at.len() >= 40,
+                "{}: action pin must be a full 40-char SHA, got {after_at:?}",
+                file.display()
+            );
+        }
+    }
+}
+
+/// M07.5: the release-candidate workflow must not run untrusted PR code with a
+/// write token. It is `workflow_dispatch`-only (no `pull_request_target`), the
+/// checkout uses `persist-credentials: false`, and there is no release job.
+#[test]
+fn release_workflow_never_runs_untrusted_code_with_write() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let source = std::fs::read_to_string(root.join("release.yml")).expect("release.yml present");
+
+    assert!(
+        source.contains("workflow_dispatch") && !source.contains("pull_request_target"),
+        "release.yml must be dispatch-only (never pull_request_target)"
+    );
+    assert!(
+        source.contains("persist-credentials: false"),
+        "release.yml checkout must not persist credentials"
+    );
+    assert!(
+        !source.contains("permissions: write-all")
+            && !source.contains("contents: write")
+            && !source.contains("issues: write"),
+        "release.yml must hold no write scopes"
+    );
+    assert!(
+        !source.contains("gh release create") && !source.contains("on.release"),
+        "release.yml must not create GitHub releases (separate authorized step)"
+    );
+}

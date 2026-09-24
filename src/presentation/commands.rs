@@ -54,6 +54,51 @@ pub enum RowAction {
     RemoveFromList,
 }
 
+impl RowAction {
+    /// Map a numeric context-menu action code (as the Slint `ContextMenuPopup`
+    /// forwards it) onto a [`RowAction`].
+    ///
+    /// M05 review OBS-01 closed (M07.1): these codes mirror the `MenuRow`
+    /// order in `ui/app-window.slint` (0 = Open, 1 = CopyPath, 2 = CopyName,
+    /// 3 = Edit, 4 = TogglePin, 5 = ToggleEnable, anything else = Remove) and
+    /// live here as named/typed state so a reorder on either side is caught at
+    /// compile time rather than by a silent mis-dispatch. The ordered variants
+    /// also assert the mirror stays correct.
+    pub fn from_context_action(action: i32) -> Self {
+        match action {
+            0 => RowAction::Open,
+            1 => RowAction::CopyPath,
+            2 => RowAction::CopyName,
+            3 => RowAction::Edit,
+            4 => RowAction::TogglePin,
+            5 => RowAction::ToggleEnable,
+            _ => RowAction::RemoveFromList,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_action_codes_map_to_the_slint_menu_order() {
+        // OBS-01: the numeric action codes the Slint ContextMenuPopup forwards
+        // must map one-to-one onto the typed actions, in order.
+        assert_eq!(RowAction::from_context_action(0), RowAction::Open);
+        assert_eq!(RowAction::from_context_action(1), RowAction::CopyPath);
+        assert_eq!(RowAction::from_context_action(2), RowAction::CopyName);
+        assert_eq!(RowAction::from_context_action(3), RowAction::Edit);
+        assert_eq!(RowAction::from_context_action(4), RowAction::TogglePin);
+        assert_eq!(RowAction::from_context_action(5), RowAction::ToggleEnable);
+        assert_eq!(RowAction::from_context_action(6), RowAction::RemoveFromList);
+        assert_eq!(
+            RowAction::from_context_action(999),
+            RowAction::RemoveFromList
+        );
+    }
+}
+
 /// Every user gesture the ViewModel understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewCommand {

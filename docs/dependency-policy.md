@@ -22,6 +22,10 @@ Slint's exact v1.18.0 royalty-free license text is vendored at `third-party/slin
 
 CI uses the pinned `cargo-about` release and `about.toml`/`about.hbs` to render `THIRD_PARTY_LICENSES.html` with `--locked --fail --all-features --target x86_64-pc-windows-msvc` so the inventory reflects the shipped Windows x86-64 artifact's resolution. The ordered acceptance list places Slint's royalty-free license first so `OR` expressions select the project's documented desktop-license basis. The generator must resolve the checked-in `Cargo.lock`; it must not silently update dependencies. Resolution diagnostics fail the job where supported; CI sanity-checks only stable HTML markers (title and non-empty content; no unreliable slice-literal substring assertions like `slint`), and CI/independent review must additionally verify that every package in the configured Windows x86-64 release dependency graph appears with usable notice text because tool limitations can still report some missing metadata as warnings. Generated inventory is uploaded with CI artifacts and reviewed before a release.
 
+## M07.5 current audit posture (0.0.1 RC)
+
+The dependency graph is frozen at the checked-in `Cargo.lock` (no `cargo update`, verified immutably via `cargo metadata --frozen`) with zero runtime network/telemetry dependencies. Every GitHub Actions step is pinned to a full 40-character commit SHA with `permissions: contents: read`, and the release-candidate workflow is `workflow_dispatch`-only with no write scope and no release job (structural guards in `src/storage/tests.rs` enforce pins/min-permissions). Any advisory, license, ban, or source violation in a future `cargo deny` run blocks CI and therefore blocks release; there are no recorded exceptions, and the per-run audit results are captured in the M00–M07 review evidence chain.
+
 ## Human checks
 
 Automated SPDX detection is not legal advice. Reviewers must check:

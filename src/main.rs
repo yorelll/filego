@@ -641,6 +641,10 @@ struct SettingsWindowController {
     /// after a settings/management change (rebuilt settings make search take
     /// effect immediately).
     main: std::rc::Rc<std::cell::RefCell<MainWindowController>>,
+    /// The tray weak reference, used to refresh the hotkey-unavailable hint
+    /// (M04-N001 closed in M07.1) after a settings-driven hotkey change so a
+    /// stale "unavailable" row never lingers once the user fixes the hotkey.
+    tray: slint::Weak<AppTray>,
 }
 
 impl SettingsWindowController {
@@ -652,6 +656,7 @@ impl SettingsWindowController {
         native: std::rc::Rc<std::cell::RefCell<filego::platform::windows::NativePlatform>>,
         data_dir: std::path::PathBuf,
         main: std::rc::Rc<std::cell::RefCell<MainWindowController>>,
+        tray: slint::Weak<AppTray>,
     ) -> Self {
         let repo = store.repo().clone();
         let one_level_import_setting = store
@@ -671,6 +676,7 @@ impl SettingsWindowController {
             data_dir,
             pending_import: None,
             main,
+            tray,
         }
     }
 
@@ -934,6 +940,8 @@ impl SettingsWindowController {
 
     /// Project the native hotkey machine's runtime state into the settings
     /// controller (Active/Paused/Disabled + last error), then refresh the UI.
+    /// Also refreshes the tray hotkey-unavailable hint (M04-N001 closed in
+    /// M07.1) so a fixed hotkey removes any stale hint immediately.
     fn sync_hotkey_from_native(&mut self) {
         use filego::platform::hotkey::HotkeyState;
         let native = self.native.borrow();
@@ -948,10 +956,15 @@ impl SettingsWindowController {
                 filego::presentation::settings_controller::HotkeyRuntime::Paused
             }
         };
+        let state = native.hotkey_state();
         let error = native.hotkey_last_error();
+        let locale = locale_for(self.settings.view().settings.language_preference);
         drop(native);
         self.settings
             .handle(SCommand::SyncHotkeyRuntime(runtime, error));
+        if let Some(tray) = self.tray.upgrade() {
+            tray.set_hotkey_unavailable_hint(tray_hotkey_hint(state, error, locale));
+        }
         self.sync_settings_ui();
     }
 
@@ -1060,6 +1073,9 @@ impl SettingsWindowController {
                     // standalone document (it is an apply-time union check),
                     // but the match must stay exhaustive.
                     ImportErrorKind::DuplicatePath => SNotice::ImportInvalidDocument,
+                    // M07.5 resource limit: the file (or its record count)
+                    // exceeded the bound; nothing was mutated.
+                    ImportErrorKind::ImportTooLarge => SNotice::ImportTooLarge,
                     ImportErrorKind::EncodeFailed => SNotice::ImportParseFailed,
                 };
                 self.settings.set_notice(notice);
@@ -1089,7 +1105,10 @@ impl SettingsWindowController {
     /// saved atomically as one revision. Real directories are never touched.
     fn apply_import(&mut self) {
         use filego::storage::import_export;
-        let Some(incoming) = self.pending_import.take() else {
+        // Keep the parsed import until a successful save commits it. A failed
+        // apply/save leaves the preview available for the user to retry or
+        // cancel; taking it up front would silently discard that recovery path.
+        let Some(incoming) = self.pending_import.clone() else {
             return;
         };
         let Some(current) = self.settings.document() else {
@@ -1110,35 +1129,79 @@ impl SettingsWindowController {
                 // apply, and a failed import never reaches this branch. The
                 // snapshot reuses the standard backup list (visible + restorable
                 // on the Data page) under a recognizable `before-import-` stamp.
-                if mode == import_export::ImportMode::Overwrite {
-                    let stamp = format!(
-                        "before-import-{}",
-                        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                //
+                // M06 review I1: the stamp is disambiguated by `unique_stamp`
+                // so two overwrite-imports within the same second each get their
+                // OWN snapshot (the old second one would have truncated the
+                // first). M06 review I2: keep this snapshot ONLY if the import
+                // save succeeds. On an apply/save failure it is the redundant
+                // "before import" snapshot of an import that never landed, so
+                // cleanup removes exactly this named sibling (never another
+                // backup, never a real folder).
+                let snapshot = if mode == import_export::ImportMode::Overwrite {
+                    let seconds = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+                    let stamp = filego::storage::backup::unique_stamp(
+                        &self.data_dir,
+                        filego::storage::backup::BEFORE_IMPORT_STAMP_PREFIX,
+                        &seconds,
                     );
-                    let _ =
-                        filego::storage::backup::create_backup(&self.data_dir, &current, &stamp);
-                }
+                    match filego::storage::backup::create_backup(&self.data_dir, &current, &stamp) {
+                        Ok(file_name) => Some(file_name),
+                        // "覆盖前备份" is a data-safety prerequisite, not best
+                        // effort. Do not mutate the document when the explicit
+                        // restore point could not be created (disk full /
+                        // permission); leave the preview available for retry.
+                        Err(_) => {
+                            self.settings.set_notice(SNotice::ImportPreviewFailed);
+                            self.sync_settings_ui();
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let revision = {
                     let mut repo = self.repo.borrow_mut();
-                    if repo.set_data(applied.data).is_err() {
-                        self.settings.set_notice(SNotice::ImportUnresolvedReference);
-                        self.sync_settings_ui();
-                        return;
+                    match repo.set_data(applied.data) {
+                        Ok(()) => match repo.save_at() {
+                            Ok(revision) => Ok(revision),
+                            Err(error) => {
+                                // The disk write failed after set_data changed
+                                // the working copy. Restore the pre-import
+                                // data too so UI/repository/disk remain in the
+                                // same state; a later save cannot resurrect an
+                                // import that was reported as failed.
+                                let _ = repo.set_data(current.data.clone());
+                                Err(error)
+                            }
+                        },
+                        Err(error) => Err(error),
                     }
-                    let _ = applied;
-                    repo.save_at()
                 };
-                let revision_result = revision;
-                // Refresh the Data-page backup list so the pre-import snapshot
-                // (and any earlier manual backups) stay visible after the apply.
-                let names =
-                    filego::storage::backup::list_backups(&self.data_dir).unwrap_or_default();
-                self.settings.set_backups(names);
-                match revision_result {
+                match revision {
                     Ok(_) => {
+                        // Keep and list the snapshot ONLY when the overwrite
+                        // actually committed.
+                        if snapshot.is_some() {
+                            let names = filego::storage::backup::list_backups(&self.data_dir)
+                                .unwrap_or_default();
+                            self.settings.set_backups(names);
+                        }
                         self.settings.handle(SCommand::ApplyImport);
+                        self.pending_import = None;
                     }
                     Err(_) => {
+                        if let Some(file_name) = snapshot {
+                            // I2: failure cleanup is deliberately restricted by
+                            // backup::remove_failed_import_snapshot to this
+                            // `backup-before-import-*.json` sibling. Failure to
+                            // clean is non-fatal: the save failure remains the
+                            // user-visible condition.
+                            let _ = filego::storage::backup::remove_failed_import_snapshot(
+                                &self.data_dir,
+                                &file_name,
+                            );
+                        }
                         self.settings.set_notice(SNotice::ImportPreviewFailed);
                     }
                 }
@@ -1526,7 +1589,12 @@ impl SettingsWindowController {
                 };
                 window.set_draft_title(title.tr(locale).into());
                 let duplicate = draft.duplicate_existing.is_some();
-                let error = if !draft.valid {
+                // M05-L3 closed (M07.1): a manual add opens with an empty path;
+                // show a "please enter a path" prompt instead of the generic
+                // "Invalid path" for that not-yet-filled state.
+                let error = if !draft.valid && draft.path.trim().is_empty() {
+                    Msg::NoticeEnterPath.tr(locale)
+                } else if !draft.valid {
                     Msg::NoticeInvalidPath.tr(locale)
                 } else if duplicate {
                     format!(
@@ -1687,6 +1755,12 @@ fn snotice_text(
         filego::presentation::settings_controller::SNotice::ImportDuplicatePath => {
             Msg::MonoNoticeImportDuplicatePath
         }
+        filego::presentation::settings_controller::SNotice::ImportTooLarge => {
+            Msg::MonoNoticeImportTooLarge
+        }
+        filego::presentation::settings_controller::SNotice::DataUnreadable => {
+            Msg::MonoNoticeDataUnreadable
+        }
         filego::presentation::settings_controller::SNotice::BackupsNone => {
             Msg::MonoNoticeBackupsNone
         }
@@ -1778,6 +1852,31 @@ fn hotkey_error_text(kind: filego::platform::hotkey::HotkeyErrorKind, _locale: L
     kind.as_detail().to_owned()
 }
 
+/// The tray hint shown when the global hotkey is not active (M04-N001 closed in
+/// M07.1): a localized, anonymous, non-activatable menu row so the user can see
+/// WHY the shortcut does not work while the tray keeps working. Empty string =
+/// no hint. Only a Disabled hotkey with a last registration error surfaces a
+/// hint; an active/paused/disabled-without-error hotkey shows nothing (pause is
+/// already surfaced by the Pause item glyph).
+fn tray_hotkey_hint(
+    state: filego::platform::hotkey::HotkeyState,
+    last_error: Option<filego::platform::hotkey::HotkeyErrorKind>,
+    locale: Locale,
+) -> slint::SharedString {
+    use filego::platform::hotkey::HotkeyState;
+    if !matches!(state, HotkeyState::Disabled) {
+        return slint::SharedString::default();
+    }
+    let msg = match last_error {
+        Some(filego::platform::hotkey::HotkeyErrorKind::Conflict) => Msg::TrayHotkeyConflict,
+        Some(filego::platform::hotkey::HotkeyErrorKind::Unavailable) => Msg::TrayHotkeyUnavailable,
+        // A Disabled hotkey with no recorded error (never cleared or
+        // never-configured) is a normal state, not a failure — no hint.
+        None => return slint::SharedString::default(),
+    };
+    msg.tr(locale).into()
+}
+
 /// The import-mode combo index for a mode.
 fn import_mode_index(mode: filego::storage::import_export::ImportMode) -> i32 {
     match mode {
@@ -1834,36 +1933,69 @@ fn data_dir() -> std::path::PathBuf {
     base.join("FileGo")
 }
 
+/// Why the startup data file could not be used (M07.1), surfaced to the Data
+/// page as an anonymous, localized notice while the recovery actions (open
+/// data location, restore backup, reset) stay reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupDataStatus {
+    /// The data file loaded normally (or a first run seeded an empty one).
+    Ok,
+    /// The file was corrupt / pending repair. The corrupt bytes are preserved;
+    /// the app starts with the recovered backup copy or an empty working copy.
+    /// The user repairs via the Data page.
+    Unreadable,
+}
+
 /// Open (or create) the shared repository at `data_dir()`. A first run has no
 /// document: we seed an empty (but valid) one so the whole flow (add/edit/
 /// category/tag) is available immediately. Corruption/pending-recovery is kept
 /// explicit: the repository reports it and the app starts with an empty
 /// working copy rather than destroying the corrupt file.
-fn open_repository()
--> std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>> {
+///
+/// M07.1: an unreadable data directory (permission / disk / offline store) or
+/// a corrupt file is NOT a silent start — the caller receives
+/// [`StartupDataStatus::Unreadable`] and the Data page surfaces a localized,
+/// anonymous notice with the recovery actions (open data location / restore
+/// backup / reset / repair). On first run (`NotFound`) we seed a valid empty
+/// document so the revision/lock machinery is exercised exactly like a real
+/// first save; a first-run write failure is also surfaced as `Unreadable`
+/// (the data directory is not writable).
+fn open_repository() -> (
+    std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>>,
+    StartupDataStatus,
+) {
+    use filego::storage::repository::RepositoryError;
     let base = data_dir();
     let paths = filego::storage::location::DocumentPaths::from_base_dir(&base);
     let mut repo = filego::storage::repository::DocumentRepository::new(paths);
     let result = repo.load();
-    // On first run (`NotFound`) we seed a valid empty document through the
-    // public `save` so the revision/lock machinery is exercised exactly like a
-    // real first save. On corruption we keep the file untouched and start with
-    // an empty working copy the user can repair via the normal recovery path.
-    if matches!(
-        result,
-        Err(filego::storage::repository::RepositoryError::NotFound)
-    ) {
-        let empty = empty_document();
-        if repo.save(&empty).is_err() {
-            eprintln!("FileGo could not create its data file");
+    let status = match result {
+        // First run: seed an empty document exactly like a real first save.
+        Err(RepositoryError::NotFound) => {
+            let empty = empty_document();
+            if repo.save(&empty).is_ok() {
+                StartupDataStatus::Ok
+            } else {
+                // The data directory exists but is not writable.
+                StartupDataStatus::Unreadable
+            }
         }
-    } else if result.is_err() {
-        // Corrupt/unreadable: keep the file, start with no working copy. The
-        // repository recovery paths (backup/repair) remain the only writers.
-        eprintln!("FileGo could not load stored data; recovery is pending");
-    }
+        // A loaded document (found, or recovered-from-backup which already has
+        // an in-memory copy) is fine to use; pending repair is handled via the
+        // Data page but does not block editing with the restored copy.
+        Ok(_) => StartupDataStatus::Ok,
+        // Corrupt main with no valid backup, or an inaccessible data directory
+        // (permission / disk / offline): keep the file untouched, start with an
+        // empty working copy, and surface the Data-page recovery actions.
+        Err(RepositoryError::CorruptData) | Err(RepositoryError::Io) => {
+            StartupDataStatus::Unreadable
+        }
+        // NotFound was handled above; the remaining variants cannot arise from
+        // a plain `load`.
+        Err(_) => StartupDataStatus::Ok,
+    };
     let _ = base;
-    std::rc::Rc::new(std::cell::RefCell::new(repo))
+    (std::rc::Rc::new(std::cell::RefCell::new(repo)), status)
 }
 
 /// Push the settings-window i18n strings into the shared `UiStrings` global.
@@ -1885,10 +2017,10 @@ fn apply_settings_localization(
         ("action_add", Msg::ActionAdd),
         ("action_edit", Msg::ActionEdit),
         ("action_remove", Msg::ActionRemoveRecord),
-        // M05 review H4: the per-row enable/disable toggle label is bound in
-        // Slint to the row state (context-menu.disable/enable); this static
-        // string is now only a fallback and must never read "添加".
-        ("action_toggle_enabled", Msg::DisabledLabel),
+        // M05 review OBS-02 closed (M07.1): the `action_toggle_enabled` static
+        // fallback is dead — the per-row enable/disable label is bound in Slint
+        // to the row state (context-menu.disable/enable), so the key/property
+        // were removed instead of keeping an unused fallback.
         ("action_toggle_pin", Msg::PinnedLabel),
         ("action_check", Msg::ActionCheck),
         ("filter_name_placeholder", Msg::FilterNamePlaceholder),
@@ -1912,6 +2044,7 @@ fn apply_settings_localization(
         ("remove_confirm", Msg::RemoveConfirm),
         ("remove_never_deletes", Msg::RemoveNeverDeletes),
         ("undo", Msg::Undo),
+        ("undo_dismiss", Msg::UndoDismiss),
         ("add_dialog_title", Msg::AddDialogTitle),
         ("edit_dialog_title", Msg::EditDialogTitle),
         ("field_name", Msg::FieldName),
@@ -2191,6 +2324,14 @@ fn apply_settings_localization(
             "settings_notice_import_duplicate_path",
             Msg::MonoNoticeImportDuplicatePath,
         ),
+        (
+            "settings_notice_import_too_large",
+            Msg::MonoNoticeImportTooLarge,
+        ),
+        (
+            "settings_notice_data_unreadable",
+            Msg::MonoNoticeDataUnreadable,
+        ),
         ("settings_notice_backups_none", Msg::MonoNoticeBackupsNone),
         (
             "settings_notice_backup_created",
@@ -2250,7 +2391,6 @@ fn call_string_setter(window: &SettingsWindow, field: &str, value: String) {
         "action_add" => strings.set_action_add(value),
         "action_edit" => strings.set_action_edit(value),
         "action_remove" => strings.set_action_remove(value),
-        "action_toggle_enabled" => strings.set_action_toggle_enabled(value),
         "action_toggle_pin" => strings.set_action_toggle_pin(value),
         "action_check" => strings.set_action_check(value),
         "filter_name_placeholder" => strings.set_filter_name_placeholder(value),
@@ -2274,6 +2414,7 @@ fn call_string_setter(window: &SettingsWindow, field: &str, value: String) {
         "remove_confirm" => strings.set_remove_confirm(value),
         "remove_never_deletes" => strings.set_remove_never_deletes(value),
         "undo" => strings.set_undo(value),
+        "undo_dismiss" => strings.set_undo_dismiss(value),
         "add_dialog_title" => strings.set_add_dialog_title(value),
         "edit_dialog_title" => strings.set_edit_dialog_title(value),
         "field_name" => strings.set_field_name(value),
@@ -2487,6 +2628,8 @@ fn call_string_setter(window: &SettingsWindow, field: &str, value: String) {
         "settings_notice_import_duplicate_path" => {
             strings.set_settings_notice_import_duplicate_path(value)
         }
+        "settings_notice_import_too_large" => strings.set_settings_notice_import_too_large(value),
+        "settings_notice_data_unreadable" => strings.set_settings_notice_data_unreadable(value),
         "settings_notice_backups_none" => strings.set_settings_notice_backups_none(value),
         "settings_notice_backup_created" => strings.set_settings_notice_backup_created(value),
         "settings_notice_backup_restore_failed" => {
@@ -2778,7 +2921,10 @@ fn run() -> Result<(), slint::PlatformError> {
 
     // ---- M05: shared repository (opened early so M06 can read the persisted
     // settings for the hotkey + startup behavior) --------------------------
-    let repo = open_repository();
+    // M07.1: `open_repository` returns the startup data status so an unreadable
+    // data file is surfaced (Data-page recovery stays reachable) instead of a
+    // silent empty start.
+    let (repo, startup_data_status) = open_repository();
 
     // ---- M04.2/M04.3 native platform --------------------------------
     // M06: the hotkey is the PERSISTED one (from the shared repository), not a
@@ -2913,6 +3059,16 @@ fn run() -> Result<(), slint::PlatformError> {
         .into(),
     );
     tray.set_pause_hotkeys_glyph(if native.borrow().paused() { "✓ " } else { "" }.into());
+    // M04-N001 (closed in M07.1): surface a hotkey-unavailable state to the
+    // tray. The startup locale is derived from the persisted language below;
+    // the hint is pushed once here (and refreshed whenever the settings window
+    // re-syncs the native hotkey state — `sync_hotkey_from_native`). The string
+    // is anonymous + localized, and the menu row is non-activatable.
+    tray.set_hotkey_unavailable_hint(tray_hotkey_hint(
+        native.borrow().hotkey_state(),
+        native.borrow().hotkey_last_error(),
+        startup_locale,
+    ));
 
     // ---- M05: shared repository + settings window + shared adapter -----
     let (context_tx, context_rx) = std::sync::mpsc::channel();
@@ -3069,19 +3225,16 @@ fn run() -> Result<(), slint::PlatformError> {
     // M05.5: context-menu action for a requested row. The adapter selects the
     // row and dispatches the corresponding RowAction (the ViewModel maps it to
     // an ExternalEffect; edit/pin/enable/remove route to the settings window).
+    //
+    // M05 review OBS-01 closed (M07.1): the action codes are named constants
+    // mirrors of the `MenuRow` order in ui/app-window.slint (see
+    // `ContextMenuAction`), so the two sides can no longer silently drift when
+    // a menu row is added/reordered.
     let main_ui = Rc::clone(&main);
     app.on_command_context_action(move |index, action| {
         let mut main = main_ui.borrow_mut();
         main.handle(ViewCommand::SelectIndex(index as usize));
-        let row_action = match action {
-            0 => RowAction::Open,
-            1 => RowAction::CopyPath,
-            2 => RowAction::CopyName,
-            3 => RowAction::Edit,
-            4 => RowAction::TogglePin,
-            5 => RowAction::ToggleEnable,
-            _ => RowAction::RemoveFromList,
-        };
+        let row_action = RowAction::from_context_action(action);
         main.handle(ViewCommand::RowAction(row_action));
     });
 
@@ -3117,6 +3270,7 @@ fn run() -> Result<(), slint::PlatformError> {
         Rc::clone(&native),
         data_dir(),
         Rc::clone(&main),
+        tray.as_weak(),
     )));
     // Push the initial settings view + apply persisted startup appearance.
     {
@@ -3128,6 +3282,11 @@ fn run() -> Result<(), slint::PlatformError> {
             .set_launch_at_login_os(filego::platform::windows::tray_open::launch_at_login().ok());
         // Hotkey runtime from the native machine (Active/Paused/Disabled).
         adapter.sync_hotkey_from_native();
+        // M07.1: surface an unreadable data file as an anonymous, localized
+        // notice on the Data page (the recovery actions are already there).
+        if startup_data_status == StartupDataStatus::Unreadable {
+            adapter.settings.set_notice(SNotice::DataUnreadable);
+        }
         // Persisted theme + locale + font-scale applied on open.
         adapter.refresh_settings_appearance();
     }
@@ -4200,10 +4359,47 @@ fn main() {
         return;
     }
 
+    // M07.1: install a REDACTED panic hook before anything else can panic. The
+    // hook writes only an anonymous, stable line to a capped/rotated log under
+    // the data directory — never the panic payload (which may embed a path or a
+    // query), never the console in release. `data_dir()` is a pure fallback, so
+    // the hook is safe even when single-instance wiring later fails.
+    install_redacted_panic_hook(filego::diagnostics::SENSITIVE_FIELDS_REDACTED);
+
     if run().is_err() {
         eprintln!("FileGo could not initialize its user interface");
         std::process::exit(1);
     }
+}
+
+/// Install the redacted panic hook. A typical Rust panic payload for a
+/// `panic!("...")` or `.expect("...")` is a `String`/`&str` — the default hook
+/// would print it verbatim, and an assertion during e.g. path handling can
+/// carry user-visible content. Our hook logs only a fixed line plus the
+/// language-level panic location (file:line:col), which cannot contain user
+/// data. The hook is deliberately set once; release builds get no console
+/// output from it (the `windows_subsystem = "windows"` attribute already
+/// detaches the console for the GUI binary).
+fn install_redacted_panic_hook(redaction_enabled: bool) {
+    if !redaction_enabled {
+        return;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_else(|| "unknown".to_owned());
+        // The payload can contain user data; it is deliberately NOT read.
+        let line = format!(
+            "FileGo encountered an internal error at {location} and is closing (details redacted)"
+        );
+        filego::diagnostics::log_panic(&data_dir(), &line);
+        // Keep the previous hook for its side effects (nothing user-visible
+        // here; the default hook would print the payload, so we do NOT chain
+        // it — this is the whole point of the redaction).
+        let _ = previous;
+    }));
 }
 
 #[cfg(test)]

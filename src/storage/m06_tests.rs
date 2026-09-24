@@ -101,8 +101,10 @@ fn overwrite_import_snapshot_restores_the_pre_import_document() {
     assert_eq!(applied.data.folders.len(), 2, "new record added");
 
     // The adapter creates the pre-import snapshot via the standard backup
-    // mechanism under a recognizable before-import stamp, then applies.
-    let stamp = format!("before-import-{}", Utc::now().format("%Y%m%d-%H%M%S"));
+    // mechanism under a recognizable before-import stamp, then applies. The
+    // stamp is made collision-free with `unique_stamp` (M06 review I1).
+    let seconds = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let stamp = backup::unique_stamp(base.path(), backup::BEFORE_IMPORT_STAMP_PREFIX, &seconds);
     backup::create_backup(base.path(), &pre, &stamp).expect("pre-import snapshot");
     repo.set_data(applied.data).expect("set_data");
     repo.save_at().expect("save after overwrite import");

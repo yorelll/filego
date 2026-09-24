@@ -123,6 +123,13 @@ pub enum Msg {
     RemoveNeverDeletes,
     RemoveConfirm,
     Undo,
+    // M05-L2 (closed in M07.1): the undo-banner dismiss button's label. "取消"
+    // was ambiguous (the user might think it cancels the removal); this wording
+    // makes clear the record STAYS removed and the undo banner is dismissed.
+    UndoDismiss,
+    // --- tray hotkey-unavailable hint (M04-N001 closed in M07.1) ---
+    TrayHotkeyConflict,
+    TrayHotkeyUnavailable,
     // --- settings window (M05) ---
     SettingsTitle,
     SettingsFolders,
@@ -151,6 +158,10 @@ pub enum Msg {
     NoticeCannotUndo,
     NoticeDuplicateBlocked,
     NoticeInvalidPath,
+    // M05-L3 closed (M07.1): the manual "add" dialog opens with an empty path;
+    // a dedicated prompt ("enter a path") is clearer than a generic
+    // "Invalid path" for the not-yet-filled state.
+    NoticeEnterPath,
     NoticeInvalidName,
     NoticeNotFound,
     NoticePathAccessible,
@@ -326,6 +337,13 @@ pub enum Msg {
     // M06 review M3: an overwrite import was refused because a path would be
     // duplicated (no mutation). Replaces the dead ExportTargetExists key.
     MonoNoticeImportDuplicatePath,
+    // M07.5: an import file exceeded the size/record limits (no mutation).
+    MonoNoticeImportTooLarge,
+    // M07.1: the data file could not be read at startup (unreadable data dir /
+    // permission / disk). The app keeps running with an empty working copy and
+    // the Data page's recovery actions (open data location, restore backup,
+    // reset) stay reachable; the corrupt/an unreadable file is preserved.
+    MonoNoticeDataUnreadable,
     MonoNoticeBackupsNone,
     MonoNoticeBackupCreated,
     MonoNoticeBackupRestoreFailed,
@@ -389,6 +407,9 @@ impl Msg {
             Msg::RemoveNeverDeletes => "contextmenu.remove_never_deletes",
             Msg::RemoveConfirm => "contextmenu.remove_confirm",
             Msg::Undo => "contextmenu.undo",
+            Msg::UndoDismiss => "contextmenu.undo_dismiss",
+            Msg::TrayHotkeyConflict => "tray.hotkey_conflict",
+            Msg::TrayHotkeyUnavailable => "tray.hotkey_unavailable",
             Msg::SettingsTitle => "settings.title",
             Msg::SettingsFolders => "settings.page.folders",
             Msg::SettingsCategories => "settings.page.categories",
@@ -416,6 +437,7 @@ impl Msg {
             Msg::NoticeCannotUndo => "settings.notice.cannot_undo",
             Msg::NoticeDuplicateBlocked => "settings.notice.duplicate_blocked",
             Msg::NoticeInvalidPath => "settings.notice.invalid_path",
+            Msg::NoticeEnterPath => "settings.notice.enter_path",
             Msg::NoticeInvalidName => "settings.notice.invalid_name",
             Msg::NoticeNotFound => "settings.notice.not_found",
             Msg::NoticePathAccessible => "settings.notice.path_accessible",
@@ -581,6 +603,8 @@ impl Msg {
             Msg::MonoNoticeImportPreviewFailed => "settings.notice.import_preview_failed",
             Msg::MonoNoticeExportFailed => "settings.notice.export_failed",
             Msg::MonoNoticeImportDuplicatePath => "settings.notice.import_duplicate_path",
+            Msg::MonoNoticeImportTooLarge => "settings.notice.import_too_large",
+            Msg::MonoNoticeDataUnreadable => "settings.notice.data_unreadable",
             Msg::MonoNoticeBackupsNone => "settings.notice.backups_none",
             Msg::MonoNoticeBackupCreated => "settings.notice.backup_created",
             Msg::MonoNoticeBackupRestoreFailed => "settings.notice.backup_restore_failed",
@@ -662,6 +686,9 @@ pub const ALL_KEYS: &[&str] = &[
     "contextmenu.remove_never_deletes",
     "contextmenu.remove_confirm",
     "contextmenu.undo",
+    "contextmenu.undo_dismiss",
+    "tray.hotkey_conflict",
+    "tray.hotkey_unavailable",
     "settings.title",
     "settings.page.folders",
     "settings.page.categories",
@@ -689,6 +716,7 @@ pub const ALL_KEYS: &[&str] = &[
     "settings.notice.cannot_undo",
     "settings.notice.duplicate_blocked",
     "settings.notice.invalid_path",
+    "settings.notice.enter_path",
     "settings.notice.invalid_name",
     "settings.notice.not_found",
     "settings.notice.path_accessible",
@@ -852,6 +880,8 @@ pub const ALL_KEYS: &[&str] = &[
     "settings.notice.import_preview_failed",
     "settings.notice.export_failed",
     "settings.notice.import_duplicate_path",
+    "settings.notice.import_too_large",
+    "settings.notice.data_unreadable",
     "settings.notice.backups_none",
     "settings.notice.backup_created",
     "settings.notice.backup_restore_failed",
@@ -944,6 +974,15 @@ mod zh_cn {
         ),
         ("contextmenu.remove_confirm", "从 FileGo 移除记录"),
         ("contextmenu.undo", "撤销"),
+        ("contextmenu.undo_dismiss", "保持已移除"),
+        (
+            "tray.hotkey_conflict",
+            "快捷键已被其他程序占用，可从设置更换",
+        ),
+        (
+            "tray.hotkey_unavailable",
+            "快捷键不可用，可从托盘或设置打开",
+        ),
         ("settings.title", "设置"),
         ("settings.page.folders", "文件夹"),
         ("settings.page.categories", "分类"),
@@ -971,6 +1010,7 @@ mod zh_cn {
         ("settings.notice.cannot_undo", "无法撤销（数据已变化）"),
         ("settings.notice.duplicate_blocked", "路径已存在，未添加"),
         ("settings.notice.invalid_path", "路径无效"),
+        ("settings.notice.enter_path", "请输入文件夹路径"),
         ("settings.notice.invalid_name", "名称无效或重复"),
         ("settings.notice.not_found", "记录不存在"),
         ("settings.notice.path_accessible", "路径可访问"),
@@ -1206,6 +1246,14 @@ mod zh_cn {
             "settings.notice.import_duplicate_path",
             "导入被拒绝：将产生重复路径的记录",
         ),
+        (
+            "settings.notice.import_too_large",
+            "导入被拒绝：文件超过大小或记录数量限制",
+        ),
+        (
+            "settings.notice.data_unreadable",
+            "未能读取本地数据，请在数据页执行恢复操作；原数据文件保持不变",
+        ),
         ("settings.notice.backups_none", "暂无备份"),
         ("settings.notice.backup_created", "备份已创建"),
         ("settings.notice.backup_restore_failed", "备份恢复失败"),
@@ -1314,6 +1362,15 @@ mod en_us {
         ),
         ("contextmenu.remove_confirm", "Remove record from FileGo"),
         ("contextmenu.undo", "Undo"),
+        ("contextmenu.undo_dismiss", "Keep removed"),
+        (
+            "tray.hotkey_conflict",
+            "Hotkey is in use by another app; change it in Settings",
+        ),
+        (
+            "tray.hotkey_unavailable",
+            "Hotkey is unavailable; open from the tray or Settings",
+        ),
         ("settings.title", "Settings"),
         ("settings.page.folders", "Folders"),
         ("settings.page.categories", "Categories"),
@@ -1344,6 +1401,7 @@ mod en_us {
             "Path already exists; not added",
         ),
         ("settings.notice.invalid_path", "Invalid path"),
+        ("settings.notice.enter_path", "Enter a folder path"),
         ("settings.notice.invalid_name", "Invalid or duplicate name"),
         ("settings.notice.not_found", "Record not found"),
         ("settings.notice.path_accessible", "Path is accessible"),
@@ -1626,6 +1684,14 @@ mod en_us {
         (
             "settings.notice.import_duplicate_path",
             "Import refused: it would create records with duplicate paths",
+        ),
+        (
+            "settings.notice.import_too_large",
+            "Import refused: the file exceeds the size or record limit",
+        ),
+        (
+            "settings.notice.data_unreadable",
+            "Local data could not be read; use the Data page to restore. The original data file is kept unchanged",
         ),
         ("settings.notice.backups_none", "No backups yet"),
         ("settings.notice.backup_created", "Backup created"),

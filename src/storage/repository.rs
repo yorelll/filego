@@ -472,6 +472,15 @@ impl DocumentRepository {
             return Ok(RepairOutcome::HadNoCorruptMain);
         }
 
+        // M01B-N001-followup (closed in M07): the whole read-judge-write window
+        // runs under the per-directory write lock. Without the lock, a
+        // concurrent `save` could interleave a fresh main between our "still
+        // corrupt?" read, our evidence write and our promotion, silently
+        // reverting a newer main to the backup's older bytes. The lock makes
+        // `repair_from_backup` serialize with every `save`/`save_at` exactly
+        // like the other writers.
+        let _lock = self.acquire_write_lock()?;
+
         let main = self.main();
         let main_bytes = match self.io.read(&main) {
             Ok(bytes) => Some(bytes),

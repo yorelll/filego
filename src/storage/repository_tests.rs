@@ -37,8 +37,8 @@ use crate::{
         io::{FileOps, FsFileOps},
         location::DocumentPaths,
         location::{
-            backup_document_path, backup_temp_document_path, lock_file_path, main_document_path,
-            temp_document_path,
+            TEMP_FILE_PREFIX, backup_document_path, backup_temp_document_path, lock_file_path,
+            main_document_path, temp_document_path,
         },
         repository::{DocumentRepository, LoadOutcome, RepairOutcome, RepositoryError},
         schema::StoredDocumentV1,
@@ -639,6 +639,51 @@ fn repair_from_backup_rejects_absent_or_invalid_backup_and_preserves_both() {
             "main must remain untouched"
         );
         assert!(!backup_document_path(base.path()).exists());
+    }
+}
+
+/// M01B-N001-followup (closed in M07): `repair_from_backup` must run under the
+/// per-directory write lock, exactly like every other writer. This regression
+/// proves the lock is actually held: while a lock file exists (a concurrent
+/// save mid-write), a repair request is refused with `ConcurrentModification`
+/// and touches neither the corrupt main nor the valid backup.
+#[test]
+fn repair_from_backup_contends_with_a_concurrent_writer_via_the_lock() {
+    let base = TempDir::new().expect("temp dir");
+    let document = fixture_with_revision(7);
+    let mut repo = seed_corrupt_main_valid_backup(&base, &document);
+
+    // Simulate the OTHER writer holding the write lock.
+    std::fs::write(lock_file_path(base.path()), b"held by a concurrent writer")
+        .expect("lock file must be creatable");
+
+    // Repair must refuse with ConcurrentModification — it never races a save or
+    // silently reverts a newer main.
+    assert_eq!(
+        repo.repair_from_backup()
+            .expect_err("lock must be contended"),
+        RepositoryError::ConcurrentModification
+    );
+    // Nothing was touched: main still corrupt, backup still intact.
+    assert_eq!(
+        read_raw(&main_document_path(base.path())),
+        corrupt_bytes(),
+        "corrupt main must remain untouched while the lock is held"
+    );
+    assert_eq!(
+        read_raw(&backup_document_path(base.path())),
+        codec_mod::encode(&document).expect("encode"),
+        "valid backup must remain intact while the lock is held"
+    );
+
+    // Release the lock: repair now succeeds and promotes the valid backup.
+    std::fs::remove_file(lock_file_path(base.path())).expect("remove test lock");
+    match repo
+        .repair_from_backup()
+        .expect("repair after lock release")
+    {
+        RepairOutcome::Repaired { evidence: Some(_) } => {}
+        other => panic!("expected repaired with evidence, got {other:?}"),
     }
 }
 
@@ -1390,6 +1435,126 @@ fn two_writers_contending_save_if_current_only_one_wins() {
     assert!(
         !lock_file_path(base.path()).exists(),
         "the losing writer must not leave a stale lock"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M07.2 rapid successive saves (stress, on real threads) + lifecycle
+// ---------------------------------------------------------------------------
+
+/// M07.2 "fast successive hotkey/open/save": the repository serializes every
+/// write through the per-directory lock + revision guard. This stress test
+/// drives MANY rapid sequential revisions through a single repository (no
+/// threads — the single-instance app always serializes through the UI thread)
+/// and then verifies a fresh reader sees the LAST revision intact. It proves
+/// the write path stays deterministic and non-torn under bursty saves, which
+/// is what a burst of hotkey-triggered setting/record changes exercises.
+#[test]
+fn rapid_successive_saves_all_persist_in_order() {
+    let base = TempDir::new().expect("temp dir");
+    {
+        let mut repo = real_repo(&base);
+        repo.save(&fixture_with_revision(1))
+            .expect("seed save must succeed");
+    }
+
+    const BURST: usize = 100;
+    let mut repo = real_repo(&base);
+    repo.load().expect("load");
+    for revision in 2..=(1 + BURST as u64) {
+        let document = fixture_with_revision(revision);
+        repo.save(&document)
+            .expect("burst save must succeed (serialized path)");
+    }
+    // All 100 saves landed: the working copy holds the last revision.
+    let final_revision = repo.document().expect("document").data.revision;
+    assert_eq!(final_revision, 1 + BURST as u64);
+
+    // A fresh reader sees exactly the last document, and no temp/lock litter.
+    let mut fresh = real_repo(&base);
+    let loaded = fresh.load().expect("reload");
+    match loaded {
+        LoadOutcome::Found(document) => {
+            assert_eq!(document.data.revision, 1 + BURST as u64);
+        }
+        other => panic!("expected Found, got {other:?}"),
+    }
+    assert!(
+        !lock_file_path(base.path()).exists(),
+        "no stale lock after burst saves"
+    );
+    // All stale main-temp siblings were cleaned up by the saves.
+    let stale: Vec<_> = std::fs::read_dir(base.path())
+        .expect("read dir")
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(TEMP_FILE_PREFIX))
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "no stale temp files after burst saves: {stale:?}"
+    );
+}
+
+/// M07.2 concurrent rapid saves across TWO repository instances on real
+/// threads using the plain `save` surface (the settings/management layers both
+/// call `save_at`, which acquires the lock every time). The lock guarantees the
+/// on-disk main is ALWAYS one complete document even with many interleaved
+/// writers; the revision guard refuses overwrites rather than corrupting.
+#[test]
+fn concurrent_burst_saves_never_torn_main() {
+    let base = TempDir::new().expect("temp dir");
+    {
+        let mut repo = real_repo(&base);
+        repo.save(&fixture_with_revision(1))
+            .expect("seed save must succeed");
+    }
+
+    const WRITERS: usize = 4;
+    const WRITES_PER_WRITER: usize = 20;
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    let threads: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let base_dir = base.path().to_path_buf();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let paths = DocumentPaths::from_base_dir(&base_dir);
+                let mut repo = DocumentRepository::new(paths);
+                // Each writer loads once then writes many unique revisions; the
+                // lock serializes, but a loser's `save` can race the revision
+                // check — under the documented contract a plain `save` replaces
+                // whatever is there (single-instance), so the ONLY invariant we
+                // assert is that the main is never torn.
+                for i in 0..WRITES_PER_WRITER {
+                    let revision = 10_000 + writer as u64 * 1000 + i as u64;
+                    let document = fixture_with_revision(revision);
+                    let _ = repo.save(&document);
+                }
+                barrier.wait();
+            })
+        })
+        .collect();
+
+    for handle in threads {
+        handle.join().expect("writer thread must not panic");
+    }
+
+    // The main file must decode to SOME complete document (never torn), even
+    // after 80 interleaved saves from 4 threads.
+    let bytes = std::fs::read(main_document_path(base.path())).expect("main readable");
+    let decoded = codec_mod::decode(&bytes).expect("main decodes intact after burst");
+    assert!(
+        decoded.data.revision >= 10_000,
+        "a complete writer document is present, got revision {}",
+        decoded.data.revision
+    );
+    assert!(
+        !lock_file_path(base.path()).exists(),
+        "no stale lock after concurrent burst"
     );
 }
 

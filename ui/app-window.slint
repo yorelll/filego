@@ -80,7 +80,6 @@ export global UiStrings {
     in-out property <string> action-add: "";
     in-out property <string> action-edit: "";
     in-out property <string> action-remove: "";
-    in-out property <string> action-toggle-enabled: "";
     in-out property <string> action-toggle-pin: "";
     in-out property <string> action-check: "";
     in-out property <string> action-favorite: "";
@@ -105,6 +104,9 @@ export global UiStrings {
     in-out property <string> remove-confirm: "";
     in-out property <string> remove-never-deletes: "";
     in-out property <string> undo: "";
+    // M05-L2 closed: the banner's dismiss button wording ("保持已移除" / "Keep
+    // removed") makes explicit that the record stays removed.
+    in-out property <string> undo-dismiss: "";
     in-out property <string> add-dialog-title: "";
     in-out property <string> edit-dialog-title: "";
     in-out property <string> field-name: "";
@@ -274,6 +276,11 @@ export global UiStrings {
     in-out property <string> settings-notice-export-failed: "";
     // M06 review M3: a refused overwrite-import that would duplicate a path.
     in-out property <string> settings-notice-import-duplicate-path: "";
+    // M07.5: an import file exceeded the size or record limits.
+    in-out property <string> settings-notice-import-too-large: "";
+    // M07.1: the data file could not be read at startup (recovery on the Data
+    // page stays reachable; the original file is preserved).
+    in-out property <string> settings-notice-data-unreadable: "";
     in-out property <string> settings-notice-backups-none: "";
     in-out property <string> settings-notice-backup-created: "";
     in-out property <string> settings-notice-backup-restore-failed: "";
@@ -1421,7 +1428,10 @@ export component SettingsWindow inherits Window {
                         HorizontalBox {
                             spacing: 8px;
                             Button { text: UiStrings.undo; clicked() => { root.command-undo-remove(); } }
-                            Button { text: UiStrings.cancel; clicked() => { root.command-cancel-remove(); } }
+                            // M05-L2: "取消/Keep removed" clearly means "the
+                            // record STAYS removed, dismiss the undo banner"
+                            // (not "cancel the removal").
+                            Button { text: UiStrings.undo-dismiss; clicked() => { root.command-cancel-remove(); } }
                         }
                     }
                 }
@@ -1730,7 +1740,16 @@ export component SettingsWindow inherits Window {
                                 }
                                 HorizontalBox {
                                     spacing: 8px;
-                                    Button { text: UiStrings.settings-data-import-apply; clicked() => { root.s-command-apply-import(); } }
+                                    // M06 review I3: applying is pointless (and
+                                    // will be all-or-nothing refused) while the
+                                    // preview has conflicts, so the Apply button
+                                    // is disabled up front instead of only
+                                    // failing on click.
+                                    Button {
+                                        text: UiStrings.settings-data-import-apply;
+                                        enabled: root.s-import-conflicts == 0;
+                                        clicked() => { root.s-command-apply-import(); }
+                                    }
                                     Button { text: UiStrings.settings-data-import-cancel; clicked() => { root.s-command-cancel-import(); } }
                                 }
                             }
@@ -1990,6 +2009,16 @@ export component AppTray inherits SystemTrayIcon {
     // adapter can drive them from Rust (public setters are generated).
     in-out property <string> launch-at-login-glyph: "";
     in-out property <string> pause-hotkeys-glyph: "";
+    // ---- M04-N001 closed (M07.1): hotkey-unavailable tray hint -----------
+    // The tray remains fully usable when the global hotkey could not be
+    // registered (Conflict / Unavailable). A disabled hint row is shown above
+    // the Pause item when the hotkey is not active, via a localized anonymous
+    // string that never contains a raw error code or path. The row is disabled
+    // (Windows tray renders it greyed and non-activatable) and carries no
+    // activation callback — it is informational only. Empty string hides it
+    // (driven by the adapter: only a Disabled hotkey with a last error shows
+    // the hint).
+    in-out property <string> hotkey-unavailable-hint: "";
 
     clicked => { root.toggle-window(); }
 
@@ -2014,6 +2043,14 @@ export component AppTray inherits SystemTrayIcon {
         MenuItem {
             title: root.launch-at-login-glyph + @tr("Launch at login");
             activated => { root.toggle-launch-at-login(); }
+        }
+        // M04-N001: only shown while the hotkey is unavailable; a disabled,
+        // non-activatable row (the Windows backend renders `enabled: false`
+        // greyed and unclickable) so the user can SEE why the shortcut does not
+        // work but the tray keeps working. The string is anonymous + localized.
+        if !root.hotkey-unavailable-hint.is-empty : MenuItem {
+            title: root.hotkey-unavailable-hint;
+            enabled: false;
         }
         MenuItem {
             title: root.pause-hotkeys-glyph + @tr("Pause hotkeys");

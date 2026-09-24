@@ -213,4 +213,94 @@ mod tests {
         assert!(rect.x >= -1920 && rect.x + 600 <= 0);
         assert!(rect.y >= -100 && rect.y + 140 <= 900);
     }
+
+    // M07.4: verify the pure geometry for the common Windows scaling points.
+    // `compute_position` takes the PHYSICAL (DPI-scaled) window size, so each
+    // scale is checked as "logical × scale" physical dimensions stay centered /
+    // top-10% / fully inside the work area. These are pure-function tests of the
+    // 125% / 150% / 200% math; the real mixed-DPI desktop rendering remains a
+    // manual acceptance item.
+    #[test]
+    fn geometry_holds_at_125_percent_scaling() {
+        // 2560x1440 work area at 125% (scale 1.25): a 600x140 logical window is
+        // 750x175 physical.
+        let work = MonitorRect {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let rect = compute_position(
+            (1000, 700),
+            &[work],
+            (600.0 * 1.25) as i32,
+            (140.0 * 1.25) as i32,
+        )
+        .unwrap();
+        assert_eq!(rect.width, 750);
+        assert_eq!(rect.height, 175);
+        assert_eq!(rect.x, (2560 - 750) / 2);
+        assert_eq!(rect.y, 1440 / 10);
+        assert!(rect.x + rect.width <= 2560);
+        assert!(rect.y + rect.height <= 1440);
+    }
+
+    #[test]
+    fn geometry_holds_at_150_percent_scaling() {
+        // 1920x1080 work area at 150% (scale 1.5): 600x140 logical → 900x210
+        // physical.
+        let work = MonitorRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let rect = compute_position(
+            (960, 500),
+            &[work],
+            (600.0 * 1.5) as i32,
+            (140.0 * 1.5) as i32,
+        )
+        .unwrap();
+        assert_eq!(rect.width, 900);
+        assert_eq!(rect.height, 210);
+        assert_eq!(rect.x, (1920 - 900) / 2);
+        assert_eq!(rect.y, 1040 / 10);
+        assert!(rect.x + rect.width <= 1920);
+        assert!(rect.y + rect.height <= 1040);
+    }
+
+    #[test]
+    fn geometry_holds_at_100_and_200_percent_scaling() {
+        // The two endpoints: 100% and 200% on a 4K work area. Each stays
+        // centered / top-10% / fully inside the target monitor.
+        let work = MonitorRect {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2160,
+        };
+        let r100 = compute_position(
+            (500, 500),
+            &[work],
+            (600.0 * 1.0) as i32,
+            (140.0 * 1.0) as i32,
+        )
+        .unwrap();
+        assert_eq!((r100.width, r100.height), (600, 140));
+        let r200 = compute_position(
+            (500, 500),
+            &[work],
+            (600.0 * 2.0) as i32,
+            (140.0 * 2.0) as i32,
+        )
+        .unwrap();
+        assert_eq!((r200.width, r200.height), (1200, 280));
+        for rect in [r100, r200] {
+            assert!(rect.x >= 0 && rect.x + rect.width <= 3840);
+            assert!(rect.y >= 0 && rect.y + rect.height <= 2160);
+            assert_eq!(rect.x, (3840 - rect.width) / 2);
+            assert_eq!(rect.y, 2160 / 10);
+        }
+    }
 }

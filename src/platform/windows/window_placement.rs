@@ -277,6 +277,31 @@ mod tests {
         assert!(rect.y >= secondary.top && rect.y + rect.height <= secondary.bottom);
     }
 
+    // M07.4: the adapter's per-monitor DPI math (logical × target scale →
+    // physical px, then clamp) verified for 125% / 150% / 200% on a synthetic
+    // work area. Real mixed-DPI rendering stays a desktop-manual item.
+    #[test]
+    fn physical_rect_for_monitor_scales_at_125_150_200() {
+        let work = MonitorRect {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        for (scale, expected_w, expected_h) in [(1.25, 750, 175), (1.5, 900, 210), (2.0, 1200, 280)]
+        {
+            let rect = physical_rect_for_monitor((1000, 700), work, scale, 600.0, 140.0);
+            assert_eq!(rect.width, expected_w, "scale {scale}");
+            assert_eq!(rect.height, expected_h, "scale {scale}");
+            assert_eq!(rect.x, (2560 - expected_w) / 2, "scale {scale}");
+            assert_eq!(rect.y, 1440 / 10, "scale {scale}");
+            assert!(
+                rect.x + rect.width <= work.right && rect.y + rect.height <= work.bottom,
+                "scale {scale} stays inside work area"
+            );
+        }
+    }
+
     #[test]
     fn physical_rect_for_monitor_clamps_with_the_target_scale() {
         // A window larger than the work area under a 150% scale must clamp with
