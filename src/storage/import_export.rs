@@ -47,9 +47,11 @@ use crate::domain::{document::AppData, folder::FolderEntry, path_semantics::same
 use super::{codec, codec::StorageError, schema::StoredDocumentV1};
 
 /// Maximum accepted import-file size in bytes (M07.5 resource limit). Guards
-/// against a huge/crafted file being fully buffered into memory by
-/// `std::fs::read` in the adapter. 8 MiB comfortably holds even a 100k-record
-/// document (records are a few hundred bytes each) while bounding RAM.
+/// against a huge/crafted file being fully buffered into memory. Adapters
+/// pre-check the on-disk length via [`import_file_len_allowed`] before reading
+/// (F-5), and [`parse_import`] re-checks the actually-read byte count as the
+/// *authoritative* limit. 8 MiB comfortably holds even a 100k-record document
+/// (records are a few hundred bytes each) while bounding RAM.
 pub const MAX_IMPORT_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum accepted imported folder records (M07.5 resource limit). Prevents a
 /// crafted file from forcing the all-or-nothing apply to build a document far
@@ -199,13 +201,27 @@ impl ImportPlan {
     }
 }
 
+/// M07.5 / review F-5 defense-in-depth: whether an import file's on-disk
+/// length already exceeds [`MAX_IMPORT_BYTES`]. Callers check this via
+/// `std::fs::metadata` BEFORE `std::fs::read`, so a huge file is refused
+/// without ever being buffered into memory. The metadata call is a cheap
+/// stat; the authoritative byte limit is still re-checked by
+/// [`parse_import`] on the bytes actually read (a file can change between the
+/// stat and the read).
+pub fn import_file_len_allowed(len: u64) -> bool {
+    len <= MAX_IMPORT_BYTES as u64
+}
+
 /// parse + validate the whole import file; **no** mutation happens here or
 /// later when this fails.
 ///
 /// M07.5 resource limits: the byte size is bounded by [`MAX_IMPORT_BYTES`]
-/// (the adapter reads the whole file, so a huge file must be refused before it
-/// is buffered), and the parsed record/category/tag counts are bounded by
-/// [`MAX_IMPORT_RECORDS`] (a small file can still enumerate 100M records).
+/// (the adapter should pre-check the on-disk length via
+/// [`import_file_len_allowed`] before reading so a huge file is never fully
+/// buffered — F-5 — and [`parse_import`] re-checks the actually-read bytes as
+/// the authoritative limit), and the parsed record/category/tag counts are
+/// bounded by [`MAX_IMPORT_RECORDS`] (a small file can still enumerate 100M
+/// records).
 ///
 /// The count probe runs BEFORE `codec::decode`: a full decode validates while
 /// collecting + deduplicating ids (O(n²) for large inputs), so a crafted file
@@ -554,6 +570,35 @@ mod tests {
         assert_eq!(
             parse_import(&at_limit).unwrap_err().kind,
             ImportErrorKind::InvalidJson
+        );
+    }
+
+    #[test]
+    fn import_file_len_pre_check_refuses_oversized_files_before_buffering() {
+        // M07 review F-5: the adapter pre-checks the on-disk length via
+        // `import_file_len_allowed` before `std::fs::read`, so an oversized
+        // file is refused without ever being buffered. A length beyond the
+        // 8 MiB cap is refused; at or below the cap the pre-check passes and
+        // the (post-read, authoritative) `parse_import` byte check still
+        // governs the actual content.
+        assert!(
+            !import_file_len_allowed(super::MAX_IMPORT_BYTES as u64 + 1),
+            "a length beyond the cap must be refused by the metadata pre-check"
+        );
+        assert!(
+            import_file_len_allowed(super::MAX_IMPORT_BYTES as u64),
+            "exactly at the cap passes the metadata pre-check (parse_import is authoritative)"
+        );
+        assert!(import_file_len_allowed(0));
+        // The pre-check agrees with the authoritative byte gate in
+        // `parse_import`, so a chunk of `MAX_IMPORT_BYTES + 1` bytes is indeed
+        // refused once read, exactly as the adapter's pre-check predicted.
+        let oversized = vec![b'x'; super::MAX_IMPORT_BYTES + 1];
+        let refused = !import_file_len_allowed(oversized.len() as u64);
+        assert!(refused);
+        assert_eq!(
+            parse_import(&oversized).unwrap_err().kind,
+            ImportErrorKind::ImportTooLarge
         );
     }
 

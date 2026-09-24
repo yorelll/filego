@@ -1050,6 +1050,19 @@ impl SettingsWindowController {
                 return;
             }
         };
+        // M07 review F-5 defense-in-depth: refuse an oversized file by its
+        // on-disk length BEFORE `fs::read` buffers it into memory. The
+        // authoritative byte limit is still re-checked inside `parse_import`
+        // on the bytes actually read (the file can change between the stat and
+        // the read); this pre-check only avoids briefly buffering a huge file.
+        if let Ok(metadata) = std::fs::metadata(&path)
+            && !import_export::import_file_len_allowed(metadata.len())
+        {
+            self.settings.set_notice(SNotice::ImportTooLarge);
+            self.settings.handle(SCommand::DismissDataFlow);
+            self.sync_settings_ui();
+            return;
+        }
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -3035,7 +3048,17 @@ fn run() -> Result<(), slint::PlatformError> {
         let controller = Rc::clone(&controller);
         let port = Rc::clone(&port);
         tray.on_quit_requested(move || {
-            // Clean exit: unregister the hotkey, drop the mutex, quit.
+            // Clean exit: unregister the hotkey, drop the mutex, quit. There is
+            // no "exit wait-for-save" step by design (M07 review M-4): every
+            // settings change is persisted via an immediate, synchronous
+            // `save_at` (encoding first, then a locked atomic replace, with the
+            // working copy rolled back on failure), so at exit there is never
+            // an in-memory change still awaiting the disk. Quitting walks the
+            // same single-threaded, serialized command path as every other
+            // mutation, so no pending async save can be interrupted. No timeout
+            // primitive is needed at 0.0.1's scale; the real "save or report
+            // failure during exit" product check stays on the desktop manual
+            // list (task/03 L10).
             report_platform_error(
                 controller
                     .borrow_mut()
