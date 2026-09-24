@@ -23,6 +23,10 @@
 //!
 //! - `Overwrite`: the imported record wins on a path/id collision (fields
 //!   replaced, `created_at` preserved); a record with no collision is added.
+//!   A record whose id matches one current record but whose path collides with
+//!   a DIFFERENT current record is classified `Conflict` and the whole apply is
+//!   refused (`DuplicatePath`, all-or-nothing) — overwriting by id would leave
+//!   two records with the same path (M01.2 path uniqueness). M06 review M3.
 //! - `Merge`: add only records whose path is not already present; a colliding
 //!   path keeps the current record (skipped).
 //! - `SkipDuplicates`: like `Merge`, and a path that appears more than once
@@ -30,10 +34,11 @@
 //!
 //! Categories/tags from the file are always merged in (upsert by id), so every
 //! imported folder's category/tag references resolve. `conflicts` guards the
-//! pathological case where the union still would not resolve a reference; for a
-//! validated file it is empty. `apply_import` re-validates the union and
-//! rejects (`UnresolvedReference`) before returning, so a conflict can never
-//! reach the persisted document.
+//! pathological cases where the union still would not resolve a reference or
+//! would duplicate a path; for a validated file it is empty. `apply_import`
+//! re-validates the union (references + path uniqueness) and rejects
+//! (`UnresolvedReference` / `DuplicatePath`) before returning, so neither can
+//! ever reach the persisted document.
 
 use std::fmt;
 
@@ -54,6 +59,9 @@ pub enum ImportErrorKind {
     InvalidDocument,
     /// The merged result could not be validated (reference conflict).
     UnresolvedReference,
+    /// M06 review M3: applying would leave two records with the same path (the
+    /// M01.2 path-uniqueness invariant). All-or-nothing: refused, no mutation.
+    DuplicatePath,
     /// The document could not be encoded (export path).
     EncodeFailed,
 }
@@ -72,6 +80,7 @@ impl fmt::Display for ImportError {
             }
             ImportErrorKind::InvalidDocument => "the file does not form a valid FileGo document",
             ImportErrorKind::UnresolvedReference => "the import would leave unresolved references",
+            ImportErrorKind::DuplicatePath => "the import would duplicate a folder path",
             ImportErrorKind::EncodeFailed => "the current data could not be encoded",
         };
         formatter.write_str(text)
@@ -183,8 +192,10 @@ pub fn export_bytes(document: &StoredDocumentV1) -> Result<Vec<u8>, ImportError>
 /// dedup set (paths already planned as Added in this very file).
 ///
 /// Deterministic priority: (1) same id → `Updated` in Overwrite mode else
-/// `Skipped`; (2) same path (M01.2) → `Updated` in Overwrite mode else
-/// `Skipped`; (3) in-file duplicate path → `Skipped`; (4) otherwise `Added`.
+/// `Skipped` (unless the id-match would duplicate another record's path →
+/// `Conflict`, see M06 review M3); (2) same path (M01.2) → `Updated` in
+/// Overwrite mode else `Skipped`; (3) in-file duplicate path → `Skipped`;
+/// (4) otherwise `Added`.
 fn classify(
     folder: &FolderEntry,
     current: &AppData,
@@ -198,6 +209,23 @@ fn classify(
         .iter()
         .any(|existing| existing.id == folder.id);
     if id_present {
+        // M06 review M3: an id-match whose incoming path collides with a
+        // DIFFERENT record (not the id-matched one) is ambiguous — overwriting
+        // by id would leave two records with the same path. Classify as
+        // `Conflict` (only in Overwrite mode, the mode that replaces by id) so
+        // the preview shows it and the all-or-nothing apply refuses it.
+        let id_matched_path_differs = current
+            .folders
+            .iter()
+            .find(|existing| existing.id == folder.id)
+            .is_some_and(|existing| !same_path(&existing.path, &folder.path));
+        let collides_with_different_record = current
+            .folders
+            .iter()
+            .any(|existing| existing.id != folder.id && same_path(&existing.path, &folder.path));
+        if mode.overwrite_wins() && id_matched_path_differs && collides_with_different_record {
+            return (ItemStatus::Conflict, name);
+        }
         return (
             if mode.overwrite_wins() {
                 ItemStatus::Updated
@@ -328,9 +356,18 @@ pub fn apply_import(
                 plan.skipped.push(name);
             }
             ItemStatus::Conflict => {
+                // M06 review M3: an ambiguous path collision (overwriting by id
+                // would leave two records with the same path). All-or-nothing:
+                // the whole import is refused below; nothing is mutated.
                 plan.conflicts.push(name);
             }
         }
+    }
+    // M06 review M3, all-or-nothing: any path-collision `Conflict` is
+    // ambiguous, so refuse the ENTIRE import (never apply the non-conflicting
+    // records while silently dropping the ambiguous one).
+    if !plan.conflicts.is_empty() {
+        return Err(ImportError::new(ImportErrorKind::DuplicatePath));
     }
 
     let mut data = AppData {
@@ -340,11 +377,41 @@ pub fn apply_import(
         tags,
         revision: current.revision,
     };
-    // All-or-nothing guard: the union must re-validate, or nothing is applied.
+    // All-or-nothing guard #1: the union must re-validate (references,
+    // settings, ids), or nothing is applied.
     if data.validate_and_normalize().is_err() {
         return Err(ImportError::new(ImportErrorKind::UnresolvedReference));
     }
+    // All-or-nothing guard #2 (M06 review M3): the merged document must not
+    // contain two records with the same path under M01.2 semantics. This can
+    // only arise when an id-match overwrote a record with a path that another
+    // current record already owns (classify already turns that case into
+    // `Conflict`, but the final invariant is enforced here regardless, so the
+    // persisted document can never hold a duplicate path).
+    if duplicate_paths(&data.folders) {
+        return Err(ImportError::new(ImportErrorKind::DuplicatePath));
+    }
     Ok((StoredDocumentV1::new(data), plan))
+}
+
+/// Whether any two records in `folders` share a path under M01.2 semantics
+/// (the path-uniqueness invariant the repository/maintenance layer maintains).
+fn duplicate_paths(folders: &[FolderEntry]) -> bool {
+    // Same composite key the repository uses for maintenance duplicate scans
+    // (`path_key` class + normalized text), so the import cannot contradict
+    // the live uniqueness invariant.
+    let mut seen: Vec<String> = Vec::with_capacity(folders.len());
+    for folder in folders {
+        let Some(key) = crate::domain::path_semantics::path_key(&folder.path) else {
+            continue;
+        };
+        let entry = format!("{:?}\u{1}{}", key.class, key.normalized);
+        if seen.contains(&entry) {
+            return true;
+        }
+        seen.push(entry);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -480,6 +547,106 @@ mod tests {
         assert!(applied.data.folders.iter().any(|f| f.display_name == "New"));
         // Settings/revision preserved.
         assert_eq!(applied.data.revision, 2);
+    }
+
+    #[test]
+    fn overwrite_where_id_match_duplicates_another_records_path_is_refused() {
+        // M06 review M3: incoming record 1 has id==A.id but path==B.path (A, B
+        // are two different current records). Overwriting A by id would leave
+        // two records (A and B) with the same path — the M01.2 path-uniqueness
+        // invariant. The whole import must be refused (all-or-nothing), with a
+        // clear DuplicatePath error, and nothing mutated.
+        let mut current = base_data();
+        current.folders.push(folder(2, "Work", r"D:\work"));
+        let mut incoming = folder(1, "Docs But Work Path", r"D:\work"); // id==A(1), path==B(2)
+        incoming.created_at = utc("2099-01-01T00:00:00Z");
+        let incoming_data = AppData {
+            folders: vec![incoming],
+            ..base_data()
+        };
+
+        // Preview flags the ambiguous record as a conflict (not "updated").
+        let plan = plan_import(&current, &incoming_data, ImportMode::Overwrite);
+        assert_eq!(plan.conflicts, ["Docs But Work Path"]);
+        assert_eq!(plan.updated_count(), 0);
+
+        // Apply refuses the WHOLE import (all-or-nothing), no mutation.
+        let result = apply_import(&current, &incoming_data, ImportMode::Overwrite);
+        assert_eq!(
+            result.unwrap_err().kind,
+            ImportErrorKind::DuplicatePath,
+            "ambiguous path-id overwrite must be refused"
+        );
+        assert_eq!(current.folders.len(), 2, "current untouched");
+    }
+
+    #[test]
+    fn non_colliding_overwrite_still_applies() {
+        // M06 review M3: when the id-match keeps its own path (no collision
+        // with any OTHER record) overwrite still works exactly as before.
+        let current = base_data(); // single record A: id 1, path C:\docs
+        let mut same = folder(1, "Docs Renamed", r"C:\docs"); // id A + A's path
+        same.created_at = utc("2099-01-01T00:00:00Z");
+        let incoming = AppData {
+            folders: vec![same, folder(9, "New", r"D:\new")],
+            ..base_data()
+        };
+        let plan = plan_import(&current, &incoming, ImportMode::Overwrite);
+        assert_eq!(plan.updated, ["Docs Renamed"]);
+        assert_eq!(plan.added, ["New"]);
+        assert_eq!(plan.conflicts_count(), 0);
+
+        let (applied, _) = apply_import(&current, &incoming, ImportMode::Overwrite).expect("apply");
+        let docs = applied
+            .data
+            .folders
+            .iter()
+            .find(|f| f.id.as_uuid() == Uuid::from_u128(1))
+            .expect("docs under id 1");
+        assert_eq!(docs.display_name, "Docs Renamed");
+        assert_eq!(applied.data.folders.len(), 2);
+        // Path uniqueness preserved: exactly one record owns C:\docs.
+        assert_eq!(
+            applied
+                .data
+                .folders
+                .iter()
+                .filter(|f| same_path(&f.path, r"C:\docs"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn own_export_overwrite_round_trip_is_still_accepted() {
+        // M06 review M3: re-importing the app's OWN export in Overwrite mode
+        // (identical ids AND identical paths — a normal "restore same file"
+        // flow) must keep working: no false conflict, no duplicate path.
+        let current = base_data();
+        let document = doc(current.clone());
+        let bytes = export_bytes(&document).expect("export");
+        let parsed = parse_import(&bytes).expect("parse own export");
+        let plan = plan_import(&current, &parsed.data, ImportMode::Overwrite);
+        assert_eq!(plan.updated, ["Docs"]);
+        assert_eq!(plan.conflicts_count(), 0);
+
+        let (applied, _) =
+            apply_import(&current, &parsed.data, ImportMode::Overwrite).expect("apply");
+        assert_eq!(applied.data.folders.len(), 1);
+        assert!(
+            applied
+                .data
+                .folders
+                .iter()
+                .any(|f| f.id == current.folders[0].id)
+        );
+        assert!(
+            applied
+                .data
+                .folders
+                .iter()
+                .any(|f| same_path(&f.path, r"C:\docs"))
+        );
     }
 
     #[test]

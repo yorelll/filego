@@ -76,9 +76,13 @@ pub enum MonitorStrategy {
     /// behavior).
     #[default]
     Mouse,
-    /// Place on the monitor containing the foreground active window (0.0.1
-    /// maps this to the same cursor-monitor fallback; the strategy is
-    /// persisted for forward-compat).
+    /// Place on the monitor containing the foreground (active) window. The
+    /// placement is genuinely implemented in
+    /// `platform::windows::window_placement::placement_rect_for_active_window`
+    /// (`GetWindowRect` → monitor work area, DPI-aware); when the active-window
+    /// handle is invalid/unavailable the placement falls back to the cursor
+    /// monitor (same as [`MonitorStrategy::Mouse`]). M06 review M2: corrected
+    /// docstring to match the real wiring.
     ActiveWindow,
 }
 
@@ -349,8 +353,14 @@ pub struct AppSettings {
     /// visible" unless the platform otherwise suppresses it.
     #[serde(default = "default_true")]
     pub silent_start: bool,
-    /// The launch-at-login flag as persisted (kept in sync with the HKCU Run
-    /// value written by [`crate::platform::windows::tray_open`]).
+    /// M06 review L1: LEGACY forward-compat field. The HKCU Run value is the
+    /// single source of truth (tracked live by
+    /// `SettingsWindowController::set_launch_at_login_os` and read from the
+    /// registry at startup/toggle), so this persisted flag is never read or
+    /// written by any logic. It is KEPT because `AppSettings` decodes with
+    /// `#[serde(deny_unknown_fields)]`: every M06-era on-disk document
+    /// serializes this key, so dropping the field would make existing data
+    /// files fail to load. Retain as a defaulted, always-false legacy field.
     #[serde(default)]
     pub launch_at_login_wired: bool,
     /// Which monitor the search window targets (M06.2).

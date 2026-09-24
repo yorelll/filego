@@ -272,7 +272,8 @@ export global UiStrings {
     in-out property <string> settings-notice-import-applied: "";
     in-out property <string> settings-notice-import-preview-failed: "";
     in-out property <string> settings-notice-export-failed: "";
-    in-out property <string> settings-notice-export-target-exists: "";
+    // M06 review M3: a refused overwrite-import that would duplicate a path.
+    in-out property <string> settings-notice-import-duplicate-path: "";
     in-out property <string> settings-notice-backups-none: "";
     in-out property <string> settings-notice-backup-created: "";
     in-out property <string> settings-notice-backup-restore-failed: "";
@@ -1221,12 +1222,10 @@ export component SettingsWindow inherits Window {
     callback s-command-list-backups();
     callback s-command-restore-backup(int);
     callback s-command-clear-recent();
-    callback s-command-arm-clear-all();
+    // M06 review L2: the two-step confirm state is local (`s-confirm-*`);
+    // only the final confirm callbacks are wired to Rust (no dead arm/cancel).
     callback s-command-confirm-clear-all();
-    callback s-command-cancel-clear-all();
-    callback s-command-arm-reset();
     callback s-command-confirm-reset();
-    callback s-command-cancel-reset();
     callback s-command-rename-category(int, string);
     callback s-command-rename-tag(int, string);
     callback s-command-merge-tag(int, string);
@@ -2006,7 +2005,10 @@ export component AppTray inherits SystemTrayIcon {
         MenuSeparator {}
         MenuItem {
             title: @tr("Settings");
-            enabled: false; // M06 wires the settings window.
+            // M06 review H1: the tray Settings entry must reach the settings
+            // window, so this item carries NO `enabled` gate (previously it was
+            // hardcoded disabled and unreachable). The Rust side
+            // (`tray.on_open_settings`) shows + focuses the SettingsWindow.
             activated => { root.open-settings(); }
         }
         MenuItem {

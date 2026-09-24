@@ -157,6 +157,34 @@ fn bring_search_to_front(app: &AppWindow) {
     let _ = filego::platform::windows::window_focus::bring_to_front_bits(hwnd_bits, true);
 }
 
+/// Show the settings window and bring it to the foreground (tray "设置" and any
+/// other direct settings-open path). Mirror of `bring_search_to_front`: the
+/// same native bring-to-front fallback chain, so the window is not merely
+/// mapped but foreground-focused.
+///
+/// M06 review H1: the SettingsWindow has no focus-loss hide wiring
+/// (`hide_on_focus_loss` only affects the main search window; the native focus
+/// hook is an M07 manual item), so the settings window stays open while the
+/// user works in it.
+fn open_settings_window(settings: &std::rc::Rc<std::cell::RefCell<SettingsWindowController>>) {
+    let Some(window) = settings.borrow().window.upgrade() else {
+        return;
+    };
+    let _ = window.show();
+    use raw_window_handle::HasWindowHandle as _;
+    // Bind the winit window handle so its owned data outlives the
+    // `HasWindowHandle` borrow (E0716, same as `bring_search_to_front`).
+    let winit_window = window.window().window_handle();
+    let Ok(handle) = winit_window.window_handle() else {
+        return;
+    };
+    let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd_bits = win32.hwnd.get();
+    let _ = filego::platform::windows::window_focus::bring_to_front_bits(hwnd_bits, true);
+}
+
 fn event_loop_error_as_platform_error(error: slint::EventLoopError) -> slint::PlatformError {
     slint::PlatformError::from(error.to_string())
 }
@@ -1028,6 +1056,10 @@ impl SettingsWindowController {
                     ImportErrorKind::FutureSchema => SNotice::ImportFutureSchema,
                     ImportErrorKind::MigrationNeeded => SNotice::ImportMigrationNeeded,
                     ImportErrorKind::UnresolvedReference => SNotice::ImportUnresolvedReference,
+                    // `DuplicatePath` cannot arise from parsing a single
+                    // standalone document (it is an apply-time union check),
+                    // but the match must stay exhaustive.
+                    ImportErrorKind::DuplicatePath => SNotice::ImportInvalidDocument,
                     ImportErrorKind::EncodeFailed => SNotice::ImportParseFailed,
                 };
                 self.settings.set_notice(notice);
@@ -1070,6 +1102,22 @@ impl SettingsWindowController {
             .unwrap_or(import_export::ImportMode::Merge);
         match import_export::apply_import(&current.data, &incoming, mode) {
             Ok((applied, _)) => {
+                // M06 review M1: before an OVERWRITE-mode import actually
+                // applies (mutates the document), take an explicit user-facing
+                // backup snapshot of the CURRENT (pre-import) document, so the
+                // user has a restorable point beyond the internal data.json.bak.
+                // All-or-nothing still holds: this runs only right before the
+                // apply, and a failed import never reaches this branch. The
+                // snapshot reuses the standard backup list (visible + restorable
+                // on the Data page) under a recognizable `before-import-` stamp.
+                if mode == import_export::ImportMode::Overwrite {
+                    let stamp = format!(
+                        "before-import-{}",
+                        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                    );
+                    let _ =
+                        filego::storage::backup::create_backup(&self.data_dir, &current, &stamp);
+                }
                 let revision = {
                     let mut repo = self.repo.borrow_mut();
                     if repo.set_data(applied.data).is_err() {
@@ -1080,7 +1128,13 @@ impl SettingsWindowController {
                     let _ = applied;
                     repo.save_at()
                 };
-                match revision {
+                let revision_result = revision;
+                // Refresh the Data-page backup list so the pre-import snapshot
+                // (and any earlier manual backups) stay visible after the apply.
+                let names =
+                    filego::storage::backup::list_backups(&self.data_dir).unwrap_or_default();
+                self.settings.set_backups(names);
+                match revision_result {
                     Ok(_) => {
                         self.settings.handle(SCommand::ApplyImport);
                     }
@@ -1089,8 +1143,16 @@ impl SettingsWindowController {
                     }
                 }
             }
-            Err(_) => {
-                self.settings.set_notice(SNotice::ImportUnresolvedReference);
+            Err(error) => {
+                // M06 review M3: a refused overwrite-import (ambiguous path
+                // collision) gets its own clear anonymous notice; other apply
+                // failures keep the existing unresolved-reference notice.
+                let notice = if error.kind == import_export::ImportErrorKind::DuplicatePath {
+                    SNotice::ImportDuplicatePath
+                } else {
+                    SNotice::ImportUnresolvedReference
+                };
+                self.settings.set_notice(notice);
             }
         }
         self.sync_settings_ui();
@@ -1622,8 +1684,8 @@ fn snotice_text(
         filego::presentation::settings_controller::SNotice::ExportFailed => {
             Msg::MonoNoticeExportFailed
         }
-        filego::presentation::settings_controller::SNotice::ExportTargetExists => {
-            Msg::MonoNoticeExportTargetExists
+        filego::presentation::settings_controller::SNotice::ImportDuplicatePath => {
+            Msg::MonoNoticeImportDuplicatePath
         }
         filego::presentation::settings_controller::SNotice::BackupsNone => {
             Msg::MonoNoticeBackupsNone
@@ -2126,8 +2188,8 @@ fn apply_settings_localization(
         ),
         ("settings_notice_export_failed", Msg::MonoNoticeExportFailed),
         (
-            "settings_notice_export_target_exists",
-            Msg::MonoNoticeExportTargetExists,
+            "settings_notice_import_duplicate_path",
+            Msg::MonoNoticeImportDuplicatePath,
         ),
         ("settings_notice_backups_none", Msg::MonoNoticeBackupsNone),
         (
@@ -2422,8 +2484,8 @@ fn call_string_setter(window: &SettingsWindow, field: &str, value: String) {
             strings.set_settings_notice_import_preview_failed(value)
         }
         "settings_notice_export_failed" => strings.set_settings_notice_export_failed(value),
-        "settings_notice_export_target_exists" => {
-            strings.set_settings_notice_export_target_exists(value)
+        "settings_notice_import_duplicate_path" => {
+            strings.set_settings_notice_import_duplicate_path(value)
         }
         "settings_notice_backups_none" => strings.set_settings_notice_backups_none(value),
         "settings_notice_backup_created" => strings.set_settings_notice_backup_created(value),
@@ -3084,9 +3146,12 @@ fn run() -> Result<(), slint::PlatformError> {
         let settings = Rc::clone(&settings_adapter);
         tray.on_open_settings(move || {
             // M05/M06: tray "设置" opens the settings window (M06 pages included).
-            if let Some(window) = settings.borrow().window.upgrade() {
-                let _ = window.show();
-            }
+            // M06 review H1: the tray Settings menu is now enabled and this is
+            // its only reachable path. Show + bring-to-front so the window is
+            // not just mapped but foreground-focused. The SettingsWindow has no
+            // focus-loss hide wiring (hide-on-focus-loss only applies to the
+            // main search window), so it stays open while the user navigates.
+            open_settings_window(&settings);
         });
     }
 
@@ -4144,6 +4209,47 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_settings_menu_item_is_enabled() {
+        // M06 review H1: the tray "Settings" MenuItem must NOT be gated with
+        // `enabled: false` — it is the only direct entry to the settings
+        // window. Source guard against re-introducing the dead gate.
+        let slint_source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/app-window.slint"),
+        )
+        .expect("app-window.slint is checked in at the repo root");
+        let tray_section = slint_source
+            .split("component AppTray inherits SystemTrayIcon")
+            .nth(1)
+            .expect("AppTray component present");
+        let title_at = tray_section
+            .find("title: @tr(\"Settings\")")
+            .expect("Settings menu item present");
+        // Scope to the entire Settings `MenuItem { ... }` block: the nearest
+        // `{` after the opening `MenuItem` up to the closing `}` of its last
+        // `activated` handler (the block's top brace becomes `open_at`).
+        let open_at = tray_section[..title_at]
+            .rfind("MenuItem {")
+            .map(|i| i + "MenuItem {".len())
+            .expect("Settings item opened with MenuItem {");
+        let rest = &tray_section[open_at..];
+        // The first `}` after the title closes `{ root.open-settings(); }`; the
+        // block is balanced, so the SECOND `}` closes the MenuItem element.
+        let first_close = rest.find('}').expect("handler close");
+        let second_close = rest[first_close + 1..].find('}').expect("element close");
+        let item_body = &rest[..first_close + 1 + second_close + 1];
+        // Match the Slint gate exactly (`enabled: false`), so a comment
+        // merely mentioning the form can never false-positive.
+        assert!(
+            !item_body.contains("enabled: false"),
+            "the tray Settings MenuItem must not carry `enabled: false` (H1)"
+        );
+        assert!(
+            item_body.contains("activated => { root.open-settings(); }"),
+            "the tray Settings item must still call open-settings()"
+        );
+    }
 
     #[test]
     fn event_loop_errors_are_converted_for_the_shared_window_port() {

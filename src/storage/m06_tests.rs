@@ -71,6 +71,68 @@ fn real_repo(base: &TempDir) -> DocumentRepository {
 }
 
 #[test]
+fn overwrite_import_snapshot_restores_the_pre_import_document() {
+    // M06 review M1: before an overwrite-mode import APPLIES, the adapter takes
+    // an explicit `backup-before-import-*.json` snapshot of the CURRENT
+    // (pre-import) document. Replicate that sequence against a real directory:
+    // seed current -> plan/apply overwrite -> snapshot pre-import -> replace +
+    // save; then assert a restorable backup exists that decodes to the exact
+    // PRE-import document (not the post-import one).
+    use crate::storage::{backup, import_export};
+    let base = TempDir::new().expect("temp dir");
+    let mut repo = real_repo(&base);
+    repo.save(&seed()).expect("seed save");
+
+    let mut repo = real_repo(&base);
+    repo.load().expect("load");
+    let pre = repo.document().expect("pre-import doc").clone();
+
+    // The incoming document adds a record with a fresh path (no collision);
+    // in Overwrite mode that is still an explicit user action that mutates the
+    // document (a new record lands), so a pre-import snapshot must exist.
+    let incoming_doc = seed();
+    let incoming = AppData {
+        folders: vec![folder(99, "Imported", r"D:\imported")],
+        ..incoming_doc.data
+    };
+    let (applied, _) =
+        import_export::apply_import(&pre.data, &incoming, import_export::ImportMode::Overwrite)
+            .expect("apply");
+    assert_eq!(applied.data.folders.len(), 2, "new record added");
+
+    // The adapter creates the pre-import snapshot via the standard backup
+    // mechanism under a recognizable before-import stamp, then applies.
+    let stamp = format!("before-import-{}", Utc::now().format("%Y%m%d-%H%M%S"));
+    backup::create_backup(base.path(), &pre, &stamp).expect("pre-import snapshot");
+    repo.set_data(applied.data).expect("set_data");
+    repo.save_at().expect("save after overwrite import");
+
+    // Assert: a backup-before-import file exists, is listed, and decodes to
+    // the EXACT pre-import document (the old record + old revision).
+    let names = backup::list_backups(base.path()).expect("list");
+    let snapshot = names
+        .iter()
+        .find(|name| name.starts_with("backup-before-import-"))
+        .cloned()
+        .expect("a before-import snapshot must exist after an overwrite import");
+    let decoded = backup::read_backup(base.path(), &snapshot).expect("decode snapshot");
+    assert_eq!(decoded, pre, "snapshot decodes to the pre-import document");
+    assert_eq!(decoded.data.folders.len(), 1);
+    assert_eq!(decoded.data.folders[0].path, r"C:\docs");
+    assert_eq!(decoded.data.revision, 2);
+    // The live document is the applied (post-import) one.
+    let live = repo.document().expect("live doc");
+    assert_eq!(live.data.folders.len(), 2, "imported record landed live");
+    assert!(
+        live.data
+            .folders
+            .iter()
+            .any(|f| f.display_name == "Imported")
+    );
+    assert_ne!(live, &pre, "live document changed by the import");
+}
+
+#[test]
 fn settings_round_trip_through_a_real_file() {
     let base = TempDir::new().expect("temp dir");
     let mut repo = real_repo(&base);

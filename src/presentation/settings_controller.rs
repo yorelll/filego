@@ -93,7 +93,9 @@ pub enum SNotice {
     ImportApplied,
     ImportPreviewFailed,
     ExportFailed,
-    ExportTargetExists,
+    // M06 review M3: an overwrite import was refused because a path would be
+    // duplicated (all-or-nothing; nothing was mutated).
+    ImportDuplicatePath,
     BackupsNone,
     BackupCreated,
     BackupRestoreFailed,
