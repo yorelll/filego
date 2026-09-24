@@ -26,7 +26,7 @@
 | M05-OBS-02（action_toggle_enabled 死键） | `CLOSED` | 删除死 i18n 键 + slint 属性 + setter。 |
 | M01B-N001-followup（repair_from_backup 不加锁） | `CLOSED` | `repair_from_backup` 全程持有 `WriteLock`（repository.rs）；回归测试 `repair_from_backup_contends_with_a_concurrent_writer_via_the_lock`。发布前必须关闭的项现已关闭。 |
 | M07.1 配置读取失败静默 | `CLOSED` | `open_repository` 返回 `StartupDataStatus`，数据未读时 Data 页显示匿名双语通知 `settings.notice.data_unreadable`；恢复动作（打开数据位置/恢复备份/重置）原本已可达。损坏文件保留，不自动覆盖。 |
-| M07.1 panic hook 红action | `CLOSED` | `install_redacted_panic_hook` 只写匿名行到数据目录 `panic.log`（`diagnostics::log_panic`，256KB 上限 + `.1` 轮转）；payload/用户路径/query 一律不落盘；release 无 console spam。 |
+| M07.1 panic hook 脱敏（redaction） | `CLOSED` | `install_redacted_panic_hook` 只写匿名行到数据目录 `panic.log`（`diagnostics::log_panic`，256KB 上限 + `.1` 轮转）；payload/用户路径/query 一律不落盘；release 无 console spam。 |
 | M07.5 导入资源限制 | `CLOSED` | `MAX_IMPORT_BYTES=8MiB`、`MAX_IMPORT_RECORDS=100k`；解析前的线性 count probe（不做 O(n²) 全量解码）；超限返回 `ImportTooLarge`，不 mutation；i18n + 通知。3 项测试。 |
 | M07.5 shell/command 源守卫 | `CLOSED` | `storage/tests.rs` 递归扫描禁止 `std::process::Command`/`powershell`/`cmd.exe`/`CreateProcess` 等；ShellExecuteExW 边界必须 `lpVerb=null`/`lpParameters=null`。 |
 | M07.5 GH Actions 供应链 | `CLOSED` | `workflows_pin_actions_and_use_minimal_permissions` + `release_workflow_never_runs_untrusted_code_with_write`：actions 全 full-SHA pin、`permissions: contents: read`、dispatch-only、无 write scope、无 release job。 |
@@ -38,15 +38,15 @@
 | ID / 项 | 说明 / 依据 |
 |---|---|
 | M02-F005 多音字首读音 | `keys.rs` 文档化；确定性取首读音，非常用读音拼音搜索可能不命中。r02 CLOSED（文档）。对应桌面验收项。 |
-| M02-F003 重复检测 O(n²)（`duplicate_folders` 全库定位） | 保留，证据：10k 时逐键 `is_duplicate_path` ~77µs debug（release ~个位数 µs），仅显式「定位重复」按钮触发 O(n²) 全库扫描（debug 772ms / release ~80ms），不在搜索热路径。搜素核心本身无路径比较。 |
-| M02 review F005（MSVC>50ms 基线） | 归 M07.3 真实机器复核；CI 基准只做回归门禁（宽松 500ms），权威 50ms 由真实桌面测量。hosted MSVC 数字记录在 M02/M06 review 证据。 |
+| M02-F003 重复检测 O(n²)（`duplicate_folders` 全库定位） | 保留（仅显式「定位重复」按钮触发 O(n²) 全库扫描，不在搜索热路径；搜索核心本身无路径比较）。性能数字为本地 debug 快速反馈（10k 时逐键 `is_duplicate_path` ~77µs debug / release ~个位数 µs；全库扫描 debug ~772ms / release ~80ms），**非 MSVC 权威、非 Git 可复算产品断言；为（目标/待真实机器测量），权威数字由 M07.3/桌面性能验收实测后补入 `review/0-0-1/manual-acceptance.md`**。 |
+| M02 review F005（MSVC>50ms 基线） | 归 M07.3 真实机器复核；CI 基准只做回归门禁（宽松 500ms，本机 hosted 数字非产品断言），权威 50ms 由真实桌面测量。**尚未实测量化，列为（目标/待真实机器测量）**。 |
 | native 失焦钩子（hide_on_focus_loss） | M06.2 已接 接入设置；真实 native 失焦行为留桌面手工验收（M08）。 |
 | Explorer 重启 tray 恢复 / 显示器变化 / 睡眠唤醒 / 网络断连 | M04/M07 桌面手工验收项（task/03 C8、H5/H6、L9）。 |
 | 混合 DPI / 文本缩放 / 高对比 / 减少动画 / 屏幕阅读器 | M07.4 桌面手工项；screen reader 受 Slint 1.18 限制，如实披露、不虚假宣称（task/03 I7/I9/I11）。 |
 | Microsoft 拼音候选放置/composition | 桌面手工验收（task/03 G1-G3）；presenter 层 IME gate 已实现并有状态机测试。 |
 | OS 拖拽（drag-drop） | M05 记录为 seam：Slint 1.18 不透传 DroppedFile；剪贴板粘贴可用。桌面手工项。 |
 | 线程模型 | 单 worker 线程（filego-native-worker）+ 每条 shell open 一个临时线程；无 per-show 线程生成；`Rc` 不强捕获进线程。 |
-| 空闲 CPU/内存 | 无 timer busy-loop（3 个 50ms drain timer 仅 `try_recv`，空 channel 立即返回）；内存 `<50MB` 目标与实测记录见 M07.3 报告区。 |
+| 空闲 CPU/内存 | 无 timer busy-loop 是 **静态代码结构结论**（3 个 50ms drain timer 仅 `try_recv`，空 channel 立即返回），**不得声称「实测 CPU 0%」**；内存 `<50MB` 为**优化目标（待真实机器测量）**，由 M07.3/桌面性能验收实测，权威记录计划补入 `review/0-0-1/manual-acceptance.md` —— 此前不作为已达标事实。 |
 
 ## MVP 缺失（**不得**标为 known issue 放行发布；仅列清单）
 
@@ -59,4 +59,4 @@
 
 ## 说明
 
-- 以上 CLOSED 项均随 MSVC CI run（见本轮 response 记录的 run ID）执行；CI 全绿前不作为已验证。
+- 以上 CLOSED 项均随 MSVC CI run 执行。权威 run ID 见 `review/0-0-1/m07-hardening-response-r01.md`（Windows CI `35950631364` + Search benchmark `35950631427`，head `367bb8c`）；CI 全绿前不作为已验证。
