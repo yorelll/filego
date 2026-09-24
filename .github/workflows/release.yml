@@ -237,6 +237,7 @@ jobs:
             throw "Malformed PE: missing PE signature"
           }
           $coffOffset = $peOffset + 4
+          $sectionCount = [int](Read-UInt16LE $bytes ($coffOffset + 2) "section count")
           $optionalSize = [int](Read-UInt16LE $bytes ($coffOffset + 16) "optional-header size")
           $optionalOffset = $coffOffset + 20
           if ($optionalSize -lt 2 -or $optionalOffset + $optionalSize -gt $bytes.Length) {
@@ -260,6 +261,89 @@ jobs:
           }
           $debugRva = Read-UInt32LE $bytes $debugDirectoryOffset "debug RVA"
           $debugSize = Read-UInt32LE $bytes ($debugDirectoryOffset + 4) "debug size"
+          if (($debugRva -eq 0) -xor ($debugSize -eq 0)) {
+            throw "Malformed PE: debug data directory has only one zero field"
+          }
+
+          function Clear-ByteRange {
+            param([byte[]] $Bytes, [int] $Offset, [int] $Length, [string] $Label)
+            if ($Offset -lt 0 -or $Length -lt 0 -or
+                ([uint64] $Offset + [uint64] $Length) -gt [uint64] $Bytes.Length) {
+              throw "Malformed PE: invalid $Label range"
+            }
+            for ($index = 0; $index -lt $Length; $index++) {
+              $Bytes[$Offset + $index] = 0
+            }
+          }
+          function Get-RawOffsetForRva {
+            param(
+              [uint32] $Rva,
+              [object[]] $Sections,
+              [uint32] $SizeOfHeaders,
+              [int] $FileLength
+            )
+            if ($Rva -lt $SizeOfHeaders) {
+              if ($Rva -ge $FileLength) { throw "Malformed PE: header RVA is outside the file" }
+              return [int] $Rva
+            }
+            foreach ($section in $Sections) {
+              $start = [uint64] $section.VirtualAddress
+              $span = [Math]::Max([uint64] $section.VirtualSize, [uint64] $section.SizeOfRawData)
+              $end = $start + $span
+              if ([uint64] $Rva -ge $start -and [uint64] $Rva -lt $end) {
+                $offset = [uint64] $section.PointerToRawData + ([uint64] $Rva - $start)
+                if ($offset -ge [uint64] $FileLength) { throw "Malformed PE: section RVA is outside the file" }
+                return [int] $offset
+              }
+            }
+            throw "Malformed PE: debug RVA does not map to a section"
+          }
+
+          # llvm-objcopy removes debug sections but, on this MSVC-linked PE,
+          # leaves the IMAGE_DIRECTORY_ENTRY_DEBUG record itself. Clear that
+          # record and each payload it points to, then clear directory index 6.
+          # This is deliberately PE-specific and immediately re-parsed below.
+          if ($debugRva -ne 0) {
+            if ($debugSize -lt 28 -or ($debugSize % 28) -ne 0) {
+              throw "Malformed PE: debug data directory is not IMAGE_DEBUG_DIRECTORY entries"
+            }
+            $sectionTableOffset = $optionalOffset + $optionalSize
+            if (($sectionTableOffset + (40 * $sectionCount)) -gt $bytes.Length) {
+              throw "Malformed PE: truncated section table"
+            }
+            $sections = @()
+            for ($sectionIndex = 0; $sectionIndex -lt $sectionCount; $sectionIndex++) {
+              $sectionOffset = $sectionTableOffset + (40 * $sectionIndex)
+              $sections += [pscustomobject]@{
+                VirtualSize = Read-UInt32LE $bytes ($sectionOffset + 8) "section virtual size"
+                VirtualAddress = Read-UInt32LE $bytes ($sectionOffset + 12) "section virtual address"
+                SizeOfRawData = Read-UInt32LE $bytes ($sectionOffset + 16) "section raw size"
+                PointerToRawData = Read-UInt32LE $bytes ($sectionOffset + 20) "section raw offset"
+              }
+            }
+            $sizeOfHeaders = Read-UInt32LE $bytes ($optionalOffset + 60) "size of headers"
+            $debugOffset = Get-RawOffsetForRva $debugRva $sections $sizeOfHeaders $bytes.Length
+            if (([uint64] $debugOffset + [uint64] $debugSize) -gt [uint64] $bytes.Length) {
+              throw "Malformed PE: debug directory extends beyond the file"
+            }
+            for ($entryOffset = $debugOffset; $entryOffset -lt ($debugOffset + $debugSize); $entryOffset += 28) {
+              $dataSize = Read-UInt32LE $bytes ($entryOffset + 16) "debug payload size"
+              $dataOffset = Read-UInt32LE $bytes ($entryOffset + 24) "debug payload offset"
+              if ($dataSize -ne 0) {
+                if ($dataOffset -gt [int]::MaxValue -or $dataSize -gt [int]::MaxValue) {
+                  throw "Malformed PE: invalid debug payload offset or size"
+                }
+                Clear-ByteRange $bytes ([int] $dataOffset) ([int] $dataSize) "debug payload"
+              }
+            }
+            Clear-ByteRange $bytes $debugOffset ([int] $debugSize) "debug directory"
+            Clear-ByteRange $bytes $debugDirectoryOffset 8 "debug data-directory entry"
+            [System.IO.File]::WriteAllBytes($portableExe, $bytes)
+            $bytes = [System.IO.File]::ReadAllBytes($portableExe)
+          }
+
+          $debugRva = Read-UInt32LE $bytes $debugDirectoryOffset "verified debug RVA"
+          $debugSize = Read-UInt32LE $bytes ($debugDirectoryOffset + 4) "verified debug size"
           if ($debugRva -ne 0 -or $debugSize -ne 0) {
             throw ("Portable EXE retains PE debug directory: RVA=0x{0:x}, Size={1}" -f $debugRva, $debugSize)
           }
