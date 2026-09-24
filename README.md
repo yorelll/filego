@@ -4,7 +4,7 @@
 
 FileGo 是面向 Windows 的轻量级文件夹快捷启动工具。它常驻系统托盘；用户通过全局快捷键唤出搜索窗口，输入名称、路径、分类或标签，并用键盘快速打开已添加的文件夹。
 
-> 当前状态：`0.0.1` 开发中。FileGo 更名、GNU/MSVC 双工具链规则及显式 MSVC target 路径已由 Windows CI run `35587340136`（head `c42f5728`）验证；FileGo release-candidate workflow run `35590444471`（candidate `3c42413c`）亦已验证成功。真实 Windows 桌面行为仍待验证。
+> 当前状态：`0.0.1` 已完成候选构建验证，但尚未正式发布。候选构建、真实 Windows 桌面手工验收和独立 release review 是发布前的必经门禁；在这些门禁完成前，不应把候选构建视为正式版本。
 
 ## 产品目标
 
@@ -16,7 +16,7 @@ FileGo 是面向 Windows 的轻量级文件夹快捷启动工具。它常驻系�
 
 ## `0.0.1` 范围
 
-首版计划包含：
+首版包含：
 
 - 系统托盘、单实例运行和可配置的全局快捷键。
 - 顶部居中的搜索窗口，以及名称、路径、分类和标签搜索。
@@ -54,7 +54,30 @@ FileGo 是面向 Windows 的轻量级文件夹快捷启动工具。它常驻系�
 
 交互类能力（托盘、全局快捷键、中文输入、多显示器等）需使用 MSVC CI 生成的便携版在真实 Windows 桌面上完成发布前手工验收。
 
-当前 M00 只提供架构验证壳：静默托盘启动、最小搜索窗口、显示/隐藏及退出。搜索、持久化、快捷键、单实例和完整设置尚未实现，不能视为可发布版本。
+### 安装与运行
+
+FileGo 是未签名的 Windows x86-64 便携应用，不提供安装器。请仅从对应 GitHub Actions candidate artifact 或正式 GitHub Release 下载 `FileGo-0.0.1-windows-x86_64.zip`，先按随附 SHA-256 校验文件验证下载完整性，再解压 ZIP 到一个由自己管理的目录并运行 `FileGo.exe`。ZIP 包含应用、`README.md`、`LICENSE`、`THIRD_PARTY_LICENSES.html` 和 Slint 许可证文本。
+
+由于构建未签名，Windows SmartScreen 可能在首次运行时显示警告。请核对下载来源和 SHA-256 后，再按照 Windows 提供的逐项选项决定是否运行；不要为运行 FileGo 而广泛关闭 SmartScreen、杀毒软件或其他操作系统安全功能。
+
+应用通常以系统托盘方式启动。默认全局快捷键为 `Ctrl + Alt + Space`；也可以通过 tray 菜单显示主窗口。
+
+### 数据、备份与卸载
+
+默认数据目录是 `%LOCALAPPDATA%\FileGo`，主数据文件为 `data.json`。数据保存在当前 Windows 用户的本地应用数据目录，不保存在 ZIP 解压目录中。
+
+在更新、降级、导入或手工清理前，建议先在设置的“数据”页面创建备份或导出 versioned JSON，并把导出文件保存到应用数据目录之外的安全位置。卸载方式是退出 FileGo 后删除其解压目录；这不会自动删除 `%LOCALAPPDATA%\FileGo` 中的数据和备份。若要清除个人数据，请在确认已完成备份后自行删除该数据目录。
+
+### 验证 SHA-256
+
+在 PowerShell 中，将路径替换为实际下载位置后运行：
+
+```powershell
+Get-FileHash ".\FileGo-0.0.1-windows-x86_64.zip" -Algorithm SHA256
+Get-Content ".\FileGo-0.0.1-SHA256SUMS.txt"
+```
+
+将输出的哈希值与 `FileGo-0.0.1-SHA256SUMS.txt` 中同名 ZIP（或独立 EXE）的值逐字符比较。哈希不一致时，不要运行该文件，应重新从原始 artifact 或 Release 下载。
 
 ### 获取开发构建
 

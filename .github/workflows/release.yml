@@ -55,6 +55,24 @@ jobs:
             throw "Checked out '$actual', expected '$env:CANDIDATE_SHA'"
           }
 
+      - name: Remap compiler source paths
+        shell: pwsh
+        run: |
+          # Rust embeds panic locations from the workspace and registry even
+          # in stripped release binaries. Use stable, non-host paths so the
+          # portable candidate does not disclose the build machine layout.
+          # CI places the registry under USERPROFILE; add the workspace parent
+          # too because generated Slint sources live under target/.
+          $registry = Join-Path $env:USERPROFILE ".cargo\registry\src"
+          $workspaceParent = Split-Path $env:GITHUB_WORKSPACE -Parent
+          $flags = @(
+            "--remap-path-prefix=$env:GITHUB_WORKSPACE=/filego",
+            "--remap-path-prefix=$workspaceParent=/workspace",
+            "--remap-path-prefix=$registry=/cargo/registry/src"
+          )
+          "CARGO_ENCODED_RUSTFLAGS=$($flags -join [char]0x1f)" |
+            Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable action commit
         with:
@@ -132,6 +150,14 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($notice)) { throw "License inventory is empty" }
           if ($notice -notmatch '<title>FileGo Third-Party Licenses</title>') { throw "License inventory title is missing" }
 
+      - name: Verify portable release layout
+        shell: pwsh
+        run: |
+          $exe = "target\x86_64-pc-windows-msvc\release\filego.exe"
+          if (-not (Test-Path $exe -PathType Leaf)) { throw "Missing $exe" }
+          if (Test-Path "target\x86_64-pc-windows-msvc\release\filego.pdb" -PathType Leaf) {
+            throw "PDB must not be packaged with the portable candidate"
+          }
       - name: Package unsigned candidate
         shell: pwsh
         env:
