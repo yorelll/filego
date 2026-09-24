@@ -52,9 +52,9 @@ M-3 由本 response 文档落盘闭环。
 | CLOSED 项 | 上游来源 review 文档 | 代码/测试证据 | CI |
 |---|---|---|---|
 | M04-N001（托盘热键不可用提示） | `review/0-0-1/m04-windows-review-r02.md` Finding N001 | `tray_hotkey_hint`（main.rs:1861-1885）+ `sync_hotkey_from_native`（main.rs:945-969）+ slint `hotkey-unavailable-hint`（ui/app-window.slint:2044-2054） | run `35950631364` |
-| M06-I1（before-import 快照同秒 stamp 碰撞） | `review/0-0-1/m06-settings-review-r01.md` Finding I1 | `backup::unique_stamp` `-2/-3` 后缀；`unique_stamp_disambiguates_same_second_backups` | run `35950631364` |
-| M06-I2（保存失败冗余快照 + 工作副本回滚） | `review/0-0-1/m06-settings-review-r01.md` Finding I2 | `remove_failed_import_snapshot`（白名单文件名受限，无 traversal）；`failed_import_snapshot_cleanup_removes_only_the_named_backup`；`apply_import` Err 分支回滚工作副本 | run `35950631364` |
-| M06-I3（冲突时 Apply 禁用） | `review/0-0-1/m06-settings-review-r01.md` Finding I3 | slint `enabled: root.s-import-conflicts == 0`（ui/app-window.slint:1743-1756）+ apply 层 all-or-nothing | run `35950631364` |
+| M06-I1（before-import 快照同秒 stamp 碰撞） | `review/0-0-1/m06-settings-review-r02.md` Finding I1 | `backup::unique_stamp` `-2/-3` 后缀；`unique_stamp_disambiguates_same_second_backups` | run `35950631364` |
+| M06-I2（保存失败冗余快照 + 工作副本回滚） | `review/0-0-1/m06-settings-review-r02.md` Finding I2 | `remove_failed_import_snapshot`（白名单文件名受限，无 traversal）；`failed_import_snapshot_cleanup_removes_only_the_named_backup`；`apply_import` Err 分支回滚工作副本 | run `35950631364` |
+| M06-I3（冲突时 Apply 禁用） | `review/0-0-1/m06-settings-review-r02.md` Finding I3 | slint `enabled: root.s-import-conflicts == 0`（ui/app-window.slint:1743-1756）+ apply 层 all-or-nothing | run `35950631364` |
 | M05-L2（undo 横幅 Cancel 语义）/ L3（空路径提示） | `review/0-0-1/m05-management-review-r01.md` Finding L2/L3（r02 记录 RECORDED） | `undo_dismiss` / `NoticeEnterPath` 双语文案；`draft.path.trim().is_empty()` 分支（main.rs:1591-1598） | run `35950631364` |
 | M05-OBS-01（action 码耦合）/ OBS-02（死键删除） | `review/0-0-1/m05-management-review-r02.md` Finding OBS-01/OBS-02 | `RowAction::from_context_action` + 单测镜像 MenuRow；`action-toggle-enabled` 全树零残留 | run `35950631364` |
 | M01B-N001-followup（repair_from_backup 加锁） | `review/0-0-1/m01b-persistence-review-r02.md` Finding M01B-R02-N001（评审明确延期 + 后续任务） | `acquire_write_lock` 在 `repair_from_backup` 全程持有（repository.rs:482）；`repair_from_backup_contends_with_a_concurrent_writer_via_the_lock` | run `35950631364`（发布前必须关闭项，现已关闭） |
