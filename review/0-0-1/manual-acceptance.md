@@ -8,16 +8,18 @@
 
 | Field | Value |
 |---|---|
-| RC commit SHA | |
-| GitHub Actions workflow/run ID/URL | |
-| EXE artifact name | |
-| ZIP artifact name | |
-| SHA-256 manifest name | |
-| Locally computed EXE SHA-256 | |
-| Locally computed ZIP SHA-256 | |
-| Hash comparison result | |
-| Test date | |
+| RC commit SHA | `a16d28b015ac5816677f3bba961f8e89962fc119` |
+| GitHub Actions workflow/run ID/URL | `Build release candidate` (release.yml), run `35981840362`, https://github.com/yorelll/filego/actions/runs/35981840362 |
+| EXE artifact name | `FileGo-0.0.1-windows-x86_64.exe` (inside `FileGo-0.0.1-unsigned-candidate-a16d28b015ac5816677f3bba961f8e89962fc119`) |
+| ZIP artifact name | `FileGo-0.0.1-windows-x86_64.zip` |
+| SHA-256 manifest name | `FileGo-0.0.1-SHA256SUMS.txt` |
+| Locally computed EXE SHA-256 | `e0b50242ebe5c7eb9af7638d5ac9605f1cc95852a6a750446b231e462fba6eca` |
+| Locally computed ZIP SHA-256 | `7c36af3fe845eba7f263a2eb5437028904a2564049d7c92e3e63912fd6bd2b28` |
+| Hash comparison result | Match: locally recomputed EXE/ZIP SHA-256 equal the values in the workflow-generated `SHA256SUMS` manifest; ZIP `FileGo.exe` is byte-identical to the standalone EXE (same SHA-256) |
+| Test date | 2026-09-24 (candidate verification date) |
 | Tester | Project owner |
+
+> Candidate-identity values above are the implementation agent's downloaded-artifact verification (hashes, PE debug-directory/path scan, `--version`). They are not desktop acceptance results; every checklist row and real-machine measurement below remains unfilled until the project owner performs them.
 
 ## Test environment
 
