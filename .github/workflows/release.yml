@@ -379,8 +379,24 @@ jobs:
           }
           Write-Output "No forbidden build-host markers found in the portable EXE."
 
-          $actualVersion = (& $portableExe --version).Trim()
-          if ($LASTEXITCODE -ne 0 -or $actualVersion -ne "FileGo $env:VERSION") {
+          # A windows-subsystem (GUI) Rust binary cannot rely on pwsh's native
+          # stdout pipe for `--version` capture: pwsh closes its read end and the
+          # child panics with "the pipe is being closed" (os error 232). Capturing
+          # through the .NET process API keeps the pipe open on this side.
+          $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+          $startInfo.FileName = $portableExe
+          $startInfo.Arguments = "--version"
+          $startInfo.UseShellExecute = $false
+          $startInfo.RedirectStandardOutput = $true
+          $startInfo.CreateNoWindow = $true
+          $versionProcess = [System.Diagnostics.Process]::Start($startInfo)
+          $versionStdout = $versionProcess.StandardOutput.ReadToEnd()
+          $versionProcess.WaitForExit()
+          if ($versionProcess.ExitCode -ne 0) {
+            throw "Stripped portable EXE --version exited with code $($versionProcess.ExitCode)"
+          }
+          $actualVersion = $versionStdout.Trim()
+          if ($actualVersion -ne "FileGo $env:VERSION") {
             throw "Stripped portable EXE version mismatch: '$actualVersion'"
           }
           Write-Output "Stripped portable EXE version: $actualVersion"
