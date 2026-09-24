@@ -11,6 +11,9 @@
 /artifacts/
 /dist/
 
+# Local release deliverable copied to the repo root for user acceptance
+/FileGo-0.0.1-windows-x86_64.exe
+
 # The original long-form brief is retained locally until the owner removes it.
 /filego项目描述.md
 /quickfolder项目描述.md
