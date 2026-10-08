@@ -1,0 +1,48 @@
+# FileGo 0.0.1 — B/C 手工验收整改独立代码复审 r02
+
+- **版本 / topic / 轮次 / 日期**：`0.0.1` / `manual-bc-remediation` / `r02` / 2026-10-08。
+- **Reviewer / 独立性**：独立 code-review agent；**未参与**被评实现提交 `caa671e`、`486c1e4` 的代码实现；只审查，不修改实现，不批准发布或代填用户验收结果。
+- **被评代码**：`486c1e4b6413c390f4e5752ae37d98cf28766e95`；完整比较 `caa671efeb5b8e9036fca97486b3d2b076f76a33..486c1e4b6413c390f4e5752ae37d98cf28766e95`。审阅了该范围的全部 diff、现行实现、相关旧实现和测试。代码范围：`src/main.rs`、`src/presentation/{i18n,mod,settings_controller,startup_registration}.rs`、`src/storage/{repository,repository_tests}.rs`、`ui/app-window.slint`；该范围还引入此前的 `manual-bc-remediation-review-r01.md` 与 `manual-bc-remediation-response-r01.md`。同时检查 `manual-bc-remediation-response-r02.md`（HEAD `8ab6504669f179e34641a92fe869fc605c7ea4db`，仅新增该文档）、`task/03-发布手工验收清单.md`、`CLAUDE.md`、既有 Windows 边界、备份及 CI workflow。`git diff caa671e..486c1e4 --check` 通过。
+- **项目用户原始验收**：`review/0-0-1/manual-acceptance.md` 的未暂存改动属于项目用户，仍对应旧 RC `a16d28b015ac5816677f3bba961f8e89962fc119`；本复审未改写、暂存或外推任何结果。旧 B7/C5 FAIL、C1/C2/C3 部分通过、D 及后续未测仍是发布阻断；新提交没有已核对哈希并由用户验收的新 RC。
+- **独立核对的精确 SHA CI**：按指定绝对路径 `D:\Program Files\GitHub CLI\gh.exe` 查询：[`Windows CI` 37766128334](https://github.com/yorelll/filego/actions/runs/37766128334)，`headSha=486c1e4b6413c390f4e5752ae37d98cf28766e95`，`completed/success`，job `fmt, clippy, test, release, package` 全成功；MSVC `x86_64-pc-windows-msvc`、Rust 1.92.0，410 lib tests + 10 bin tests 通过、1 项专用 benchmark ignored，MSVC Release EXE/版本/依赖审计/portable **开发**包检查成功；artifact `FileGo-0.0.1-windows-x86_64-486c1e4b6413c390f4e5752ae37d98cf28766e95`。[`Search benchmark` 37766128401](https://github.com/yorelll/filego/actions/runs/37766128401)，**相同 headSha**、`completed/success`，job `release 10k benchmark`，artifact `search-benchmark-log-486c1e4b6413c390f4e5752ae37d98cf28766e95`。其 hosted runner 的 pinyin-heavy median **51.49 ms**，高于产品的 50 ms 目标但低于 CI 的宽松 500 ms 回归门限；用户机器性能仍待实测。HEAD `8ab6504` 是纯审计文档提交，按 `paths-ignore` 没有对应新 CI；不得把开发包当正式 RC/验收 EXE。Reviewer 未重新运行本地 GNU 或真实桌面程序。
+
+## 需求与旧 finding 的逐项复核
+
+| 旧 ID / 验收映射 | 从代码和测试独立核验的事实 | 状态 |
+|---|---|---|
+| **H01 High**：B7、K7/K8，坏主文件修复与告警 | `main.rs:1383-1400,4430-4434` 已将 Data 页新按钮接到 `repair_from_backup`；`repository.rs:469-534` 在写锁内重读并留存腐坏主文件后提升有效内部 `.bak`，旧真实仓库测试覆盖成功、缺失/坏 backup 及锁竞争。坏主文件且无内部 `.bak` 时，`main.rs:1330-1353` 选中命名备份会转到 `restore_named_backup`，后者 `repository.rs:541-585` 读主文件、保存坏原件证据、同步暂存并提升；新测试 `repository_tests.rs:1453-1558` 覆盖此路径、健康主文件拒绝及读权限失败。`main.rs:1013-1025,1678-1690` 两个同步器均优先 settings notice，打开设置/manager sync 不再把 `DataUnreadable` **空白擦除**。但 **健康文档已加载后、实际磁盘主文件变坏** 的分支仍破坏坏文件证据和唯一有效 `.bak`（下述 `BC-R02-H01`）；测试中的所谓提升故障实际上错打在证据写入步骤。另 `repair_from_backup` 在外部已修复主文件时返回 `HadNoCorruptMain` 并更新仓库，UI 却报恢复失败、未刷新搜索（`main.rs:1393-1395`）。 | **未关闭；High 阻断**。上述常见启动坏文件路径已有改善，但“永不抹掉恢复证据”未成立。 |
+| **H02 High**：C3.6、J1–J6，HKCU/JSON 一致性 | tray 与设置两入口均调用 `change_launch_at_login`（`main.rs:744-765,3455-3473,4017-4026`）；无 document 的纯事务在任何 registry 调用前失败，pending recovery 在 adapter 拒绝/真实仓库 `save_at` 拒绝。`SettingsController::set_launch_at_login` 返回明确 `Result`，先保存 JSON 再写/验证 HKCU；写失败（含已部分改变 OS）、读失败时分别尝试两边回滚和重读，回滚不成功返回错误、不会改成功 glyph。`startup_registration.rs:218-371` 的可注入 fake 覆盖这些 bool 状态和失败；pending recovery 使用真实仓库。**但 fake 与生产 OS seam 都仅存 `bool`**；已有指向旧 portable EXE 的 `FileGo` Run 值会被读成 `false`，失败回滚无法恢复原值（`BC-R02-M01`）。 | 原先“无文档也写 HKCU / 假报成功”**已关闭**；完整 OS/JSON 原值事务保障**未完全关闭**，新 Medium 问题待解决/明确接受。 |
+| **H03 High**：C1/C3.1/C3.3/C5、前台与白屏 | `main.rs:145-173,184-222` 两个延迟回调现在均为 `slint::Timer::single_shot`，weak handle 升级成功才重绘/再次原生尝试；不会因局部 `Timer` 析构而取消。`main.rs:4777-4796` 在真实 Slint event loop 中证明调度函数返回后 callback 仍触发，2 s watchdog 防卡死。`show()` 前后 invalidate 与定时 invalidate 仍只是**重绘请求**；`window_focus.rs:66-121` 可能返回 `VisibleNotForeground`，调用处忽略结果，CI 不测真实 taskbar/隐藏区前台、帧像素或用户焦点。 | **生命周期缺陷已关闭**；真实 Windows 桌面 C1/C3.1/C3.3/C5 仍未验收，不能宣称绘制/前台已修复。 |
+| **M01 Medium**：C3.4、Folder 表单归属/可达性 | 真实 Slint 树中 `ui/app-window.slint:1301-1311` 的外层 `ScrollView` 包住同一 `VerticalBox`，`1836-1950` 草稿是各页面块的 sibling，**但 conditional 的布尔表达式为 `page == 1 && draft-visible`**，因而其它页不实例化草稿；offer/batch 同理。`1357-1445` Folder 行列表由无固定高度的 `VerticalBox` 渲染，已移除原 400 px 内层滚动区。`main.rs:4735-4774` 的字符串 guard + Slint 编译能确认源码形状/语法，**不是 AST/viewport/鼠标滚轮/Save 可点的动态证明**；batch 仍有独立内层 scroll，其他设置页也保留 400 px 内层 scroll。 | **针对旧跨页显示和 Folder 列表滚动陷阱的代码层面已关闭**；760×520、125–200% DPI/字体缩放、长列表/键盘/鼠标必须由用户逐一实测。 |
+| **M02 Medium**：B7→C3.5 空备注真实持久化、错误用例 | `main.rs:4673-4705` 从不存在的临时 data dir 走 `open_repository_at`，经真实 `ManagementController<SharedStore>` 创建中文路径/名称且不编辑备注，执行 `SaveDraft`、销毁并重新打开真实 `DocumentRepository` 后核验单记录、空备注和真实目录仍在；不是旧 `MemStore` 的自增计数。`main.rs:4707-4719` 坏主文件不会当首次运行；`repository_tests.rs:1511-1558` 覆盖无内部备份的坏主文件读权限/写故障保留；上述 registry fake 及 pending 仓库检查也是真实失败路径。它不模拟 Slint 点击、COM picker、真实 Windows ACL 或 HKCU。 | **旧 M02 规定的仓库 round-trip/权限/腐坏/注入测试缺口已关闭**；`BC-R02-H01` 指出的故障测试命中错误步骤，不能用其证明“提升失败”已测试。 |
+
+## Findings（按严重级）
+
+### BC-R02-H01 — High，阻断 — 命名备份的“健康内存”分支可覆盖损坏主文件和有效内部 `.bak`
+
+- **位置**：`src/main.rs:1346-1365`；`src/storage/repository.rs:939-956,305-346,541-585`；测试 `src/storage/repository_tests.rs:1533-1558`。
+- **可复现场景/证据**：启动时 `data.json` 健康并已载入 (`repo.document().is_some()`、`recovery_pending()==false`)；运行期间用户/外部程序损坏磁盘上的 `data.json`，此时原有 `data.json.bak` 仍有效。用户在 Data 页选一个健康的 `backup-*.json` 点击“恢复”。适配层仅按**过期的内存状态**选 `set_data(decoded.data) → save_at()`，不复读/比较磁盘主文件，也不调用新 evidence-preserving 恢复路径。`save_at → save_locked → replace_backup_with_current_main` **先把当前已损坏的主文件写入 `.bak`、覆盖原有效内部备份**，再用暂存文件取代坏主文件；坏原件没有生成 `data.json.corrupt-*`，这两个恢复线索从磁盘消失。若主文件在加载后被另一写者换成较新的健康文件，同一路径也无 revision guard 就覆盖它；只是 `.bak` 暂存了之前版本。当前测试只在 `load()` 先失败、`repo.document()==None` 的情况下验证命名恢复，未覆盖此情形。仅在用户重启、进入 pending recovery 后才会选择安全分支，不是所有允许的 UI 操作都安全。
+- **影响**：与 K7/K8 和“坏原件、有效备份不得被静默擦除”的硬门禁直接冲突；不能发布或批准本轮整改。
+- **建议**：不要凭 `document().is_some()` 判断磁盘是否健康。在同一写锁内复读主文件，按磁盘 **missing/corrupt/valid + revision** 安全分派；任何损坏先耐久保存坏原件，且不能将坏 bytes 写进内部 `.bak`，健康外部修订需要冲突检查；失败不得改变原件和选定备份。加真实仓库/适配层测试：先正常 load、运行中把主文件改坏、保留有效 `.bak`、点击/调用命名恢复，确认证据文件为原始 bytes 且 `.bak` 保持有效；还要测加载后外部健康修订及提升中断。现有 `named_backup_restore_fault...` 在 `FaultyFileOps` 下计数为 0 lock、1/2 **证据写/同步**、3/4 **提升 temp 写/同步**、5 rename；其 `step: 1, TempWrite` (`repository_tests.rs:1542-1548`) 实际只使**证据写**失败，不是注释所说的“证据耐久保存之后提升故障”。应在 3/4/5 注入以真正证明提升失败仍保留原文件、命名备份、内部 `.bak` 和已写证据。`HadNoCorruptMain`（外部已修复）也应刷新 UI/搜索并报告准确状态，而不是一律报失败。
+
+### BC-R02-M01 — Medium — OS 启动项 bool 快照不能回滚已有的不同 EXE 路径
+
+- **位置**：`src/presentation/startup_registration.rs:9-14,36-83,154-185,269-371`；`src/platform/windows/tray_open.rs:107-145`（生产适配器 `src/main.rs:228-240`）。
+- **可复现场景/证据**：HKCU `Run\FileGo` 原值指向旧 portable EXE；本次运行来自另一位置。`launch_at_login()` 对**已有但路径不同**及**值不存在**均返回 `false`。用户启用当前 EXE：JSON 已保存、新 Run 值已写，但注入/发生写后首次状态复读失败（已有 `failed_verification_with_successful_rollback_is_read_error` 就模拟这一支）。回滚执行 `registry.write_enabled(prior_os)`，这里 `prior_os=false`，生产 `set_launch_at_login(false)` **删除**原有 Run 值，而非恢复原旧路径；函数返回 `ReadFailed`，虽不假报成功，却不能维持失败前的 OS 状态。源注释声称“拒绝 pre-existing mismatched OS registration” (`startup_registration.rs:36-38`)，实际 bool API 无法拒绝或恢复其内容。当前 fake Registry 只有 bool，不可能构造这一情况。
+- **影响**：失败操作可能无意删除用户另一 portable 安装的登录启动设置。是否允许主动迁移该固定 Run 值需作明确产品决定，至少失败回滚不可声称已恢复 *原值*。
+- **建议**：读取/保存 Run 值的完整匿名内存快照（含 absent / own current EXE / foreign or stale value），拒绝或显式确认替换旧路径；失败时恢复准确 UTF-16 类型和原 bytes，重读核验，不把值内容写日志或 UI。注入测试覆盖已有旧路径下的成功迁移、写后复读失败、部分写入与回滚失败。此为新 finding；旧 H02 对**无 document/pending recovery** 的具体故障已修复，但对完整 OS 原值事务的声称须收窄。
+
+## 横向检查及边界
+
+- **正确性/错误处理/数据安全**：正常 first-run 与空备注 round-trip、内部 `.bak` pending repair、无内部 `.bak`+命名恢复及权限拒绝皆有真实磁盘测试；共享 settings/manager notice 不再因同步顺序被清空。但 `SNotice::DataUnreadable` 是单值而非持久故障状态，随后 `list_backups()` 的 `BackupsNone` (`main.rs:1422-1434`) 等动作可覆盖它，不能声称“任何用户操作之后 unreadable 告警都保留”。`BC-R02-H01` 仍是确定的证据擦除路径。`HadNoCorruptMain` 分支 UI 与实际仓库状态不一致。没有看到本次变更新增对用户真实文件夹的删除调用；`remove_record` 仍仅编辑快捷记录，新增恢复写入只作用于配置文件/暂存/备份/证据。真实目录 canary 仍必须手测。
+- **Windows / 隐私 / 安全性**：无新依赖、网络、遥测、路径上传、磁盘递归扫描或明文路径/搜索词日志；消息本地化的内部备份按钮中/英文均有 key，错误文案匿名。HKCU 仅当前用户 `Run\FileGo`，真实 OS 注册值/前台/软件渲染未经 CI GUI 验证；`Timer::single_shot` 修复的是调度生命周期而非 Windows 前台授权。用户当前未暂存的验收记录含用户环境信息，不得把它并入此复审提交。
+- **测试/性能/UX/可访问性/维护性**：MSVC 两项 workflow 同一代码 SHA success；静态 guard 不是 AST 语义执行，语义依据是 Slint 的实际 conditional 及外层 scroll 树。没有模拟原生窗口 show 后的重绘结果/输入焦点、最小窗 Save 可达性、屏幕阅读器、键盘滚动、文本放大、中文 IME、高对比；都不得推断 PASS。Folder 长列表改为外层统一滚动，需实测长列表时滚轮、外侧滚动条和 Save；About 的外观取决于用户意见。Hosted benchmark 某查询 median 超 50 ms，不能用 500 ms CI 门限宣称产品性能已验收。`restore_backup` 的内存状态分派和错位 fault-step 注释提高了维护风险。
+
+## 交接、真实 Windows 复测和结论
+
+1. 实施 agent 先修复 `BC-R02-H01`，回应 `BC-R02-M01`，补上**实际命中提升故障**与应用分支的失败测试；推送新代码后取得该 SHA 的 MSVC Windows CI、Release benchmark，新一轮独立 reviewer 检查 diff、失败路径和 CI，不得仅依据 response 批准。
+2. 主 agent 冻结新的候选 commit，通过 release-candidate workflow 生成未签名 EXE/ZIP/SHA-256，下载、核对文件名/来源与本地哈希。现有开发 artifact 与旧 `a16d28b` 的 RC 都不能作为新验收候选；保留 owner 已填旧结果原样。
+3. 请项目用户用**新候选**在真实 Windows 10/11 桌面复测：B7（首次/健康/坏主+有效内部备份/坏主+无内部备份但有命名备份/权限失败/运行中坏主）、K7/K8（按 Data 页操作核对 evidence、`.bak`、重启后数据和匿名日志）；C3.5（选择正常目录、不填备注保存并重启搜索）；C3.6/J1–J6（HKCU Run 原始值、旧 portable 路径、开/关、重复点击、重登、含空格/中文 EXE、故障/回滚）。C1/C3.1/C3.3/C5 从**隐藏区单击**与“Open FileGo”多次测试窗口前台、键盘焦点和首次/重复设置首帧白屏/局部绘制，不能仅观察任务栏按钮；C2 需先向 owner 取得双击异常的具体步骤。C3.2 测真实 picker Cancel/失败无设置窗口。C3.4 在 760×520 + 长列表、100/125/150/200% DPI/文本缩放下用滚轮、外侧 scrollbar、Tab/键盘触及 Save，并在 General/Folder 来回切页确认草稿只在 Folder 显示、修改未丢；C3.7/B6 请 owner 重看 About。继续原记录未执行的 D+、Explorer 重启、热键、IME、多显示器、路径异常、真实目录 canary 与真实机性能/资源测量。
+4. 本次只是整改**代码**复审，不是最终 RC release review；用户手工结论、相同候选 SHA 的 artifact/哈希、最终独立 `APPROVED_FOR_RELEASE` 未具备，禁止 tag/GitHub Release。
+
+**最终结论：`CHANGES_REQUESTED`（本轮 B/C 整改；非发布批准）。** H01 的确定性数据恢复证据丢失仍属 High，旧候选的用户 FAIL/PARTIAL 不变；H03/M01/M02 已有针对性代码改进但必须按上述项目由 owner 实测。此文档应单独纳入 Git 审计记录，不得同时暂存项目用户的 `manual-acceptance.md`。
