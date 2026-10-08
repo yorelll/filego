@@ -23,7 +23,10 @@ use windows::Win32::{
     Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND},
     System::{
         LibraryLoader::GetModuleFileNameW,
-        Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegGetValueW, RegSetKeyValueW},
+        Registry::{
+            HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_SZ, RegDeleteValueW, RegGetValueW,
+            RegOpenKeyExW, RegSetKeyValueW,
+        },
     },
     UI::{
         Shell::{SEE_MASK_ASYNCOK, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW},
@@ -54,8 +57,12 @@ pub fn run_value_for(exe_path: &str) -> String {
 /// removes it. Idempotent. The quoted value comes from [`run_value_for`], so a
 /// path with spaces/Unicode is never split by the Windows startup parser.
 pub fn set_launch_at_login(enabled: bool) -> Result<(), RegistryError> {
-    let subkey = pcwstr(run_subkey_wide());
-    let value = pcwstr(run_value_wide());
+    // Keep both UTF-16 buffers alive for the entire Win32 call: PCWSTR borrows
+    // their storage and may not outlive either buffer.
+    let subkey_wide = run_subkey_wide();
+    let value_wide = run_value_wide();
+    let subkey = windows::core::PCWSTR(subkey_wide.as_ptr());
+    let value = windows::core::PCWSTR(value_wide.as_ptr());
     if enabled {
         let exe = current_exe_path()?;
         let quoted = run_value_for(&exe);
@@ -77,12 +84,20 @@ pub fn set_launch_at_login(enabled: bool) -> Result<(), RegistryError> {
         }
         Ok(())
     } else {
-        // RegSetKeyValueW with NULL data removes the value.
-        // Safety: same arguments, NULL data + 0 length.
+        // RegSetKeyValueW with NULL data does not reliably delete an existing
+        // value. Open the per-user Run key and remove this value explicitly.
+        let mut key = Default::default();
         let status =
-            unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, subkey, value, REG_SZ.0, None, 0) };
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey, Some(0), KEY_SET_VALUE, &mut key) };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+        if status != ERROR_SUCCESS {
+            return Err(RegistryError::WriteFailed);
+        }
+        let status = unsafe { RegDeleteValueW(key, value) };
+        let _ = unsafe { windows::Win32::System::Registry::RegCloseKey(key) };
         if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
-            // Removing a value that does not exist is benign for our purposes.
             return Err(RegistryError::WriteFailed);
         }
         Ok(())
@@ -95,12 +110,15 @@ pub fn launch_at_login() -> Result<bool, RegistryError> {
     // overflow) surfaces as ReadFailed rather than overflowing our buffer.
     let mut buffer = [0u16; 4096];
     let mut size = (buffer.len() * 2) as u32;
-    // Safety: buffer is valid for size bytes; RRF_RT_REG_SZ restricts the type.
+    let subkey_wide = run_subkey_wide();
+    let value_wide = run_value_wide();
+    // Safety: the UTF-16 key buffers and value buffer remain live for the call;
+    // RRF_RT_REG_SZ restricts the registry value type.
     let status = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
-            pcwstr(run_subkey_wide()),
-            pcwstr(run_value_wide()),
+            windows::core::PCWSTR(subkey_wide.as_ptr()),
+            windows::core::PCWSTR(value_wide.as_ptr()),
             RRF_RT_REG_SZ,
             None,
             Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
@@ -108,7 +126,19 @@ pub fn launch_at_login() -> Result<bool, RegistryError> {
         )
     };
     match status {
-        ERROR_SUCCESS => Ok(true),
+        ERROR_SUCCESS => {
+            let encoded = (size as usize / 2).min(buffer.len());
+            let end = buffer[..encoded]
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(encoded);
+            let actual = String::from_utf16_lossy(&buffer[..end]);
+            let expected = current_exe_path()?;
+            // A stale Run value targeting a different portable EXE is not an
+            // active registration for this process. It will be replaced when
+            // the owner opts in again.
+            Ok(actual == run_value_for(&expected))
+        }
         ERROR_FILE_NOT_FOUND => Ok(false),
         _ => Err(RegistryError::ReadFailed),
     }
@@ -123,12 +153,6 @@ fn run_subkey_wide() -> Vec<u16> {
 
 fn run_value_wide() -> Vec<u16> {
     RUN_VALUE.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Borrow a PCWSTR from a NUL-terminated wide vector.
-fn pcwstr(wide: Vec<u16>) -> windows::core::PCWSTR {
-    debug_assert_eq!(wide.last(), Some(&0), "wide string must be NUL-terminated");
-    windows::core::PCWSTR::from_raw(wide.as_ptr())
 }
 
 /// The current executable's absolute path (for the Run value).
@@ -306,6 +330,28 @@ mod tests {
     /// reads `false`. The registry itself is not touchable headlessly, so this
     /// pins the contract the (real) read path relies on: a written value is
     /// exactly the quoted current-exe path, matched by `launch_at_login`.
+    #[test]
+    fn launch_at_login_value_matches_only_this_executable() {
+        let current = r"C:\Program Files\FileGo\filego.exe";
+        assert_eq!(
+            run_value_for(current),
+            r#""C:\Program Files\FileGo\filego.exe""#
+        );
+        assert_ne!(
+            run_value_for(r"C:\Users\user\Desktop\old-filego.exe"),
+            run_value_for(current),
+            "a stale portable location must not appear enabled for this process"
+        );
+        // The registry's quoted UTF-16 value must survive decoding without
+        // lifetime-dependent pointers or dropping the terminating NUL early.
+        let wide: Vec<u16> = run_value_for(current)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let actual = String::from_utf16_lossy(&wide[..wide.len() - 1]);
+        assert_eq!(actual, run_value_for(current));
+    }
+
     #[test]
     fn launch_at_login_read_write_are_exact_inverses_by_contract() {
         let exe = r"C:\Program Files\FileGo\filego.exe";

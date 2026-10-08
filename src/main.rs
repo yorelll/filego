@@ -41,6 +41,7 @@ impl WindowPort for SlintWindowPort {
         place_window(&app);
         app.show()?;
         bring_search_to_front(&app);
+        app.window().request_redraw();
         Ok(())
     }
 
@@ -147,14 +148,32 @@ fn bring_search_to_front(app: &AppWindow) {
     // `HasWindowHandle` borrow (E0716: the accessor returns a handle borrowing
     // from this temporary).
     let winit_window = window.window_handle();
-    let Ok(handle) = winit_window.window_handle() else {
-        return;
-    };
-    let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() else {
-        return;
-    };
-    let hwnd_bits = win32.hwnd.get();
-    let _ = filego::platform::windows::window_focus::bring_to_front_bits(hwnd_bits, true);
+    if let Ok(handle) = winit_window.window_handle()
+        && let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw()
+    {
+        let _ =
+            filego::platform::windows::window_focus::bring_to_front_bits(win32.hwnd.get(), true);
+    }
+    let weak = app.as_weak();
+    let redraw = slint::Timer::default();
+    redraw.start(
+        slint::TimerMode::SingleShot,
+        std::time::Duration::from_millis(40),
+        move || {
+            if let Some(app) = weak.upgrade() {
+                app.window().request_redraw();
+                let owned = app.window().window_handle();
+                if let Ok(handle) = owned.window_handle()
+                    && let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw()
+                {
+                    let _ = filego::platform::windows::window_focus::bring_to_front_bits(
+                        win32.hwnd.get(),
+                        true,
+                    );
+                }
+            }
+        },
+    );
 }
 
 /// Show the settings window and bring it to the foreground (tray "设置" and any
@@ -170,23 +189,55 @@ fn open_settings_window(settings: &std::rc::Rc<std::cell::RefCell<SettingsWindow
     let Some(window) = settings.borrow().window.upgrade() else {
         return;
     };
-    let _ = window.show();
+    {
+        let mut adapter = settings.borrow_mut();
+        adapter.settings.reload();
+        adapter
+            .settings
+            .set_launch_at_login_os(filego::platform::windows::tray_open::launch_at_login().ok());
+        adapter.sync_settings_ui();
+        adapter.sync_ui();
+    }
+    // Invalidate after synchronizing models as well as after showing so the
+    // software renderer paints the first frame without requiring a resize.
+    window.window().request_redraw();
+    if window.show().is_err() {
+        return;
+    }
     use raw_window_handle::HasWindowHandle as _;
     // Bind the winit window handle so its owned data outlives the
     // `HasWindowHandle` borrow (E0716, same as `bring_search_to_front`).
     let winit_window = window.window().window_handle();
-    let Ok(handle) = winit_window.window_handle() else {
-        return;
-    };
-    let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() else {
-        return;
-    };
-    let hwnd_bits = win32.hwnd.get();
-    let _ = filego::platform::windows::window_focus::bring_to_front_bits(hwnd_bits, true);
+    if let Ok(handle) = winit_window.window_handle()
+        && let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw()
+    {
+        let _ =
+            filego::platform::windows::window_focus::bring_to_front_bits(win32.hwnd.get(), true);
+    }
+    window.window().request_redraw();
+    // winit can defer its first layout pass until the next event-loop turn;
+    // invalidate once more after mapping instead of relying on a user resize.
+    let weak_window = window.as_weak();
+    let redraw = slint::Timer::default();
+    redraw.start(
+        slint::TimerMode::SingleShot,
+        std::time::Duration::from_millis(40),
+        move || {
+            if let Some(window) = weak_window.upgrade() {
+                window.window().request_redraw();
+            }
+        },
+    );
 }
 
 fn event_loop_error_as_platform_error(error: slint::EventLoopError) -> slint::PlatformError {
     slint::PlatformError::from(error.to_string())
+}
+
+fn picker_should_open_settings(
+    outcome: &filego::platform::windows::folder_picker::PickOutcome,
+) -> bool {
+    matches!(outcome, filego::platform::windows::folder_picker::PickOutcome::Picked(paths) if !paths.is_empty())
 }
 
 /// Result of an async shell open, posted back to the UI thread.
@@ -1458,14 +1509,31 @@ impl SettingsWindowController {
         }
     }
 
+    fn show_folder_page(&mut self) {
+        self.manager.handle(MCommand::ShowPage(
+            filego::presentation::manager::Page::Folders,
+        ));
+        if let Some(window) = self.window.upgrade() {
+            window.set_page(1);
+        }
+        self.sync_ui();
+    }
+
     /// Open the native folder picker and forward results (add flow).
-    fn browse(&mut self) {
-        if let filego::platform::windows::folder_picker::PickOutcome::Picked(paths) =
-            (self.picker)()
+    /// Cancellation or failure is not navigation; only a non-empty pick opens
+    /// a draft/preview. The caller may show the window only when this is true.
+    fn browse(&mut self) -> bool {
+        let outcome = (self.picker)();
+        let picked = picker_should_open_settings(&outcome);
+        if let filego::platform::windows::folder_picker::PickOutcome::Picked(paths) = outcome
+            && picked
         {
             self.manager.handle(MCommand::OpenPickPaths(paths));
         }
-        self.sync_ui();
+        if picked {
+            self.sync_ui();
+        }
+        picked
     }
 
     /// Paste the clipboard text as a manual path (add/edit field).
@@ -1936,14 +2004,11 @@ fn apply_settings_window_width(window: &SettingsWindow, logical_width: u16) {
     window.window().set_size(physical);
 }
 
-/// The FileGo data directory: `%LOCALAPPDATA%\FileGo`. Pure helper; the app
-/// falls back to a portable path when the env var is missing (M05 keeps data
-/// local and private).
-fn data_dir() -> std::path::PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("FileGo-portable"));
-    base.join("FileGo")
+/// The FileGo data directory is in the current user's LOCALAPPDATA. Never
+/// fall back to TEMP or the executable directory: an unavailable data location
+/// is an error, not a reason to create a different collection of shortcuts.
+fn data_dir() -> Option<std::path::PathBuf> {
+    filego::platform::windows::data_location::current_user_data_dir()
 }
 
 /// Why the startup data file could not be used (M07.1), surfaced to the Data
@@ -1973,42 +2038,56 @@ enum StartupDataStatus {
 /// document so the revision/lock machinery is exercised exactly like a real
 /// first save; a first-run write failure is also surfaced as `Unreadable`
 /// (the data directory is not writable).
-fn open_repository() -> (
-    std::rc::Rc<std::cell::RefCell<filego::storage::repository::DocumentRepository>>,
+fn open_repository_at(
+    base: &std::path::Path,
+) -> (
+    filego::storage::repository::DocumentRepository,
     StartupDataStatus,
 ) {
     use filego::storage::repository::RepositoryError;
-    let base = data_dir();
-    let paths = filego::storage::location::DocumentPaths::from_base_dir(&base);
+    let paths = filego::storage::location::DocumentPaths::from_base_dir(base);
     let mut repo = filego::storage::repository::DocumentRepository::new(paths);
     let result = repo.load();
     let status = match result {
         // First run: seed an empty document exactly like a real first save.
         Err(RepositoryError::NotFound) => {
-            let empty = empty_document();
-            if repo.save(&empty).is_ok() {
-                StartupDataStatus::Ok
-            } else {
-                // The data directory exists but is not writable.
+            // A first launch has no directory yet. Only a true NotFound may
+            // create it; a corrupt or unreadable existing file is never reset.
+            if std::fs::create_dir_all(base).is_err() {
                 StartupDataStatus::Unreadable
+            } else {
+                // Another instance/process could create a document between
+                // our first read and directory creation. Never overwrite it.
+                match repo.load() {
+                    Ok(filego::storage::repository::LoadOutcome::Found(_)) => StartupDataStatus::Ok,
+                    Ok(filego::storage::repository::LoadOutcome::Recovered(_)) => {
+                        StartupDataStatus::Unreadable
+                    }
+                    Err(RepositoryError::NotFound) => {
+                        if repo.save_if_current(&empty_document(), 0).is_ok() {
+                            StartupDataStatus::Ok
+                        } else {
+                            StartupDataStatus::Unreadable
+                        }
+                    }
+                    Err(_) => StartupDataStatus::Unreadable,
+                }
             }
         }
-        // A loaded document (found, or recovered-from-backup which already has
-        // an in-memory copy) is fine to use; pending repair is handled via the
-        // Data page but does not block editing with the restored copy.
-        Ok(_) => StartupDataStatus::Ok,
+        Ok(filego::storage::repository::LoadOutcome::Found(_)) => StartupDataStatus::Ok,
+        // A recovered backup is readable but still requires explicit repair.
+        // Do not report an ordinary successful load when saving remains blocked.
+        Ok(filego::storage::repository::LoadOutcome::Recovered(_)) => StartupDataStatus::Unreadable,
         // Corrupt main with no valid backup, or an inaccessible data directory
         // (permission / disk / offline): keep the file untouched, start with an
         // empty working copy, and surface the Data-page recovery actions.
         Err(RepositoryError::CorruptData) | Err(RepositoryError::Io) => {
             StartupDataStatus::Unreadable
         }
-        // NotFound was handled above; the remaining variants cannot arise from
-        // a plain `load`.
-        Err(_) => StartupDataStatus::Ok,
+        // An unknown load error must never masquerade as a successful read.
+        Err(_) => StartupDataStatus::Unreadable,
     };
-    let _ = base;
-    (std::rc::Rc::new(std::cell::RefCell::new(repo)), status)
+    (repo, status)
 }
 
 /// Push the settings-window i18n strings into the shared `UiStrings` global.
@@ -2937,7 +3016,11 @@ fn run() -> Result<(), slint::PlatformError> {
     // M07.1: `open_repository` returns the startup data status so an unreadable
     // data file is surfaced (Data-page recovery stays reachable) instead of a
     // silent empty start.
-    let (repo, startup_data_status) = open_repository();
+    let base = data_dir().ok_or_else(|| {
+        slint::PlatformError::from("the current user's local data location is unavailable")
+    })?;
+    let (repository, startup_data_status) = open_repository_at(&base);
+    let repo = Rc::new(RefCell::new(repository));
 
     // ---- M04.2/M04.3 native platform --------------------------------
     // M06: the hotkey is the PERSISTED one (from the shared repository), not a
@@ -3106,11 +3189,31 @@ fn run() -> Result<(), slint::PlatformError> {
     // window when search settings change; `main` only needs `context_tx`.
     {
         let tray_weak = tray.as_weak();
+        let repo = Rc::clone(&repo);
         tray.on_toggle_launch_at_login(move || {
-            let enabled = !filego::platform::windows::tray_open::launch_at_login().unwrap_or(false);
-            let _ = filego::platform::windows::tray_open::set_launch_at_login(enabled);
+            let Ok(current) = filego::platform::windows::tray_open::launch_at_login() else {
+                // A failed read must not be interpreted as OFF and toggled ON.
+                return;
+            };
+            let desired = !current;
+            // The registry is authoritative. A failed registry write must not
+            // change the checkbox glyph or persist a state that never took effect.
+            if filego::platform::windows::tray_open::set_launch_at_login(desired).is_err() {
+                return;
+            }
+            let mut repo = repo.borrow_mut();
+            if let Some(previous) = repo.document().map(|doc| doc.data.settings.clone()) {
+                let mut settings = previous.clone();
+                settings.launch_at_login = desired;
+                if repo.set_settings(settings).is_err() || repo.save_at().is_err() {
+                    let _ = repo.set_settings(previous);
+                    // Best effort to restore the OS registration as well.
+                    let _ = filego::platform::windows::tray_open::set_launch_at_login(current);
+                    return;
+                }
+            }
             if let Some(tray) = tray_weak.upgrade() {
-                tray.set_launch_at_login_glyph(if enabled { "✓ " } else { "" }.into());
+                tray.set_launch_at_login_glyph(if desired { "✓ " } else { "" }.into());
             }
         });
     }
@@ -3291,7 +3394,7 @@ fn run() -> Result<(), slint::PlatformError> {
         store,
         context_rx,
         Rc::clone(&native),
-        data_dir(),
+        base,
         Rc::clone(&main),
         tray.as_weak(),
     )));
@@ -3316,11 +3419,11 @@ fn run() -> Result<(), slint::PlatformError> {
     {
         let settings = Rc::clone(&settings_adapter);
         tray.on_add_folder(move || {
-            // M05.2: tray "添加文件夹" opens the settings window and runs the
-            // native folder picker directly (user-initiated, no scan).
-            settings.borrow_mut().browse();
-            if let Some(window) = settings.borrow().window.upgrade() {
-                let _ = window.show();
+            // Cancel never navigates into Settings. A successful selection
+            // opens the folder page before showing its draft or preview.
+            if settings.borrow_mut().browse() {
+                settings.borrow_mut().show_folder_page();
+                open_settings_window(&settings);
             }
         });
     }
@@ -3415,6 +3518,7 @@ fn run() -> Result<(), slint::PlatformError> {
     {
         let settings = Rc::clone(&settings_adapter);
         settings_window.on_command_add(move || {
+            settings.borrow_mut().show_folder_page();
             settings.borrow_mut().handle(MCommand::OpenManual);
         });
     }
@@ -3427,7 +3531,7 @@ fn run() -> Result<(), slint::PlatformError> {
     {
         let settings = Rc::clone(&settings_adapter);
         settings_window.on_command_browse(move || {
-            settings.borrow_mut().browse();
+            let _ = settings.borrow_mut().browse();
         });
     }
     // M05 review C1 (Critical): folder row actions carry the ROW INDEX (never
@@ -3842,17 +3946,32 @@ fn run() -> Result<(), slint::PlatformError> {
         settings_window.on_s_command_launch_at_login(move |on| {
             // HKCU first; only a successful registry write persists + confirms
             // (no fake success). On failure the toggle snaps back to the old.
-            let written = filego::platform::windows::tray_open::set_launch_at_login(on).is_ok();
+            let previous = filego::platform::windows::tray_open::launch_at_login();
             let mut adapter = settings.borrow_mut();
-            if written {
-                adapter.settings.handle(SCommand::SetLaunchAtLogin(on));
-                adapter.settings.set_launch_at_login_os(Some(on));
-                // Keep the tray menu glyph in sync (M06.3 status↔menu synced).
-                if let Some(tray) = tray.as_weak().upgrade() {
-                    tray.set_launch_at_login_glyph(if on { "✓ " } else { "" }.into());
+            match previous {
+                Ok(was_enabled) => {
+                    if filego::platform::windows::tray_open::set_launch_at_login(on).is_ok() {
+                        adapter.settings.handle(SCommand::SetLaunchAtLogin(on));
+                        if adapter.settings.view().settings.launch_at_login == on {
+                            adapter.settings.set_launch_at_login_os(Some(on));
+                            if let Some(tray) = tray.as_weak().upgrade() {
+                                tray.set_launch_at_login_glyph(if on { "✓ " } else { "" }.into());
+                            }
+                        } else {
+                            // Save failed: don't present an OS-only registration
+                            // as a successfully persisted setting.
+                            let _ = filego::platform::windows::tray_open::set_launch_at_login(
+                                was_enabled,
+                            );
+                            adapter.settings.set_launch_at_login_os(Some(was_enabled));
+                            adapter.settings.set_notice(SNotice::StartupWriteFailed);
+                        }
+                    } else {
+                        adapter.settings.set_launch_at_login_os(Some(was_enabled));
+                        adapter.settings.set_notice(SNotice::StartupWriteFailed);
+                    }
                 }
-            } else {
-                adapter.settings.set_notice(SNotice::StartupWriteFailed);
+                Err(_) => adapter.settings.set_notice(SNotice::StartupReadFailed),
             }
             adapter.sync_settings_ui();
         });
@@ -4387,7 +4506,9 @@ fn main() {
     // the data directory — never the panic payload (which may embed a path or a
     // query), never the console in release. `data_dir()` is a pure fallback, so
     // the hook is safe even when single-instance wiring later fails.
-    install_redacted_panic_hook(filego::diagnostics::SENSITIVE_FIELDS_REDACTED);
+    if let Some(base) = data_dir() {
+        install_redacted_panic_hook(filego::diagnostics::SENSITIVE_FIELDS_REDACTED, base);
+    }
 
     if run().is_err() {
         eprintln!("FileGo could not initialize its user interface");
@@ -4403,7 +4524,7 @@ fn main() {
 /// data. The hook is deliberately set once; release builds get no console
 /// output from it (the `windows_subsystem = "windows"` attribute already
 /// detaches the console for the GUI binary).
-fn install_redacted_panic_hook(redaction_enabled: bool) {
+fn install_redacted_panic_hook(redaction_enabled: bool, base: std::path::PathBuf) {
     if !redaction_enabled {
         return;
     }
@@ -4417,7 +4538,7 @@ fn install_redacted_panic_hook(redaction_enabled: bool) {
         let line = format!(
             "FileGo encountered an internal error at {location} and is closing (details redacted)"
         );
-        filego::diagnostics::log_panic(&data_dir(), &line);
+        filego::diagnostics::log_panic(&base, &line);
         // Keep the previous hook for its side effects (nothing user-visible
         // here; the default hook would print the payload, so we do NOT chain
         // it — this is the whole point of the redaction).
@@ -4468,6 +4589,84 @@ mod tests {
             item_body.contains("activated => { root.open-settings(); }"),
             "the tray Settings item must still call open-settings()"
         );
+    }
+
+    #[test]
+    fn first_run_creates_a_valid_document_under_an_absent_data_directory() {
+        let root = tempfile::tempdir().expect("temporary data root");
+        let base = root.path().join("FileGo");
+        assert!(!base.exists());
+        let (repo, status) = open_repository_at(&base);
+        assert_eq!(status, StartupDataStatus::Ok);
+        assert!(base.join("data.json").is_file());
+        assert_eq!(
+            repo.document()
+                .expect("bootstrapped document")
+                .data
+                .revision,
+            1
+        );
+        assert!(
+            repo.document()
+                .expect("bootstrapped document")
+                .data
+                .folders
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn corrupt_existing_data_is_preserved_and_not_treated_as_a_fresh_run() {
+        let root = tempfile::tempdir().expect("temporary data root");
+        let base = root.path().join("FileGo");
+        std::fs::create_dir(&base).expect("create data directory");
+        let original = b"not valid JSON";
+        let main = base.join("data.json");
+        std::fs::write(&main, original).expect("write corrupt main");
+        let (repo, status) = open_repository_at(&base);
+        assert_eq!(status, StartupDataStatus::Unreadable);
+        assert!(repo.document().is_none());
+        assert_eq!(std::fs::read(&main).expect("read untouched main"), original);
+    }
+
+    #[test]
+    fn tray_add_picker_cancel_does_not_open_settings() {
+        use filego::platform::windows::folder_picker::PickOutcome;
+        assert!(!picker_should_open_settings(&PickOutcome::Cancelled));
+        assert!(!picker_should_open_settings(&PickOutcome::Failed));
+        assert!(!picker_should_open_settings(&PickOutcome::Picked(
+            Vec::new()
+        )));
+        assert!(picker_should_open_settings(&PickOutcome::Picked(vec![
+            r"C:\sample".into()
+        ])));
+    }
+
+    #[test]
+    fn settings_slint_keeps_draft_and_page_within_scrollable_content() {
+        let source = include_str!("../ui/app-window.slint");
+        let settings = source
+            .split("export component SettingsWindow inherits Window")
+            .nth(1)
+            .expect("settings window component");
+        let right = settings
+            .split("// ===== right content =====")
+            .nth(1)
+            .expect("right content section");
+        let outer_scroll = right
+            .find("ScrollView {")
+            .expect("scrollable right content");
+        let draft = right
+            .find("// ===== add/edit dialog =====")
+            .expect("add/edit dialog");
+        assert!(outer_scroll < draft);
+        let folder_page = right.find("// ===== 1 文件夹").expect("folder page");
+        assert!(folder_page < draft);
+        let add_button = right
+            .find("text: UiStrings.action-add")
+            .expect("add button");
+        let general_page = right.find("// ===== 0 常规").expect("general page");
+        assert!(general_page < folder_page && folder_page < add_button);
     }
 
     #[test]

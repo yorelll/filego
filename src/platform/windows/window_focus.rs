@@ -22,9 +22,9 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow},
         WindowsAndMessaging::{
-            BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, HWND_TOP,
-            IsWindowVisible, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-            SetForegroundWindow, SetWindowPos, ShowWindow,
+            BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, HWND_TOP, IsIconic,
+            IsWindowVisible, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
         },
     },
 };
@@ -64,12 +64,15 @@ pub fn window_is_visible(hwnd: HWND) -> bool {
 /// `already_visible` skips the redundant `ShowWindow` when the caller just
 /// showed the window through Slint.
 pub fn bring_to_front(hwnd: HWND, already_visible: bool) -> FocusResult {
-    if !already_visible {
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        // A tray click can show an iconified winit window while its native
+        // surface remains minimized. Restore it before foreground activation.
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
+    if !already_visible || !window_is_visible(hwnd) {
         // Safety: `hwnd` is the Slint window's native handle (valid, owned by
         // the winit event loop).
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOW);
-        }
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
         // Safety: same; SWP_NOACTIVATE means we never steal focus while placing.
         let _ = unsafe {
             SetWindowPos(
@@ -84,6 +87,20 @@ pub fn bring_to_front(hwnd: HWND, already_visible: bool) -> FocusResult {
         };
     }
 
+    // Even if Slint considers the window visible, the winit native surface
+    // can be behind other windows after a tray callback. Raise its z-order
+    // without moving/resizing before requesting foreground focus.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW,
+        )
+    };
     // Standard bring-to-front.
     // Safety: as above.
     unsafe {

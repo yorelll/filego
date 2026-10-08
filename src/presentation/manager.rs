@@ -2227,6 +2227,25 @@ mod tests {
     }
 
     #[test]
+    fn plain_folder_with_blank_optional_note_saves_and_closes_the_draft() {
+        let mut controller = controller();
+        controller.handle(MCommand::OpenPickPaths(vec![
+            r"C:\new\plain folder".to_owned(),
+        ]));
+        let AddFlowView::Draft(draft) = &controller.view().add_flow else {
+            panic!("single folder pick must open a draft");
+        };
+        assert_eq!(draft.display_name, "plain folder");
+        assert!(draft.note.is_empty());
+        assert!(draft.valid);
+
+        controller.handle(MCommand::SaveDraft);
+        assert_eq!(controller.view().notice, Some(Notice::Saved));
+        assert_eq!(controller.view().add_flow, AddFlowView::Closed);
+        assert_eq!(controller.view().folders, 2);
+    }
+
+    #[test]
     fn draft_editing_marks_unsaved_and_path_revalidates() {
         let mut controller = controller();
         controller.handle(MCommand::OpenManual);
