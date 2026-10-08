@@ -12,11 +12,12 @@
 //!
 //! # Ordering contract for [`DocumentRepository::save`]
 //! 1. `codec::encode` (pure; on failure nothing touches the disk);
-//! 2. acquire the per-directory write lock (`data.json.lock`);
+//! 2. acquire the per-directory write lock (`data.json.lock`) and verify the
+//!    current main still matches the last observed revision AND exact bytes;
 //! 3. write the main temp file (open/create, `write_all`, `flush`, `sync_all`);
 //! 4. if a main exists, fault-safely replace the backup: write the new backup
-//!    bytes to a backup temp (`data.json.bak.tmp.<token>`), sync them, then
-//!    atomic-rename onto the live `data.json.bak` — a partial or failed backup
+//!    *verified* prior main bytes to a backup temp (`data.json.bak.tmp.<token>`),
+//!    sync them, then atomic-rename onto the live `data.json.bak` — a failed backup
 //!    write never damages the previous `.bak`;
 //! 5. atomically replace main with the main temp (`std::fs::rename` on Windows
 //!    replaces the destination);
@@ -43,7 +44,8 @@
 //! using the same write-then-rename discipline, clears the pending state, and
 //! updates the observed revision. After repair, ordinary saves operate on a
 //! healthy main. If an external actor already repaired the main, the pending
-//! state is simply cleared.
+//! state is simply cleared. Even when recovery was not pending, repair re-reads
+//! the main under the lock; newly corrupt bytes require actual repair.
 //!
 //! # Concurrency contract
 //! 0.0.1 runs a single process, but every write is serialized by the
@@ -52,16 +54,18 @@
 //! covers both `save` and `save_if_current` (F003). Two writers sharing a base
 //! directory therefore cannot both pass a check-then-rename: the loser gets
 //! [`RepositoryError::ConcurrentModification`] at lock acquisition (or later
-//! from the revision guard). The revision guard itself distinguishes a missing
-//! main (no baseline), a corrupt main (an explicit `CorruptData` refusal — it
-//! never fakes an expected revision), and a readable main (F002); non-`NotFound`
+//! from the revision/byte guard). A missing main is creatable only without a
+//! baseline or surviving backup; a corrupt main is an explicit `CorruptData`
+//! refusal, never an expected revision (F002); non-`NotFound`
 //! I/O errors are surfaced as `Io` and never misread as "missing" or "corrupt"
 //! (F004).
 //!
 //! Stale-temp cleanup runs ONLY while the lock is held, so any
 //! `data.json.tmp.*` present at that moment is provably abandoned by its
 //! writer; evidence files (`data.json.corrupt-*`) and backup staging files
-//! (`data.json.bak.tmp.*`) are never removed. A crashed writer's leftover lock
+//! (`data.json.bak.tmp.*`) are never removed. The lock protects FileGo writers,
+//! not an unrelated program that ignores it and writes during this check-to-
+//! rename interval. A crashed writer's leftover lock
 //! is deliberately NOT auto-expired (auto-expiry would silently break the
 //! exclusion); removing a stale lock manually is a documented recovery step
 //! that is out of scope for 0.0.1.
@@ -108,10 +112,8 @@ pub enum RepairOutcome {
         /// main file was absent (there were no corrupt bytes to preserve).
         evidence: Option<std::path::PathBuf>,
     },
-    /// There was nothing to repair: either the repository was not pending
-    /// recovery, or the main already decoded on re-read (an external actor
-    /// repaired it). In the latter case the pending state is cleared and the
-    /// observed revision is refreshed from the healthy main.
+    /// The main decoded on a locked re-read and needed no repair. The pending
+    /// state, if any, is cleared and the observed document is refreshed.
     HadNoCorruptMain,
 }
 
@@ -174,11 +176,11 @@ pub struct DocumentRepository {
     /// In-memory working copy. `None` until `load` succeeds.
     document: Option<StoredDocumentV1>,
     /// The document revision this repository most recently observed on disk
-    /// (from a load or a successful save). `None` means no baseline is
-    /// established, so the revision guard is not enforced.
+    /// (from a load or a successful save). `None` means no healthy baseline;
+    /// unguarded writes are then allowed only on a truly empty first run.
     latest_loaded_revision: Option<u64>,
     /// The exact bytes last read from or written to a healthy on-disk main.
-    /// Used by an explicit restore to detect even same-revision external edits.
+    /// All ordinary saves and explicit restores detect same-revision edits.
     observed_main_bytes: Option<Vec<u8>>,
     /// Set when `load` recovered a missing/corrupt main from a valid backup
     /// and `repair_from_backup` has not run yet. While set, saves are rejected
@@ -245,21 +247,20 @@ impl DocumentRepository {
         }
     }
 
-    /// Encode and atomically persist `document`.
-    ///
-    /// See the module docs for the ordering and concurrency contract. Rejects
-    /// with [`RepositoryError::RecoveryRequired`] while the repository is
-    /// pending repair (a corrupt main recovered from backup).
+    /// Encode and atomically persist `document` only if the disk still matches
+    /// the observed healthy main, or if no main or backup has ever existed.
+    /// Rejects with [`RepositoryError::RecoveryRequired`] while pending repair.
     pub fn save(&mut self, document: &StoredDocumentV1) -> Result<(), RepositoryError> {
         self.reject_if_pending_recovery()?;
         let bytes = codec::encode(document)?;
         let _lock = self.acquire_write_lock()?;
-        self.save_locked(document, &bytes)
+        let current_main = self.checked_main_for_save(None)?;
+        self.save_locked(document, &bytes, current_main.as_deref())
     }
 
     /// Persist `document` only when the on-disk main matches `expected_revision`
-    /// (or there is no main yet at all); otherwise refuse to overwrite newer
-    /// state.
+    /// and the last observed exact bytes. Without a baseline, only a truly
+    /// empty first-run directory may be created.
     ///
     /// The whole check-and-save runs under the write lock, so a concurrent
     /// writer cannot slip a check-then-rename between our check and our
@@ -274,42 +275,53 @@ impl DocumentRepository {
         self.reject_if_pending_recovery()?;
         let bytes = codec::encode(document)?;
         let _lock = self.acquire_write_lock()?;
-        match self.on_disk_revision()? {
-            OnDiskRevision::Missing => {}
-            OnDiskRevision::Corrupt => return Err(RepositoryError::CorruptData),
-            OnDiskRevision::Ok(revision) if revision != expected_revision => {
-                return Err(RepositoryError::ConcurrentModification);
-            }
-            OnDiskRevision::Ok(_) => {}
-        }
-        self.save_locked(document, &bytes)
+        let current_main = self.checked_main_for_save(Some(expected_revision))?;
+        self.save_locked(document, &bytes, current_main.as_deref())
     }
 
-    /// Classify the main file's on-disk state for the revision guard. Only an
-    /// explicit `NotFound` means missing; a readable-but-undecodable main is
-    /// `Corrupt`; any other read error is surfaced as [`RepositoryError::Io`]
-    /// instead of being mistaken for missing or corrupt (F002, F004).
-    fn on_disk_revision(&mut self) -> Result<OnDiskRevision, RepositoryError> {
-        let main = self.main();
-        let bytes = match self.io.read(&main) {
+    /// Check the main before creating ANY temp file or modifying the backup.
+    /// With an observed healthy baseline, both revision and original bytes must
+    /// match; an absent main after a load/save is a conflict, not a new install.
+    /// An unreadable/corrupt main never becomes a backup or gets overwritten.
+    /// The caller holds the write lock for this read and the subsequent write.
+    fn checked_main_for_save(
+        &mut self,
+        expected_revision: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let bytes = match self.io.read(&self.main()) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(OnDiskRevision::Missing);
+                if self.latest_loaded_revision.is_some() || self.observed_main_bytes.is_some() {
+                    return Err(RepositoryError::ConcurrentModification);
+                }
+                // No main and no baseline is a first-run create ONLY when no
+                // previous backup exists. Otherwise the backup may hold the
+                // user's only surviving document and needs explicit recovery.
+                match self.io.read(&self.backup()) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(_) => return Err(RepositoryError::Io),
+                    Ok(_) => return Err(RepositoryError::RecoveryRequired),
+                }
             }
             Err(_) => return Err(RepositoryError::Io),
         };
-        match codec::decode(&bytes) {
-            Ok(document) => Ok(OnDiskRevision::Ok(document.data.revision)),
-            Err(_) => Ok(OnDiskRevision::Corrupt),
+        let current = codec::decode(&bytes).map_err(|_| RepositoryError::CorruptData)?;
+        if self.latest_loaded_revision != Some(current.data.revision)
+            || self.observed_main_bytes.as_deref() != Some(bytes.as_slice())
+            || expected_revision.is_some_and(|revision| revision != current.data.revision)
+        {
+            return Err(RepositoryError::ConcurrentModification);
         }
+        Ok(Some(bytes))
     }
 
-    /// The write steps shared by `save` and `save_if_current`. The caller must
-    /// hold the write lock and have passed all guard checks.
+    /// The write steps shared by ordinary save paths. The caller holds the
+    /// write lock and passes the bytes just verified against the baseline.
     fn save_locked(
         &mut self,
         document: &StoredDocumentV1,
         bytes: &[u8],
+        current_main: Option<&[u8]>,
     ) -> Result<(), RepositoryError> {
         // A fresh unique temp name per save keeps concurrent saves from
         // colliding on one fixed token and makes stale-temp cleanup safe.
@@ -318,8 +330,13 @@ impl DocumentRepository {
         self.io.write_flush_sync(&temp, bytes)?;
 
         let main = self.main();
-        if self.io.exists(&main)? {
-            self.replace_backup_with_current_main()?;
+        // Keep the post-temp presence check as a last guard before backup
+        // replacement. A vanished main must never be treated as a first run.
+        if self.io.exists(&main)? != current_main.is_some() {
+            return Err(RepositoryError::ConcurrentModification);
+        }
+        if let Some(current_main) = current_main {
+            self.replace_backup_with_current_main(current_main)?;
         }
 
         // Atomic replace on Windows: std::fs::rename moves temp over main.
@@ -340,14 +357,16 @@ impl DocumentRepository {
     }
 
     /// Fault-safe replacement of the live backup bytes with the current main's
-    /// bytes (F005). The new backup is first written to a backup temp and
-    /// synced, then atomic-renamed onto `data.json.bak`. A partial or failed
-    /// backup write leaves the previous `.bak` byte-identical.
-    fn replace_backup_with_current_main(&mut self) -> Result<(), RepositoryError> {
-        let main_bytes = self.io.read(&self.main())?;
+    /// bytes (F005). These bytes were verified under the write lock before
+    /// any temp was created. The backup temp is synced, then renamed onto
+    /// `data.json.bak`; a failed write leaves the old backup byte-identical.
+    fn replace_backup_with_current_main(
+        &mut self,
+        main_bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
         let token = Self::new_temp_token();
         let backup_temp = self.backup_temp(&token);
-        self.io.write_flush_sync(&backup_temp, &main_bytes)?;
+        self.io.write_flush_sync(&backup_temp, main_bytes)?;
         self.io.rename(&backup_temp, &self.backup())?;
         Ok(())
     }
@@ -460,8 +479,9 @@ impl DocumentRepository {
     /// durable evidence, then promote a valid backup onto the main.
     ///
     /// Contract:
-    /// 1. re-read the main; if it now decodes (external repair), clear the
-    ///    pending state and refresh the observed revision — nothing else;
+    /// 1. re-read the main under the lock, even if recovery was not pending;
+    ///    if it decodes, clear pending and refresh the observed document only
+    ///    when this was a pending recovery or the bytes match our baseline;
     /// 2. otherwise the main is corrupt or absent: the backup must decode, or
     ///    this returns [`RepositoryError::CorruptData`] and leaves both the
     ///    main and the backup byte-untouched;
@@ -474,10 +494,6 @@ impl DocumentRepository {
     ///    `latest_loaded_revision` from the repaired main; ordinary saves are
     ///    allowed again.
     pub fn repair_from_backup(&mut self) -> Result<RepairOutcome, RepositoryError> {
-        if !self.pending_recovery {
-            return Ok(RepairOutcome::HadNoCorruptMain);
-        }
-
         // M01B-N001-followup (closed in M07): the whole read-judge-write window
         // runs under the per-directory write lock. Without the lock, a
         // concurrent `save` could interleave a fresh main between our "still
@@ -494,16 +510,28 @@ impl DocumentRepository {
             Err(_) => return Err(RepositoryError::Io),
         };
 
-        // Re-read the main: if it now decodes, an external actor already
-        // repaired it — just clear the pending state.
+        // A previously pending recovery may have been resolved externally;
+        // only then may an unobserved healthy main replace the working copy.
         if let Some(bytes) = main_bytes.as_deref()
             && let Ok(document) = codec::decode(bytes)
         {
+            if !self.pending_recovery
+                && (self.latest_loaded_revision != Some(document.data.revision)
+                    || self.observed_main_bytes.as_deref() != Some(bytes))
+            {
+                return Err(RepositoryError::ConcurrentModification);
+            }
             self.pending_recovery = false;
             self.document = Some(document.clone());
             self.latest_loaded_revision = Some(document.data.revision);
             self.observed_main_bytes = main_bytes;
             return Ok(RepairOutcome::HadNoCorruptMain);
+        }
+
+        // A healthy main that disappeared after load is an external conflict,
+        // not an invitation to silently roll back to an older backup.
+        if main_bytes.is_none() && !self.pending_recovery && self.latest_loaded_revision.is_some() {
+            return Err(RepositoryError::ConcurrentModification);
         }
 
         // Main is absent or still corrupt: the backup must be valid. If it is
@@ -994,7 +1022,8 @@ impl DocumentRepository {
         next.data.revision = new_revision;
         let bytes = codec::encode(&next)?;
         let _lock = self.acquire_write_lock()?;
-        self.save_locked(&next, &bytes)?;
+        let current_main = self.checked_main_for_save(None)?;
+        self.save_locked(&next, &bytes, current_main.as_deref())?;
         Ok(new_revision)
     }
 
@@ -1092,16 +1121,4 @@ impl DocumentRepository {
             pending_recovery: false,
         }
     }
-}
-
-/// Classification of the main file's on-disk state for the revision guard.
-/// The three cases are deliberately distinct (F002, F004): a missing main is
-/// the only state that means "no baseline"; an undecodable main is corruption,
-/// never a fabricatable baseline; any non-`NotFound` read error is an
-/// inaccessible-file condition surfaced as `RepositoryError::Io`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OnDiskRevision {
-    Missing,
-    Corrupt,
-    Ok(u64),
 }

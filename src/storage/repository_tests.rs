@@ -3,8 +3,9 @@
 //! Plan of record (each save performs exactly these `FileOps` sub-steps, so
 //! the fault matrix knows which step index to target). When a main exists:
 //!   step 0: `create_new` acquire the write lock
+//!   before step 1: read/decode and compare the on-disk main to the baseline
 //!   step 1,2: `write_flush_sync` main temp (write then sync)
-//!   step 3:   `exists` main probe
+//!   step 3:   `exists` main presence checkpoint
 //!   step 4,5: `write_flush_sync` backup temp (write then sync)
 //!   step 6:   `rename` backup temp → `.bak`
 //!   step 7:   `rename` main temp → main
@@ -223,6 +224,7 @@ fn backup_from_previous_save_holds_first_revision_bytes() {
     let first_bytes = codec_mod::encode(&first).expect("fixture must encode");
     write_raw(&main_document_path(base.path()), &first_bytes);
 
+    repo.load().expect("observe the seeded main before saving");
     let second = fixture_with_revision(4);
     repo.save(&second).expect("second save must succeed");
 
@@ -619,7 +621,7 @@ fn repair_from_backup_rejects_absent_or_invalid_backup_and_preserves_both() {
     }
 
     // When there was never a recoverable backup, load fails with CorruptData
-    // (no pending state) and repair is an explicit no-op that changes nothing.
+    // (no pending state) and explicit repair also refuses without changing it.
     {
         let base = TempDir::new().expect("temp dir");
         write_raw(&main_document_path(base.path()), &corrupt_bytes());
@@ -630,8 +632,9 @@ fn repair_from_backup_rejects_absent_or_invalid_backup_and_preserves_both() {
             "load itself reports CorruptData when there is no backup"
         );
         assert_eq!(
-            repo.repair_from_backup().expect("nothing pending"),
-            RepairOutcome::HadNoCorruptMain
+            repo.repair_from_backup()
+                .expect_err("corrupt main with no backup cannot be repaired"),
+            RepositoryError::CorruptData
         );
         assert_eq!(
             read_raw(&main_document_path(base.path())),
@@ -722,6 +725,256 @@ fn save_if_current_with_corrupt_main_returns_corrupt_data_and_preserves_both() {
         codec_mod::encode(&document).expect("encode"),
         "valid backup must not be overwritten with corrupt main bytes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// B/C r04: ordinary saves reject post-load corruption and stale main bytes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loaded_normal_saves_refuse_newly_corrupt_main_without_touching_backup() {
+    for operation in ["save_at", "save", "save_if_current"] {
+        let base = TempDir::new().expect("temp dir");
+        let main = main_document_path(base.path());
+        let backup = backup_document_path(base.path());
+        let mut repo = real_repo(&base);
+        repo.save(&fixture_with_revision(5))
+            .expect("first revision");
+        repo.save_at().expect("second revision creates backup");
+        let saved_backup = read_raw(&backup);
+        assert_eq!(
+            codec_mod::decode(&saved_backup)
+                .expect("valid backup")
+                .data
+                .revision,
+            5
+        );
+        let revision = repo.latest_loaded_revision().expect("loaded revision");
+        let corrupted = corrupt_bytes();
+        write_raw(&main, &corrupted);
+
+        let result = match operation {
+            "save_at" => repo.save_at().map(|_| ()),
+            "save" => repo.save(&fixture_with_revision(revision + 1)),
+            _ => repo.save_if_current(&fixture_with_revision(revision + 1), revision),
+        };
+        assert_eq!(result, Err(RepositoryError::CorruptData), "{operation}");
+        assert_eq!(
+            read_raw(&main),
+            corrupted,
+            "{operation} must keep corrupt original"
+        );
+        assert_eq!(
+            read_raw(&backup),
+            saved_backup,
+            "{operation} must keep valid backup"
+        );
+        assert_eq!(repo.latest_loaded_revision(), Some(revision));
+        assert!(!repo.recovery_pending());
+        assert!(
+            std::fs::read_dir(base.path())
+                .expect("data dir")
+                .flatten()
+                .all(|entry| {
+                    !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(TEMP_FILE_PREFIX)
+                }),
+            "a refused save cannot create a main temp file"
+        );
+    }
+}
+
+#[test]
+fn loaded_saves_refuse_external_revision_same_revision_bytes_and_removed_main() {
+    for mode in ["new revision", "same revision changed bytes", "missing"] {
+        let base = TempDir::new().expect("temp dir");
+        let main = main_document_path(base.path());
+        let backup = backup_document_path(base.path());
+        let mut repo = real_repo(&base);
+        repo.save(&fixture_with_revision(7)).expect("first save");
+        repo.save_at().expect("valid prior backup");
+        let original_backup = read_raw(&backup);
+        let revision = repo.latest_loaded_revision().expect("revision");
+        let original_main = read_raw(&main);
+        let external = match mode {
+            "new revision" => codec_mod::encode(&fixture_with_revision(55)).expect("encode"),
+            "same revision changed bytes" => {
+                let mut changed = fixture_with_revision(revision);
+                changed.data.settings.one_level_import = true;
+                codec_mod::encode(&changed).expect("encode")
+            }
+            _ => Vec::new(),
+        };
+        if mode == "missing" {
+            std::fs::remove_file(&main).expect("remove only FileGo test config");
+        } else {
+            assert_ne!(external, original_main);
+            write_raw(&main, &external);
+        }
+        assert_eq!(repo.save_at(), Err(RepositoryError::ConcurrentModification));
+        assert_eq!(
+            repo.save(&fixture_with_revision(revision + 1)),
+            Err(RepositoryError::ConcurrentModification)
+        );
+        assert_eq!(
+            repo.save_if_current(&fixture_with_revision(revision + 1), revision),
+            Err(RepositoryError::ConcurrentModification)
+        );
+        if mode == "missing" {
+            assert!(!main.exists());
+        } else {
+            assert_eq!(read_raw(&main), external);
+        }
+        assert_eq!(read_raw(&backup), original_backup);
+        assert_eq!(repo.latest_loaded_revision(), Some(revision));
+    }
+}
+
+#[test]
+fn unobserved_save_cannot_overwrite_existing_main_or_only_backup() {
+    let base = TempDir::new().expect("temp dir");
+    let main = main_document_path(base.path());
+    let backup = backup_document_path(base.path());
+    let original = codec_mod::encode(&fixture_with_revision(4)).expect("encode");
+    write_raw(&main, &original);
+    let mut repo = real_repo(&base);
+    assert_eq!(
+        repo.save(&fixture_with_revision(5)),
+        Err(RepositoryError::ConcurrentModification)
+    );
+    assert_eq!(read_raw(&main), original);
+    std::fs::remove_file(&main).expect("simulate missing config");
+    write_raw(&backup, &original);
+    assert_eq!(
+        repo.save(&fixture_with_revision(5)),
+        Err(RepositoryError::RecoveryRequired)
+    );
+    assert!(!main.exists());
+    assert_eq!(read_raw(&backup), original);
+}
+
+#[test]
+fn normal_save_read_error_and_backup_fault_preserve_main_and_backup() {
+    let base = TempDir::new().expect("temp dir");
+    let main = main_document_path(base.path());
+    let backup = backup_document_path(base.path());
+    let healthy = codec_mod::encode(&fixture_with_revision(4)).expect("encode");
+    write_raw(&main, &healthy);
+    write_raw(&backup, &healthy);
+    let read_fault: Box<dyn FileOps> =
+        Box::new(ReadFaultFileOps::new().fault_named("data.json", IoErrorKind::PermissionDenied));
+    let mut repo = DocumentRepository::with_io(real_paths(&base), read_fault);
+    assert_eq!(
+        repo.save(&fixture_with_revision(5)),
+        Err(RepositoryError::Io)
+    );
+    assert_eq!(read_raw(&main), healthy);
+    assert_eq!(read_raw(&backup), healthy);
+
+    for (step, op) in [(6, FaultOp::BackupReplace), (7, FaultOp::ReplaceRename)] {
+        let mut repo = faulted_repo(&base, &[FaultPoint { step, op }]);
+        repo.load().expect("observe healthy main");
+        assert_eq!(repo.save_at(), Err(RepositoryError::Io), "{op:?}");
+        assert_eq!(read_raw(&main), healthy);
+        assert_eq!(read_raw(&backup), healthy);
+    }
+}
+
+#[test]
+fn repair_without_pending_detects_corruption_and_reports_actual_repair() {
+    let base = TempDir::new().expect("temp dir");
+    let main = main_document_path(base.path());
+    let backup = backup_document_path(base.path());
+    let mut repo = real_repo(&base);
+    repo.save(&fixture_with_revision(8)).expect("initial save");
+    repo.save_at().expect("creates valid internal backup");
+    let valid_backup = read_raw(&backup);
+    let broken = corrupt_bytes();
+    write_raw(&main, &broken);
+    assert!(!repo.recovery_pending());
+    let result = repo.repair_from_backup().expect("actual repair required");
+    let RepairOutcome::Repaired {
+        evidence: Some(evidence),
+    } = result
+    else {
+        panic!("repair must report actual promotion and evidence, got {result:?}")
+    };
+    assert_eq!(read_raw(&evidence), broken);
+    assert_eq!(read_raw(&backup), valid_backup);
+    assert_eq!(read_raw(&main), valid_backup);
+    assert_eq!(repo.document(), Some(&fixture_with_revision(8)));
+    assert!(!repo.recovery_pending());
+    repo.save_at().expect("save after repair");
+    assert_eq!(read_raw(&evidence), broken);
+}
+
+#[test]
+fn repair_without_pending_healthy_conflict_and_absent_backup_are_truthful() {
+    let base = TempDir::new().expect("temp dir");
+    let main = main_document_path(base.path());
+    let backup = backup_document_path(base.path());
+    let mut repo = real_repo(&base);
+    repo.save(&fixture_with_revision(4)).expect("initial save");
+    let original = read_raw(&main);
+    assert_eq!(
+        repo.repair_from_backup(),
+        Ok(RepairOutcome::HadNoCorruptMain)
+    );
+    assert_eq!(read_raw(&main), original);
+
+    let mut external = fixture_with_revision(4);
+    external.data.settings.one_level_import = true;
+    let external_bytes = codec_mod::encode(&external).expect("encode");
+    write_raw(&main, &external_bytes);
+    assert_eq!(
+        repo.repair_from_backup(),
+        Err(RepositoryError::ConcurrentModification)
+    );
+    assert_eq!(read_raw(&main), external_bytes);
+
+    let broken = corrupt_bytes();
+    write_raw(&main, &broken);
+    assert_eq!(repo.repair_from_backup(), Err(RepositoryError::CorruptData));
+    assert_eq!(read_raw(&main), broken);
+    assert!(!backup.exists());
+    assert_eq!(repo.document(), Some(&fixture_with_revision(4)));
+}
+
+#[test]
+fn repair_without_pending_promotion_failure_keeps_sources_and_evidence() {
+    for (step, op) in [
+        (3, FaultOp::TempWrite),
+        (4, FaultOp::TempSync),
+        (5, FaultOp::ReplaceRename),
+    ] {
+        let base = TempDir::new().expect("temp dir");
+        let main = main_document_path(base.path());
+        let backup = backup_document_path(base.path());
+        let mut repo = real_repo(&base);
+        repo.save(&fixture_with_revision(4)).expect("seed");
+        repo.save_at().expect("backup");
+        let valid = read_raw(&backup);
+        let broken = corrupt_bytes();
+        write_raw(&main, &broken);
+        let mut repo = faulted_repo(&base, &[FaultPoint { step, op }]);
+        assert_eq!(repo.repair_from_backup(), Err(RepositoryError::Io));
+        assert_eq!(read_raw(&main), broken);
+        assert_eq!(read_raw(&backup), valid);
+        let evidence: Vec<_> = std::fs::read_dir(base.path())
+            .expect("data dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("data.json.corrupt-"))
+            })
+            .collect();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(read_raw(&evidence[0]), broken);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -874,65 +1127,8 @@ fn save_if_current_main_read_access_denied_returns_io() {
     );
 }
 
-/// Wraps `FsFileOps`, delegating everything, but faults `exists` for a
-/// specific file name with a non-`NotFound` error.
-#[derive(Debug, Default)]
-struct ExistsFaultFileOps {
-    fault_paths: Vec<(String, std::io::ErrorKind)>,
-}
-
-impl ExistsFaultFileOps {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn fault_named(mut self, name: &str, kind: std::io::ErrorKind) -> Self {
-        self.fault_paths.push((name.to_owned(), kind));
-        self
-    }
-
-    fn fault_kind_for(&self, path: &std::path::Path) -> Option<std::io::ErrorKind> {
-        let name = path.file_name()?.to_str()?;
-        self.fault_paths
-            .iter()
-            .find(|(target, _)| target == name)
-            .map(|(_, kind)| *kind)
-    }
-}
-
-impl FileOps for ExistsFaultFileOps {
-    fn write_flush_sync(&mut self, path: &std::path::Path, bytes: &[u8]) -> std_io::Result<()> {
-        FsFileOps.write_flush_sync(path, bytes)
-    }
-
-    fn rename(&mut self, from: &std::path::Path, to: &std::path::Path) -> std_io::Result<()> {
-        FsFileOps.rename(from, to)
-    }
-
-    fn read(&mut self, path: &std::path::Path) -> std_io::Result<Vec<u8>> {
-        FsFileOps.read(path)
-    }
-
-    fn exists(&mut self, path: &std::path::Path) -> std_io::Result<bool> {
-        if let Some(kind) = self.fault_kind_for(path) {
-            return Err(std_io::Error::new(kind, "injected exists fault"));
-        }
-        FsFileOps.exists(path)
-    }
-
-    fn create_new(&mut self, path: &std::path::Path) -> std_io::Result<()> {
-        FsFileOps.create_new(path)
-    }
-
-    fn remove(&mut self, path: &std::path::Path) -> std_io::Result<()> {
-        FsFileOps.remove(path)
-    }
-}
-
-/// F004: the main-exists probe (`save` step 3) classifies a non-`NotFound`
-/// error as `Io`, not "no main → skip backup". Both the write-lock and the
-/// main probe faults abort nothing prematurely; the error must reach the
-/// caller.
+/// F004: a failed main probe cannot be treated as missing; the faulted read
+/// occurs under the write lock, before any temp or backup write.
 #[test]
 fn save_main_exists_error_returns_io_and_preserves_previous_main() {
     let base = TempDir::new().expect("temp dir");
@@ -944,11 +1140,11 @@ fn save_main_exists_error_returns_io_and_preserves_previous_main() {
     let previous_main = read_raw(&main_document_path(base.path()));
 
     let io_boxed: Box<dyn FileOps> =
-        Box::new(ExistsFaultFileOps::new().fault_named("data.json", IoErrorKind::PermissionDenied));
+        Box::new(ReadFaultFileOps::new().fault_named("data.json", IoErrorKind::PermissionDenied));
     let mut repo = DocumentRepository::with_io(real_paths(&base), io_boxed);
     assert_eq!(
         repo.save(&fixture_with_revision(2))
-            .expect_err("exists error must be Io"),
+            .expect_err("main read error must be Io"),
         RepositoryError::Io
     );
     assert_eq!(
@@ -1007,6 +1203,7 @@ fn save_fault_temp_sync_error_returns_and_preserves_previous_main() {
             op: FaultOp::TempSync,
         }],
     );
+    repo.load().expect("observe healthy first revision");
     assert_eq!(
         repo.save(&second).expect_err("temp sync fail must error"),
         RepositoryError::Io
@@ -1052,6 +1249,7 @@ fn save_fault_backup_staging_preserves_previous_backup() {
                 op: *op,
             }],
         );
+        repo.load().expect("observe healthy first revision");
         assert_eq!(
             repo.save(&second)
                 .expect_err("backup staging fail must error"),
@@ -1089,6 +1287,7 @@ fn save_fault_rename_error_preserves_main_and_backup() {
             op: FaultOp::ReplaceRename,
         }],
     );
+    repo.load().expect("observe healthy first revision");
     assert_eq!(
         repo.save(&second).expect_err("rename fail must error"),
         RepositoryError::Io
@@ -1180,6 +1379,7 @@ fn revision_guard_detects_external_concurrent_writer_on_disk() {
     let v2 = fixture_with_revision(2);
     {
         let mut external = real_repo(&base);
+        external.load().expect("observe v1 before writing v2");
         external.save(&v2).expect("external v2 write must succeed");
     }
 
@@ -1195,23 +1395,30 @@ fn revision_guard_detects_external_concurrent_writer_on_disk() {
         codec_mod::decode(&read_raw(&main_document_path(base.path()))).expect("main must decode");
     assert_eq!(decoded.data.revision, 2, "external state must be preserved");
 
-    // With the correct expected revision 2 the save goes through.
+    // A stale working copy cannot bypass the byte baseline just by supplying
+    // the current revision; explicitly reload before saving newer data.
     let v3 = fixture_with_revision(3);
+    assert_eq!(
+        repo_b.save_if_current(&v3, 2),
+        Err(RepositoryError::ConcurrentModification)
+    );
+    repo_b.load().expect("refresh baseline to external main");
     repo_b
         .save_if_current(&v3, 2)
-        .expect("matching on-disk revision must pass");
+        .expect("matching loaded baseline must pass");
     assert_eq!(repo_b.latest_loaded_revision(), Some(3));
 }
 
 #[test]
-fn revision_guard_is_not_enforced_before_any_load_or_save() {
+fn revision_guard_allows_first_run_creation_without_main_or_backup() {
     let base = TempDir::new().expect("temp dir");
     let mut repo = real_repo(&base);
     let document = fixture_with_revision(3);
 
-    // No baseline yet: save_if_current proceeds regardless of expected value.
+    // An empty directory is safe to bootstrap; the revision check only applies
+    // when a main file already exists.
     repo.save_if_current(&document, 999)
-        .expect("no baseline means no guard");
+        .expect("first run has no on-disk revision");
     let decoded =
         codec_mod::decode(&read_raw(&main_document_path(base.path()))).expect("main must decode");
     assert_eq!(decoded.data.revision, 3);
@@ -1362,6 +1569,7 @@ fn cleanup_does_not_delete_interleaved_writers_temp() {
     // live temp was renamed onto main), never the lock or evidence files.
     {
         let mut repo_b = real_repo(&base);
+        repo_b.load().expect("observe A's main");
         repo_b
             .save(&fixture_with_revision(2))
             .expect("B save must succeed");
@@ -1372,8 +1580,8 @@ fn cleanup_does_not_delete_interleaved_writers_temp() {
 }
 
 /// A barrier/controlled two-writer test: with both instances contending for
-/// the same base directory, exactly one `save_if_current` wins the write
-/// lock; the loser obtains `ConcurrentModification`. Because the repository is
+/// the same base directory, exactly one `save_if_current` wins; the loser
+/// obtains `ConcurrentModification` from the lock or refreshed baseline. Because the repository is
 /// `Send`, the two "processes" are two repository instances on real threads —
 /// the same exclusion the production lock enforces across real processes.
 #[test]
@@ -1395,6 +1603,7 @@ fn two_writers_contending_save_if_current_only_one_wins() {
             thread::spawn(move || {
                 let paths = DocumentPaths::from_base_dir(&base_dir);
                 let mut repo = DocumentRepository::new(paths);
+                repo.load().expect("observe the shared baseline");
                 // Each writer believes its expected revision is 1 and tries to
                 // persist revision 2. Exactly one must win.
                 let document = fixture_with_revision(2 + writer as u64);
@@ -1832,11 +2041,9 @@ fn rapid_successive_saves_all_persist_in_order() {
     );
 }
 
-/// M07.2 concurrent rapid saves across TWO repository instances on real
-/// threads using the plain `save` surface (the settings/management layers both
-/// call `save_at`, which acquires the lock every time). The lock guarantees the
-/// on-disk main is ALWAYS one complete document even with many interleaved
-/// writers; the revision guard refuses overwrites rather than corrupting.
+/// M07.2 concurrent rapid saves across repository instances on real threads
+/// using the plain `save` surface. Writers without an observed baseline are
+/// refused instead of silently replacing another writer's healthy main.
 #[test]
 fn concurrent_burst_saves_never_torn_main() {
     let base = TempDir::new().expect("temp dir");
@@ -1857,10 +2064,9 @@ fn concurrent_burst_saves_never_torn_main() {
                 let paths = DocumentPaths::from_base_dir(&base_dir);
                 let mut repo = DocumentRepository::new(paths);
                 // Each writer loads once then writes many unique revisions; the
-                // lock serializes, but a loser's `save` can race the revision
-                // check — under the documented contract a plain `save` replaces
-                // whatever is there (single-instance), so the ONLY invariant we
-                // assert is that the main is never torn.
+                // A save without a loaded baseline now refuses an existing
+                // main, so none of these unobserved writers can overwrite the
+                // initial document.
                 for i in 0..WRITES_PER_WRITER {
                     let revision = 10_000 + writer as u64 * 1000 + i as u64;
                     let document = fixture_with_revision(revision);
@@ -1875,15 +2081,11 @@ fn concurrent_burst_saves_never_torn_main() {
         handle.join().expect("writer thread must not panic");
     }
 
-    // The main file must decode to SOME complete document (never torn), even
-    // after 80 interleaved saves from 4 threads.
+    // Without a loaded baseline, every writer is refused and the original
+    // complete document is preserved rather than a stale copy being installed.
     let bytes = std::fs::read(main_document_path(base.path())).expect("main readable");
     let decoded = codec_mod::decode(&bytes).expect("main decodes intact after burst");
-    assert!(
-        decoded.data.revision >= 10_000,
-        "a complete writer document is present, got revision {}",
-        decoded.data.revision
-    );
+    assert_eq!(decoded.data.revision, 1);
     assert!(
         !lock_file_path(base.path()).exists(),
         "no stale lock after concurrent burst"

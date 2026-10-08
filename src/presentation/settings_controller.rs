@@ -105,6 +105,7 @@ pub enum SNotice {
     BackupCreated,
     BackupRestoreFailed,
     BackupRestoreApplied,
+    BackupRepairNotNeeded,
     BackupListFailed,
     ResetDefaultApplied,
     ClearAllApplied,

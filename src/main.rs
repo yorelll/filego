@@ -1374,11 +1374,12 @@ impl SettingsWindowController {
                 self.main.borrow_mut().refresh_from_repository(&self.repo);
             }
             Ok(filego::storage::repository::RepairOutcome::HadNoCorruptMain) => {
-                // An external actor already repaired the main. The repository
-                // refreshed its working copy; reflect that success in both UIs.
+                // The disk was actually checked and is healthy; no repair was
+                // applied. If recovery had been pending, refresh the UIs from
+                // the externally repaired document without claiming promotion.
                 self.settings.reload();
                 self.manager.reload_from_store();
-                self.settings.set_notice(SNotice::BackupRestoreApplied);
+                self.settings.set_notice(SNotice::BackupRepairNotNeeded);
                 self.refresh_search_settings();
                 self.main.borrow_mut().refresh_from_repository(&self.repo);
             }
@@ -1920,6 +1921,9 @@ fn snotice_text(
         }
         filego::presentation::settings_controller::SNotice::BackupRestoreApplied => {
             Msg::MonoNoticeBackupRestoreApplied
+        }
+        filego::presentation::settings_controller::SNotice::BackupRepairNotNeeded => {
+            Msg::MonoNoticeBackupRepairNotNeeded
         }
         filego::presentation::settings_controller::SNotice::BackupListFailed => {
             Msg::MonoNoticeBackupListFailed
@@ -2507,6 +2511,10 @@ fn apply_settings_localization(
         (
             "settings_notice_backup_restore_applied",
             Msg::MonoNoticeBackupRestoreApplied,
+        ),
+        (
+            "settings_notice_backup_repair_not_needed",
+            Msg::MonoNoticeBackupRepairNotNeeded,
         ),
         (
             "settings_notice_backup_list_failed",
@@ -4705,6 +4713,21 @@ mod tests {
         assert_eq!(status, StartupDataStatus::Unreadable);
         assert!(repo.document().is_none());
         assert_eq!(std::fs::read(&main).expect("read untouched main"), original);
+    }
+
+    #[test]
+    fn repair_not_needed_notice_is_distinct_from_applied_in_both_languages() {
+        use filego::presentation::i18n::{Locale, Msg};
+        assert_eq!(
+            snotice_text(SNotice::BackupRepairNotNeeded, Locale::ZhCN),
+            Msg::MonoNoticeBackupRepairNotNeeded.tr(Locale::ZhCN)
+        );
+        for locale in [Locale::ZhCN, Locale::EnUS] {
+            let no_repair = snotice_text(SNotice::BackupRepairNotNeeded, locale);
+            let applied = snotice_text(SNotice::BackupRestoreApplied, locale);
+            assert!(!no_repair.is_empty());
+            assert_ne!(no_repair, applied);
+        }
     }
 
     #[test]
