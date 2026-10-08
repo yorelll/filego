@@ -8,9 +8,13 @@ use super::settings_controller::{SNotice, SettingsController, SettingsStore};
 
 pub trait RunRegistration {
     type Error;
+    type Snapshot: Clone + PartialEq;
 
-    fn read_enabled(&mut self) -> Result<bool, Self::Error>;
+    /// Read the original registry type and bytes; `None` means no value.
+    fn read_snapshot(&mut self) -> Result<Option<Self::Snapshot>, Self::Error>;
+    fn expected_value(&mut self) -> Result<Self::Snapshot, Self::Error>;
     fn write_enabled(&mut self, enabled: bool) -> Result<(), Self::Error>;
+    fn restore_snapshot(&mut self, previous: Option<&Self::Snapshot>) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,15 +24,18 @@ pub enum RegistrationError {
     ReadFailed,
     WriteFailed,
     RollbackFailed,
+    ForeignValue,
 }
 
 impl RegistrationError {
     pub const fn notice(self) -> SNotice {
         match self {
             Self::ReadFailed => SNotice::StartupReadFailed,
-            Self::DataUnavailable | Self::SaveFailed | Self::WriteFailed | Self::RollbackFailed => {
-                SNotice::StartupWriteFailed
-            }
+            Self::DataUnavailable
+            | Self::SaveFailed
+            | Self::WriteFailed
+            | Self::RollbackFailed
+            | Self::ForeignValue => SNotice::StartupWriteFailed,
         }
     }
 }
@@ -46,30 +53,53 @@ pub fn set_launch_at_login<S: SettingsStore, R: RunRegistration>(
         return Err(RegistrationError::DataUnavailable);
     };
     let prior_settings = document.data.settings;
-    let prior_os = registry.read_enabled().map_err(|_| {
+    let expected = registry.expected_value().map_err(|_| {
         controller.set_notice(SNotice::StartupReadFailed);
         RegistrationError::ReadFailed
     })?;
-    if enabled == prior_settings.launch_at_login && enabled == prior_os {
-        controller.set_launch_at_login_os(Some(prior_os));
+    let prior_os = registry.read_snapshot().map_err(|_| {
+        controller.set_notice(SNotice::StartupReadFailed);
+        RegistrationError::ReadFailed
+    })?;
+    // A fixed value name can belong to another portable installation. Neither
+    // enabling nor disabling this EXE may replace/delete a different Run value.
+    if prior_os.as_ref().is_some_and(|value| value != &expected) {
+        controller.set_launch_at_login_os(Some(false));
+        controller.set_notice(SNotice::StartupWriteFailed);
+        return Err(RegistrationError::ForeignValue);
+    }
+    let prior_enabled = prior_os.is_some();
+    if enabled == prior_settings.launch_at_login && enabled == prior_enabled {
+        controller.set_launch_at_login_os(Some(prior_enabled));
         return Ok(());
     }
     controller
         .set_launch_at_login(enabled)
         .map_err(|_| RegistrationError::SaveFailed)?;
+    // If only JSON needed changing, leave HKCU untouched. Any failed Win32
+    // write may have partially changed HKCU and must be rolled back exactly.
+    if enabled == prior_enabled {
+        controller.set_launch_at_login_os(Some(enabled));
+        return Ok(());
+    }
     let write_ok = registry.write_enabled(enabled).is_ok();
-    let verified = registry.read_enabled();
-    if write_ok && matches!(verified, Ok(state) if state == enabled) {
+    let verified = registry.read_snapshot();
+    let target = enabled.then_some(expected.clone());
+    if write_ok && matches!(&verified, Ok(state) if *state == target) {
         controller.set_launch_at_login_os(Some(enabled));
         return Ok(());
     }
 
     // Always try BOTH rollbacks, even when one fails. A failed Win32 call may
     // still have partially changed HKCU; never assume an Err means no effect.
-    let os_rollback = registry.write_enabled(prior_os);
+    let os_rollback = registry.restore_snapshot(prior_os.as_ref());
     let data_rollback = controller.set_launch_at_login(prior_settings.launch_at_login);
-    let actual_os = registry.read_enabled().ok();
-    controller.set_launch_at_login_os(actual_os);
+    let actual_os = registry.read_snapshot().ok();
+    controller.set_launch_at_login_os(
+        actual_os
+            .as_ref()
+            .map(|state| state.as_ref() == Some(&expected)),
+    );
     if os_rollback.is_err() || data_rollback.is_err() || actual_os != Some(prior_os) {
         controller.set_notice(SNotice::StartupWriteFailed);
         return Err(RegistrationError::RollbackFailed);
@@ -151,34 +181,64 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Value {
+        kind: u32,
+        bytes: Vec<u8>,
+    }
+    fn value(bytes: &[u8]) -> Value {
+        Value {
+            kind: 1,
+            bytes: bytes.to_vec(),
+        }
+    }
     struct Registry {
-        state: bool,
+        state: Option<Value>,
         writes: usize,
         fail_read: bool,
         fail_write: bool,
         fail_first_write: bool,
         fail_read_after_write: bool,
         partial_write: bool,
+        fail_rollback: bool,
+        fail_rollback_after_write: bool,
     }
     impl RunRegistration for Registry {
         type Error = ();
-        fn read_enabled(&mut self) -> Result<bool, Self::Error> {
+        type Snapshot = Value;
+        fn expected_value(&mut self) -> Result<Value, Self::Error> {
+            Ok(value(b"current portable exe"))
+        }
+        fn read_snapshot(&mut self) -> Result<Option<Value>, Self::Error> {
             if self.fail_read || (self.fail_read_after_write && self.writes == 1) {
                 Err(())
             } else {
-                Ok(self.state)
+                Ok(self.state.clone())
             }
         }
         fn write_enabled(&mut self, enabled: bool) -> Result<(), Self::Error> {
             self.writes += 1;
             if self.partial_write && self.writes == 1 {
-                self.state = enabled;
+                self.state = enabled.then(|| value(b"current portable exe"));
                 return Err(());
             }
             if self.fail_write || (self.fail_first_write && self.writes == 1) {
                 Err(())
             } else {
-                self.state = enabled;
+                self.state = enabled.then(|| value(b"current portable exe"));
+                Ok(())
+            }
+        }
+        fn restore_snapshot(&mut self, previous: Option<&Value>) -> Result<(), Self::Error> {
+            self.writes += 1;
+            if self.fail_rollback_after_write {
+                self.state = previous.cloned();
+                return Err(());
+            }
+            if self.fail_rollback || self.fail_write {
+                Err(())
+            } else {
+                self.state = previous.cloned();
                 Ok(())
             }
         }
@@ -205,13 +265,15 @@ mod tests {
     }
     fn registry() -> Registry {
         Registry {
-            state: false,
+            state: None,
             writes: 0,
             fail_read: false,
             fail_write: false,
             fail_first_write: false,
             fail_read_after_write: false,
             partial_write: false,
+            fail_rollback: false,
+            fail_rollback_after_write: false,
         }
     }
 
@@ -224,7 +286,7 @@ mod tests {
             Err(RegistrationError::DataUnavailable)
         );
         assert_eq!(os.writes, 0);
-        assert!(!os.state);
+        assert!(os.state.is_none());
     }
 
     #[test]
@@ -271,12 +333,12 @@ mod tests {
         let mut settings = controller(true, false, None);
         let mut os = registry();
         set_launch_at_login(&mut settings, &mut os, true).expect("enable");
-        assert!(os.state);
+        assert_eq!(os.state, Some(value(b"current portable exe")));
         assert!(settings.document().unwrap().data.settings.launch_at_login);
         set_launch_at_login(&mut settings, &mut os, true).expect("repeat enable");
         assert_eq!(os.writes, 1);
         set_launch_at_login(&mut settings, &mut os, false).expect("disable");
-        assert!(!os.state);
+        assert!(os.state.is_none());
     }
 
     #[test]
@@ -289,7 +351,7 @@ mod tests {
             Err(RegistrationError::WriteFailed)
         );
         assert_eq!(os.writes, 2, "the failed call still requires OS rollback");
-        assert!(!os.state);
+        assert!(os.state.is_none());
         assert!(!settings.document().unwrap().data.settings.launch_at_login);
     }
 
@@ -325,7 +387,7 @@ mod tests {
             set_launch_at_login(&mut settings, &mut os, true),
             Err(RegistrationError::WriteFailed)
         );
-        assert!(!os.state);
+        assert!(os.state.is_none());
         assert!(!settings.document().unwrap().data.settings.launch_at_login);
     }
 
@@ -342,7 +404,7 @@ mod tests {
             os.writes, 2,
             "JSON rollback failure must not skip OS rollback"
         );
-        assert!(!os.state);
+        assert!(os.state.is_none());
     }
 
     #[test]
@@ -354,7 +416,69 @@ mod tests {
             set_launch_at_login(&mut settings, &mut os, true),
             Err(RegistrationError::ReadFailed)
         );
-        assert!(!os.state);
+        assert!(os.state.is_none());
+        assert!(!settings.document().unwrap().data.settings.launch_at_login);
+    }
+
+    #[test]
+    fn foreign_run_value_is_never_replaced_or_deleted() {
+        for enabled in [true, false] {
+            let mut settings = controller(true, false, None);
+            let mut os = registry();
+            let foreign = Value {
+                kind: 2,
+                bytes: vec![1, 0, 2, 0, 0, 0],
+            };
+            os.state = Some(foreign.clone());
+            assert_eq!(
+                set_launch_at_login(&mut settings, &mut os, enabled),
+                Err(RegistrationError::ForeignValue)
+            );
+            assert_eq!(os.state, Some(foreign));
+            assert_eq!(os.writes, 0);
+            assert!(!settings.document().unwrap().data.settings.launch_at_login);
+        }
+    }
+
+    #[test]
+    fn failed_readback_restores_original_raw_value_type_and_bytes() {
+        let mut settings = controller(true, false, None);
+        let mut os = registry();
+        os.state = Some(value(b"current portable exe"));
+        os.fail_read_after_write = true;
+        assert_eq!(
+            set_launch_at_login(&mut settings, &mut os, false),
+            Err(RegistrationError::ReadFailed)
+        );
+        assert_eq!(os.state, Some(value(b"current portable exe")));
+        assert!(!settings.document().unwrap().data.settings.launch_at_login);
+    }
+
+    #[test]
+    fn partial_disable_restores_exact_original_value() {
+        let mut settings = controller(true, false, None);
+        let mut os = registry();
+        os.state = Some(value(b"current portable exe"));
+        os.partial_write = true;
+        assert_eq!(
+            set_launch_at_login(&mut settings, &mut os, false),
+            Err(RegistrationError::WriteFailed)
+        );
+        assert_eq!(os.state, Some(value(b"current portable exe")));
+        assert!(!settings.document().unwrap().data.settings.launch_at_login);
+    }
+
+    #[test]
+    fn failed_rollback_after_mutation_does_not_claim_success() {
+        let mut settings = controller(true, false, None);
+        let mut os = registry();
+        os.partial_write = true;
+        os.fail_rollback_after_write = true;
+        assert_eq!(
+            set_launch_at_login(&mut settings, &mut os, true),
+            Err(RegistrationError::RollbackFailed)
+        );
+        assert!(os.state.is_none());
         assert!(!settings.document().unwrap().data.settings.launch_at_login);
     }
 

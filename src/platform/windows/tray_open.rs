@@ -20,12 +20,12 @@
 //! fixed; paths never appear in logs.
 
 use windows::Win32::{
-    Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND},
+    Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, GetLastError, HWND},
     System::{
         LibraryLoader::GetModuleFileNameW,
         Registry::{
-            HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_SZ, RegDeleteValueW, RegGetValueW,
-            RegOpenKeyExW, RegSetKeyValueW,
+            HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, REG_VALUE_TYPE,
+            RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
         },
     },
     UI::{
@@ -51,7 +51,119 @@ pub fn run_value_for(exe_path: &str) -> String {
     format!("\"{exe_path}\"")
 }
 
-/// Register (or update) the launch-at-login value.
+/// Lossless snapshot of the existing per-user Run value. `None` means that
+/// the value did not exist; otherwise the exact type and bytes are retained.
+/// Never display or log these bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunValueSnapshot {
+    pub value_type: REG_VALUE_TYPE,
+    pub bytes: Vec<u8>,
+}
+
+pub fn read_run_value() -> Result<Option<RunValueSnapshot>, RegistryError> {
+    const MAX_VALUE_BYTES: u32 = 8192;
+    let subkey_wide = run_subkey_wide();
+    let value_wide = run_value_wide();
+    let mut key = Default::default();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(subkey_wide.as_ptr()),
+            Some(0),
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(RegistryError::ReadFailed);
+    }
+    let value = windows::core::PCWSTR(value_wide.as_ptr());
+    let mut kind = REG_VALUE_TYPE(0);
+    let mut size = 0u32;
+    let status =
+        unsafe { RegQueryValueExW(key, value, None, Some(&mut kind), None, Some(&mut size)) };
+    if status == ERROR_FILE_NOT_FOUND {
+        let closed = unsafe { windows::Win32::System::Registry::RegCloseKey(key) };
+        return if closed == ERROR_SUCCESS {
+            Ok(None)
+        } else {
+            Err(RegistryError::ReadFailed)
+        };
+    }
+    if status != ERROR_SUCCESS && status != ERROR_MORE_DATA || size > MAX_VALUE_BYTES {
+        let _ = unsafe { windows::Win32::System::Registry::RegCloseKey(key) };
+        return Err(RegistryError::ReadFailed);
+    }
+    // The value could grow between the size query and the second read. Reserve
+    // the full allowed capacity so no raw registry write can overflow the slice.
+    let mut bytes = vec![0u8; MAX_VALUE_BYTES as usize];
+    size = MAX_VALUE_BYTES;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            value,
+            None,
+            Some(&mut kind),
+            Some(bytes.as_mut_ptr()),
+            Some(&mut size),
+        )
+    };
+    let closed = unsafe { windows::Win32::System::Registry::RegCloseKey(key) };
+    if status != ERROR_SUCCESS || size > MAX_VALUE_BYTES || closed != ERROR_SUCCESS {
+        return Err(RegistryError::ReadFailed);
+    }
+    bytes.truncate(size as usize);
+    Ok(Some(RunValueSnapshot {
+        value_type: kind,
+        bytes,
+    }))
+}
+
+pub fn expected_run_value() -> Result<RunValueSnapshot, RegistryError> {
+    let quoted = run_value_for(&current_exe_path()?);
+    let bytes = quoted
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    Ok(RunValueSnapshot {
+        value_type: REG_SZ,
+        bytes,
+    })
+}
+
+/// Restore exactly the previous HKCU value after a failed setting transaction.
+/// An absent value is deleted; a present value retains its original type and
+/// raw data (including previous portable-EXE paths). The caller verifies it by
+/// re-reading before reporting success.
+pub fn restore_run_value(previous: Option<&RunValueSnapshot>) -> Result<(), RegistryError> {
+    let Some(previous) = previous else {
+        return set_launch_at_login(false);
+    };
+    let subkey_wide = run_subkey_wide();
+    let value_wide = run_value_wide();
+    let status = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(subkey_wide.as_ptr()),
+            windows::core::PCWSTR(value_wide.as_ptr()),
+            previous.value_type.0,
+            Some(previous.bytes.as_ptr().cast()),
+            previous.bytes.len() as u32,
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(RegistryError::WriteFailed)
+    }
+}
+
+/// Register (or update) this executable's launch-at-login value. Call via
+/// the transaction in `startup_registration`, which refuses foreign values.
 ///
 /// `enabled == true` writes `HKCU\...\Run\FileGo = "<exe path>"`; `false`
 /// removes it. Idempotent. The quoted value comes from [`run_value_for`], so a
@@ -96,52 +208,18 @@ pub fn set_launch_at_login(enabled: bool) -> Result<(), RegistryError> {
             return Err(RegistryError::WriteFailed);
         }
         let status = unsafe { RegDeleteValueW(key, value) };
-        let _ = unsafe { windows::Win32::System::Registry::RegCloseKey(key) };
-        if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+        let closed = unsafe { windows::Win32::System::Registry::RegCloseKey(key) };
+        if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) || closed != ERROR_SUCCESS {
             return Err(RegistryError::WriteFailed);
         }
         Ok(())
     }
 }
 
-/// Whether launch-at-login is currently set.
+/// Whether launch-at-login is registered for this exact executable.
+/// Existing values for another portable EXE are not owned by this process.
 pub fn launch_at_login() -> Result<bool, RegistryError> {
-    // REG_SZ is small; 4 KiB is generous. A corrupt/oversized value (size
-    // overflow) surfaces as ReadFailed rather than overflowing our buffer.
-    let mut buffer = [0u16; 4096];
-    let mut size = (buffer.len() * 2) as u32;
-    let subkey_wide = run_subkey_wide();
-    let value_wide = run_value_wide();
-    // Safety: the UTF-16 key buffers and value buffer remain live for the call;
-    // RRF_RT_REG_SZ restricts the registry value type.
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            windows::core::PCWSTR(subkey_wide.as_ptr()),
-            windows::core::PCWSTR(value_wide.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
-            Some(&mut size),
-        )
-    };
-    match status {
-        ERROR_SUCCESS => {
-            let encoded = (size as usize / 2).min(buffer.len());
-            let end = buffer[..encoded]
-                .iter()
-                .position(|unit| *unit == 0)
-                .unwrap_or(encoded);
-            let actual = String::from_utf16_lossy(&buffer[..end]);
-            let expected = current_exe_path()?;
-            // A stale Run value targeting a different portable EXE is not an
-            // active registration for this process. It will be replaced when
-            // the owner opts in again.
-            Ok(actual == run_value_for(&expected))
-        }
-        ERROR_FILE_NOT_FOUND => Ok(false),
-        _ => Err(RegistryError::ReadFailed),
-    }
+    Ok(read_run_value()?.as_ref() == Some(&expected_run_value()?))
 }
 
 fn run_subkey_wide() -> Vec<u16> {
@@ -158,12 +236,13 @@ fn run_value_wide() -> Vec<u16> {
 /// The current executable's absolute path (for the Run value).
 fn current_exe_path() -> Result<String, RegistryError> {
     let mut buffer = [0u16; 4096];
-    // Safety: buffer is valid; GetModuleFileNameW null-terminates.
+    // A truncated path cannot be registered safely as a different portable
+    // executable, and must not be compared as if it were the full path.
     let len = unsafe { GetModuleFileNameW(None, &mut buffer) };
-    if len == 0 {
+    if len == 0 || len as usize >= buffer.len() {
         return Err(RegistryError::ExePathUnavailable);
     }
-    let len = (len as usize).min(buffer.len() - 1);
+    let len = len as usize;
     Ok(String::from_utf16_lossy(&buffer[..len]))
 }
 

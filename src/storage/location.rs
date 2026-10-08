@@ -25,6 +25,8 @@ pub const BACKUP_TEMP_FILE_PREFIX: &str = "data.json.bak.tmp.";
 /// `data.json.corrupt-<token>`. These are written once during
 /// `repair_from_backup` and are never removed automatically.
 pub const CORRUPT_EVIDENCE_PREFIX: &str = "data.json.corrupt-";
+/// Durable copy of a healthy main before an explicit named-backup restore.
+pub const PRE_RESTORE_PREFIX: &str = "data.json.pre-restore-";
 /// Name of the per-directory write-lock file (`data.json.lock`). It is
 /// exclusive (create-new semantics) and held for the whole write window.
 pub const LOCK_FILE_NAME: &str = "data.json.lock";

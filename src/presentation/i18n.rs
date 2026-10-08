@@ -1222,7 +1222,7 @@ mod zh_cn {
         ),
         (
             "settings.notice.startup_write_failed",
-            "开机启动设置写入失败",
+            "无法更改开机启动项；如其他 FileGo 副本已注册，请先在该副本中关闭启动项",
         ),
         (
             "settings.notice.startup_read_failed",
@@ -1656,7 +1656,7 @@ mod en_us {
         ),
         (
             "settings.notice.startup_write_failed",
-            "Could not write the startup setting",
+            "Could not change startup; if another FileGo copy is registered, disable it there first",
         ),
         (
             "settings.notice.startup_read_failed",

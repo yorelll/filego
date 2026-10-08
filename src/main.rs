@@ -229,13 +229,22 @@ struct SystemRunRegistration;
 
 impl RunRegistration for SystemRunRegistration {
     type Error = filego::platform::windows::tray_open::RegistryError;
+    type Snapshot = filego::platform::windows::tray_open::RunValueSnapshot;
 
-    fn read_enabled(&mut self) -> Result<bool, Self::Error> {
-        filego::platform::windows::tray_open::launch_at_login()
+    fn read_snapshot(&mut self) -> Result<Option<Self::Snapshot>, Self::Error> {
+        filego::platform::windows::tray_open::read_run_value()
+    }
+
+    fn expected_value(&mut self) -> Result<Self::Snapshot, Self::Error> {
+        filego::platform::windows::tray_open::expected_run_value()
     }
 
     fn write_enabled(&mut self, enabled: bool) -> Result<(), Self::Error> {
         filego::platform::windows::tray_open::set_launch_at_login(enabled)
+    }
+
+    fn restore_snapshot(&mut self, previous: Option<&Self::Snapshot>) -> Result<(), Self::Error> {
+        filego::platform::windows::tray_open::restore_run_value(previous)
     }
 }
 
@@ -1328,41 +1337,15 @@ impl SettingsWindowController {
     /// Restore a listed backup without silently overwriting a corrupt main.
     /// Never touches a real folder or any of its contents.
     fn restore_backup(&mut self, index: i32) {
-        use filego::storage::backup;
         let backups = self.settings.view().backups.clone();
         let Some(name) = backups.get(index as usize).cloned() else {
             self.settings.set_notice(SNotice::BackupRestoreFailed);
             self.sync_settings_ui();
             return;
         };
-        let decoded = match backup::read_backup(&self.data_dir, &name) {
-            Ok(document) => document,
-            Err(_) => {
-                self.settings.set_notice(SNotice::BackupRestoreFailed);
-                self.sync_settings_ui();
-                return;
-            }
-        };
-        // Explicit recovery must retain a corrupt main as a separate evidence
-        // file. A normal save_at would refuse pending recovery (or overwrite a
-        // corrupt main when no internal backup is available).
-        let result = {
-            let mut repo = self.repo.borrow_mut();
-            if repo.recovery_pending() || repo.document().is_none() {
-                repo.restore_named_backup(&decoded).map(|_| ())
-            } else {
-                let previous = repo
-                    .document()
-                    .expect("healthy loaded document")
-                    .data
-                    .clone();
-                let outcome = repo.set_data(decoded.data).and_then(|_| repo.save_at());
-                if outcome.is_err() {
-                    let _ = repo.set_data(previous);
-                }
-                outcome.map(|_| ())
-            }
-        };
+        // The repository reads the selected snapshot and current main under
+        // one write lock. A prior preview may have become stale.
+        let result = self.repo.borrow_mut().restore_named_backup(&name);
         if result.is_ok() {
             self.settings.reload();
             self.manager.reload_from_store();
@@ -1391,7 +1374,13 @@ impl SettingsWindowController {
                 self.main.borrow_mut().refresh_from_repository(&self.repo);
             }
             Ok(filego::storage::repository::RepairOutcome::HadNoCorruptMain) => {
-                self.settings.set_notice(SNotice::BackupRestoreFailed);
+                // An external actor already repaired the main. The repository
+                // refreshed its working copy; reflect that success in both UIs.
+                self.settings.reload();
+                self.manager.reload_from_store();
+                self.settings.set_notice(SNotice::BackupRestoreApplied);
+                self.refresh_search_settings();
+                self.main.borrow_mut().refresh_from_repository(&self.repo);
             }
             Err(_) => self.settings.set_notice(SNotice::BackupRestoreFailed),
         }

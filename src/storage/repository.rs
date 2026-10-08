@@ -77,7 +77,7 @@ use crate::domain::{
 };
 
 use super::{
-    codec,
+    backup, codec,
     io::{FileOps, FsFileOps, WriteLock},
     location::{DocumentPaths, TEMP_FILE_PREFIX},
     schema::StoredDocumentV1,
@@ -177,6 +177,9 @@ pub struct DocumentRepository {
     /// (from a load or a successful save). `None` means no baseline is
     /// established, so the revision guard is not enforced.
     latest_loaded_revision: Option<u64>,
+    /// The exact bytes last read from or written to a healthy on-disk main.
+    /// Used by an explicit restore to detect even same-revision external edits.
+    observed_main_bytes: Option<Vec<u8>>,
     /// Set when `load` recovered a missing/corrupt main from a valid backup
     /// and `repair_from_backup` has not run yet. While set, saves are rejected
     /// with `RecoveryRequired` and no write touches the main or the backup.
@@ -190,6 +193,7 @@ impl DocumentRepository {
             io: Box::new(FsFileOps),
             document: None,
             latest_loaded_revision: None,
+            observed_main_bytes: None,
             pending_recovery: false,
         }
     }
@@ -330,6 +334,7 @@ impl DocumentRepository {
 
         self.document = Some(document.clone());
         self.latest_loaded_revision = Some(document.data.revision);
+        self.observed_main_bytes = Some(bytes.to_vec());
         self.pending_recovery = false;
         Ok(())
     }
@@ -401,6 +406,7 @@ impl DocumentRepository {
                 let revision = document.data.revision;
                 self.document = Some(document.clone());
                 self.latest_loaded_revision = Some(revision);
+                self.observed_main_bytes = main_bytes;
                 // A healthy main means there is nothing left to repair.
                 self.pending_recovery = false;
                 Ok(LoadOutcome::Found(document))
@@ -418,6 +424,7 @@ impl DocumentRepository {
                         let revision = document.data.revision;
                         self.document = Some(document.clone());
                         self.latest_loaded_revision = Some(revision);
+                        self.observed_main_bytes = None;
                         Ok(LoadOutcome::Recovered(document))
                     }
                     None => {
@@ -495,6 +502,7 @@ impl DocumentRepository {
             self.pending_recovery = false;
             self.document = Some(document.clone());
             self.latest_loaded_revision = Some(document.data.revision);
+            self.observed_main_bytes = main_bytes;
             return Ok(RepairOutcome::HadNoCorruptMain);
         }
 
@@ -530,46 +538,80 @@ impl DocumentRepository {
         self.pending_recovery = false;
         self.document = Some(backup_document.clone());
         self.latest_loaded_revision = Some(backup_document.data.revision);
+        self.observed_main_bytes = Some(backup_bytes);
         Ok(RepairOutcome::Repaired { evidence })
     }
 
-    /// Restore a validated user-selected backup without erasing a corrupt
-    /// main. This is an explicit Data-page action, not a normal `save`: it
-    /// preserves the original corrupt bytes as durable evidence before
-    /// atomically promoting the selected document. Both re-read and promotion
-    /// run under the same write lock as ordinary saves.
+    /// Restore a user-selected named backup without erasing a corrupt main.
+    /// This is an explicit Data-page action, not a normal `save`: the selected
+    /// document is read and validated under the write lock, then the original
+    /// main is copied to durable evidence before atomic promotion. A healthy
+    /// main is replaced only when its exact bytes match the observed version.
     pub fn restore_named_backup(
         &mut self,
-        document: &StoredDocumentV1,
+        file_name: &str,
     ) -> Result<RepairOutcome, RepositoryError> {
-        let bytes = codec::encode(document)?;
+        // Validate and read the selected snapshot AFTER acquiring the write
+        // lock: a preview read outside it may already be stale or replaced.
+        if !backup::is_backup_file(file_name)
+            || std::path::Path::new(file_name).components().count() != 1
+        {
+            return Err(RepositoryError::InvalidData);
+        }
         let _lock = self.acquire_write_lock()?;
+        let bytes = self.io.read(&self.paths.base_dir().join(file_name))?;
+        let document = codec::decode(&bytes)?;
         let main = self.main();
         let main_bytes = match self.io.read(&main) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err(RepositoryError::Io),
         };
-        // Never let a named-backup restore overwrite healthy data behind the
-        // user's back; a normal import with revision checking handles that case.
-        if main_bytes
+        let healthy = main_bytes
             .as_deref()
-            .is_some_and(|bytes| codec::decode(bytes).is_ok())
-        {
-            return Err(RepositoryError::ConcurrentModification);
+            .and_then(|bytes| codec::decode(bytes).ok());
+        if let Some(current) = &healthy {
+            // Compare both revision and exact bytes observed at load/save. A
+            // same-revision external edit must not be discarded either.
+            if self.latest_loaded_revision != Some(current.data.revision)
+                || self.observed_main_bytes.as_deref() != main_bytes.as_deref()
+                || self.pending_recovery
+            {
+                return Err(RepositoryError::ConcurrentModification);
+            }
         }
+
+        // A named-backup restore is an explicit replacement. Preserve the
+        // current main durably before promotion, even if it decodes: a healthy
+        // current document is a previous user version worth retaining too.
+        // The internal .bak remains untouched so a promotion failure cannot
+        // destroy its only known-good copy. Evidence paths are UUID-named and
+        // never used as folder paths or cleaned automatically.
         let evidence = match main_bytes {
-            Some(corrupt_bytes) => {
-                let evidence_path = self.corrupt_evidence(&Self::new_temp_token());
-                self.io.write_flush_sync(&evidence_path, &corrupt_bytes)?;
+            Some(original) => {
+                let token = Self::new_temp_token();
+                let evidence_path = if healthy.is_some() {
+                    self.paths
+                        .base_dir()
+                        .join(format!("{}{token}", super::location::PRE_RESTORE_PREFIX))
+                } else {
+                    self.corrupt_evidence(&token)
+                };
+                self.io.write_flush_sync(&evidence_path, &original)?;
                 Some(evidence_path)
             }
-            None => None,
+            None => {
+                if self.latest_loaded_revision.is_some() && !self.pending_recovery {
+                    return Err(RepositoryError::ConcurrentModification);
+                }
+                None
+            }
         };
         self.promote_bytes_to_main(&bytes)?;
         self.pending_recovery = false;
         self.latest_loaded_revision = Some(document.data.revision);
-        self.document = Some(document.clone());
+        self.observed_main_bytes = Some(bytes);
+        self.document = Some(document);
         Ok(RepairOutcome::Repaired { evidence })
     }
 
@@ -1046,6 +1088,7 @@ impl DocumentRepository {
             io,
             document: None,
             latest_loaded_revision: None,
+            observed_main_bytes: None,
             pending_recovery: false,
         }
     }
