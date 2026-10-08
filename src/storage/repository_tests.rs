@@ -5,7 +5,8 @@
 //!   step 0: `create_new` acquire the write lock
 //!   before step 1: read/decode and compare the on-disk main to the baseline
 //!   step 1,2: `write_flush_sync` main temp (write then sync)
-//!   step 3:   `exists` main presence checkpoint
+//!   step 3:   `exists` main presence checkpoint (also re-read immediately
+//!             before this probe to detect noncooperative edits after temp)
 //!   step 4,5: `write_flush_sync` backup temp (write then sync)
 //!   step 6:   `rename` backup temp → `.bak`
 //!   step 7:   `rename` main temp → main
@@ -1035,6 +1036,82 @@ impl FileOps for ReadFaultFileOps {
 
     fn remove(&mut self, path: &std::path::Path) -> std_io::Result<()> {
         FsFileOps.remove(path)
+    }
+}
+
+/// Simulate an uncooperative external edit after the first locked save read.
+/// Read 1 loads the baseline; read 2 validates save; read 3 occurs after the
+/// temp is synced and must detect the edit before replacing the backup.
+struct ChangeMainAfterReadFileOps {
+    replacement: Vec<u8>,
+    main_reads: usize,
+}
+
+impl FileOps for ChangeMainAfterReadFileOps {
+    fn write_flush_sync(&mut self, path: &std::path::Path, bytes: &[u8]) -> std_io::Result<()> {
+        FsFileOps.write_flush_sync(path, bytes)
+    }
+
+    fn rename(&mut self, from: &std::path::Path, to: &std::path::Path) -> std_io::Result<()> {
+        FsFileOps.rename(from, to)
+    }
+
+    fn read(&mut self, path: &std::path::Path) -> std_io::Result<Vec<u8>> {
+        if path.file_name().is_some_and(|name| name == "data.json") {
+            self.main_reads += 1;
+            if self.main_reads == 3 {
+                std::fs::write(path, &self.replacement)?;
+            }
+        }
+        FsFileOps.read(path)
+    }
+
+    fn exists(&mut self, path: &std::path::Path) -> std_io::Result<bool> {
+        FsFileOps.exists(path)
+    }
+
+    fn create_new(&mut self, path: &std::path::Path) -> std_io::Result<()> {
+        FsFileOps.create_new(path)
+    }
+
+    fn remove(&mut self, path: &std::path::Path) -> std_io::Result<()> {
+        FsFileOps.remove(path)
+    }
+}
+
+#[test]
+fn save_rechecks_main_after_temp_before_replacing_backup() {
+    for corrupt in [true, false] {
+        let base = TempDir::new().expect("temp dir");
+        let main = main_document_path(base.path());
+        let backup = backup_document_path(base.path());
+        let original = codec_mod::encode(&fixture_with_revision(4)).expect("seed main");
+        let backup_bytes = codec_mod::encode(&fixture_with_revision(3)).expect("seed backup");
+        let replacement = if corrupt {
+            corrupt_bytes()
+        } else {
+            codec_mod::encode(&fixture_with_revision(5)).expect("external edit")
+        };
+        write_raw(&main, &original);
+        write_raw(&backup, &backup_bytes);
+        let mut repo = DocumentRepository::with_io(
+            real_paths(&base),
+            Box::new(ChangeMainAfterReadFileOps {
+                replacement: replacement.clone(),
+                main_reads: 0,
+            }),
+        );
+        assert!(repo.load().is_ok());
+        assert_eq!(
+            repo.save_at(),
+            Err(if corrupt {
+                RepositoryError::CorruptData
+            } else {
+                RepositoryError::ConcurrentModification
+            })
+        );
+        assert_eq!(read_raw(&main), replacement);
+        assert_eq!(read_raw(&backup), backup_bytes);
     }
 }
 

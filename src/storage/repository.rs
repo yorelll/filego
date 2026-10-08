@@ -330,10 +330,19 @@ impl DocumentRepository {
         self.io.write_flush_sync(&temp, bytes)?;
 
         let main = self.main();
-        // Keep the post-temp presence check as a last guard before backup
-        // replacement. A vanished main must never be treated as a first run.
-        if self.io.exists(&main)? != current_main.is_some() {
-            return Err(RepositoryError::ConcurrentModification);
+        // Recheck after temp creation: an unrelated writer need not honor the
+        // FileGo lock. Never replace the backup with bytes from an unverified
+        // main or overwrite a newly corrupt/different/missing main.
+        let rechecked = match self.io.read(&main) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(RepositoryError::Io),
+        };
+        if self.io.exists(&main)? != rechecked.is_some() || rechecked.as_deref() != current_main {
+            return match rechecked.as_deref() {
+                Some(bytes) if codec::decode(bytes).is_err() => Err(RepositoryError::CorruptData),
+                _ => Err(RepositoryError::ConcurrentModification),
+            };
         }
         if let Some(current_main) = current_main {
             self.replace_backup_with_current_main(current_main)?;
