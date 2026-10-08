@@ -507,6 +507,20 @@ impl<S: SettingsStore> SettingsController<S> {
         self.view.notice = Some(notice);
     }
 
+    /// Persist the launch-at-login preference and return an explicit outcome.
+    /// A caller must not infer success from the view's Boolean value: when
+    /// there is no loaded document, it can equal the requested value while
+    /// nothing has been saved.
+    pub fn set_launch_at_login(&mut self, enabled: bool) -> Result<(), DocumentError> {
+        let Some(document) = self.store.document() else {
+            self.view.notice = Some(SNotice::SaveFailed);
+            return Err(DocumentError::NotFound);
+        };
+        self.view.settings = document.data.settings.clone();
+        self.view.settings.launch_at_login = enabled;
+        self.persist_result()
+    }
+
     pub fn handle(&mut self, command: SCommand) {
         match command {
             SCommand::ShowPage(page) => {
@@ -514,8 +528,7 @@ impl<S: SettingsStore> SettingsController<S> {
             }
             // ---- General ----
             SCommand::SetLaunchAtLogin(on) => {
-                self.view.settings.launch_at_login = on;
-                self.need_persist();
+                let _ = self.set_launch_at_login(on);
             }
             SCommand::SetSilentStart(on) => {
                 self.view.settings.silent_start = on;
@@ -697,6 +710,10 @@ impl<S: SettingsStore> SettingsController<S> {
     /// restores the view while the document still holds the failed value would
     /// let a later `reload()` resurrect the "saved" change).
     fn persist(&mut self) {
+        let _ = self.persist_result();
+    }
+
+    fn persist_result(&mut self) -> Result<(), DocumentError> {
         let snapshot = self.view.settings.clone();
         // The pre-change value is captured from the working copy, not the
         // snapshot, so a failure restores exactly what was persisted before.
@@ -705,21 +722,23 @@ impl<S: SettingsStore> SettingsController<S> {
             .document()
             .map(|document| document.data.settings)
             .unwrap_or_else(|| snapshot.clone());
-        if self.store.set_settings(snapshot).is_err() {
+        if let Err(error) = self.store.set_settings(snapshot) {
             self.view.settings = previous;
             self.view.notice = Some(SNotice::SaveFailed);
-            return;
+            return Err(error);
         }
         match self.store.save_at() {
             Ok(_) => {
                 self.view.notice = Some(SNotice::Saved);
+                Ok(())
             }
-            Err(_) => {
+            Err(error) => {
                 // Restore BOTH the working copy and the view to the previous
                 // settings so no half-applied state survives.
                 let _ = self.store.set_settings(previous.clone());
                 self.view.settings = previous;
                 self.view.notice = Some(SNotice::SaveFailed);
+                Err(error)
             }
         }
     }

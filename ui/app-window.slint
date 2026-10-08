@@ -246,6 +246,7 @@ export global UiStrings {
     in-out property <string> settings-data-backup-create: "";
     in-out property <string> settings-data-backup-list: "";
     in-out property <string> settings-data-backup-restore: "";
+    in-out property <string> settings-data-repair-internal: "";
     in-out property <string> settings-data-backup-none: "";
     in-out property <string> settings-data-clear-recent: "";
     in-out property <string> settings-data-clear-recent-note: "";
@@ -1228,6 +1229,7 @@ export component SettingsWindow inherits Window {
     callback s-command-create-backup();
     callback s-command-list-backups();
     callback s-command-restore-backup(int);
+    callback s-command-repair-internal-backup();
     callback s-command-clear-recent();
     // M06 review L2: the two-step confirm state is local (`s-confirm-*`);
     // only the final confirm callbacks are wired to Rust (no dead arm/cancel).
@@ -1393,11 +1395,12 @@ export component SettingsWindow inherits Window {
                     }
                     Text { text: UiStrings.import-second-confirm; color: UiTheme.text-secondary; font-size: 11px; }
                 }
-                ScrollView {
-                    height: 400px;
-                    VerticalBox {
-                        spacing: 2px;
-                        for i in root.rows-count: FolderManagementRow {
+                // The outer Settings viewport owns scrolling to the draft's
+                // Save button; a nested fixed-height viewport would consume
+                // wheel input and strand the editor below the visible area.
+                VerticalBox {
+                    spacing: 2px;
+                    for i in root.rows-count: FolderManagementRow {
                             m-id: i;
                             m-name: root.rows-name[i];
                             m-path: root.rows-path[i];
@@ -1417,7 +1420,6 @@ export component SettingsWindow inherits Window {
                             color: UiTheme.text-secondary;
                             font-size: 13px;
                         }
-                    }
                 }
                 if (root.has-pending-remove): Rectangle {
                     height: 72px;
@@ -1765,6 +1767,9 @@ export component SettingsWindow inherits Window {
                             spacing: 8px;
                             Button { text: UiStrings.settings-data-backup-create; clicked() => { root.s-command-create-backup(); } }
                             Button { text: UiStrings.settings-data-backup-list; clicked() => { root.s-command-list-backups(); } }
+                            // Explicit, evidence-preserving repair of the internal
+                            // data.json.bak. Recovery is never automatic.
+                            Button { text: UiStrings.settings-data-repair-internal; clicked() => { root.s-command-repair-internal-backup(); } }
                         }
                         if (root.s-backups.length > 0) : VerticalBox {
                             spacing: 2px;
@@ -1829,7 +1834,7 @@ export component SettingsWindow inherits Window {
             }
 
             // ===== add/edit dialog =====
-            if (root.draft-visible): Rectangle {
+            if (root.page == 1 && root.draft-visible): Rectangle {
                 width: 100%;
                 border-radius: 10px;
                 border-width: 1px;
@@ -1945,7 +1950,7 @@ export component SettingsWindow inherits Window {
             }
 
             // ===== controlled one-level child import offer =====
-            if (root.import-offer-visible): Rectangle {
+            if (root.page == 1 && root.import-offer-visible): Rectangle {
                 width: 100%;
                 border-radius: 10px;
                 border-width: 1px;
@@ -1972,7 +1977,7 @@ export component SettingsWindow inherits Window {
             }
 
             // ===== batch preview =====
-            if (root.batch-visible): Rectangle {
+            if (root.page == 1 && root.batch-visible): Rectangle {
                 width: 100%;
                 border-radius: 10px;
                 border-width: 1px;

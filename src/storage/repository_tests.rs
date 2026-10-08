@@ -1450,6 +1450,114 @@ fn two_writers_contending_save_if_current_only_one_wins() {
 /// the write path stays deterministic and non-torn under bursty saves, which
 /// is what a burst of hotkey-triggered setting/record changes exercises.
 #[test]
+fn named_backup_restore_preserves_corrupt_main_and_keeps_backup_intact() {
+    let base = TempDir::new().expect("temp dir");
+    let main = main_document_path(base.path());
+    let recovered = fixture_with_revision(6);
+    let recovered_bytes = codec_mod::encode(&recovered).expect("valid backup must encode");
+    let corrupt = corrupt_bytes();
+    write_raw(&main, &corrupt);
+    // This is a separately named user snapshot, not the internal data.json.bak.
+    let named = base.path().join("backup-owner-snapshot.json");
+    write_raw(&named, &recovered_bytes);
+
+    let mut repo = real_repo(&base);
+    assert_eq!(
+        repo.load()
+            .expect_err("corrupt main without internal backup"),
+        RepositoryError::CorruptData
+    );
+    let outcome = repo
+        .restore_named_backup(&recovered)
+        .expect("explicit restore must preserve corrupt bytes first");
+    let RepairOutcome::Repaired {
+        evidence: Some(evidence),
+    } = outcome
+    else {
+        panic!("the corrupt main must have a durable evidence file");
+    };
+    assert_eq!(read_raw(&evidence), corrupt);
+    assert_eq!(read_raw(&named), recovered_bytes);
+    assert_eq!(read_raw(&main), recovered_bytes);
+    assert_eq!(repo.document(), Some(&recovered));
+    repo.save_at()
+        .expect("future edits can be saved after repair");
+    assert_eq!(
+        codec_mod::decode(&read_raw(&main))
+            .expect("repaired main must decode")
+            .data
+            .revision,
+        7
+    );
+}
+
+#[test]
+fn named_backup_restore_refuses_healthy_main_and_preserves_bytes() {
+    let base = TempDir::new().expect("temp dir");
+    let main = main_document_path(base.path());
+    let healthy = fixture_with_revision(11);
+    let original = codec_mod::encode(&healthy).expect("healthy main must encode");
+    write_raw(&main, &original);
+    let mut repo = real_repo(&base);
+    assert_eq!(
+        repo.restore_named_backup(&fixture_with_revision(5))
+            .expect_err("cannot silently overwrite a healthy main"),
+        RepositoryError::ConcurrentModification
+    );
+    assert_eq!(read_raw(&main), original);
+}
+
+#[test]
+fn named_backup_restore_denied_read_preserves_corrupt_main_and_snapshot() {
+    let base = TempDir::new().expect("temp dir");
+    let main = main_document_path(base.path());
+    let corrupt = corrupt_bytes();
+    write_raw(&main, &corrupt);
+    let snapshot = fixture_with_revision(6);
+    let named = base.path().join("backup-owner-snapshot.json");
+    let snapshot_bytes = codec_mod::encode(&snapshot).expect("encode snapshot");
+    write_raw(&named, &snapshot_bytes);
+    let io_boxed: Box<dyn FileOps> =
+        Box::new(ReadFaultFileOps::new().fault_named("data.json", IoErrorKind::PermissionDenied));
+    let mut repo = DocumentRepository::with_io(real_paths(&base), io_boxed);
+    assert_eq!(
+        repo.restore_named_backup(&snapshot),
+        Err(RepositoryError::Io)
+    );
+    assert_eq!(read_raw(&main), corrupt);
+    assert_eq!(read_raw(&named), snapshot_bytes);
+    assert!(repo.document().is_none());
+}
+
+#[test]
+fn named_backup_restore_fault_preserves_corrupt_main_and_selected_backup() {
+    let base = TempDir::new().expect("temp dir");
+    let main = main_document_path(base.path());
+    let corrupt = corrupt_bytes();
+    write_raw(&main, &corrupt);
+    let recovered = fixture_with_revision(6);
+    let backup_bytes = codec_mod::encode(&recovered).expect("encode named snapshot");
+    let named = base.path().join("backup-owner-snapshot.json");
+    write_raw(&named, &backup_bytes);
+    // The first main-temp write fails after evidence has been durably saved.
+    let mut repo = faulted_repo(
+        &base,
+        &[FaultPoint {
+            step: 1,
+            op: FaultOp::TempWrite,
+        }],
+    );
+    assert_eq!(
+        repo.restore_named_backup(&recovered)
+            .expect_err("injected promotion failure must refuse restore"),
+        RepositoryError::Io
+    );
+    assert_eq!(read_raw(&main), corrupt);
+    assert_eq!(read_raw(&named), backup_bytes);
+    assert!(repo.document().is_none());
+}
+
+#[test]
 fn rapid_successive_saves_all_persist_in_order() {
     let base = TempDir::new().expect("temp dir");
     {

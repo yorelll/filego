@@ -24,6 +24,7 @@ pub mod i18n;
 pub mod management;
 pub mod manager;
 pub mod settings_controller;
+pub mod startup_registration;
 pub mod state;
 pub mod theme;
 pub mod view_model;

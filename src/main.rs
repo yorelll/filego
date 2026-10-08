@@ -14,6 +14,7 @@ use filego::{
             CategoryNameCommand, SCommand, SNotice, SettingsController, SettingsSharedStore,
             TagNameCommand,
         },
+        startup_registration::RunRegistration,
         state::SelectionMove,
         view_model::{ExternalEffect, NoopEffects, ResolvedEntry, SearchViewModel, default_runner},
     },
@@ -155,25 +156,20 @@ fn bring_search_to_front(app: &AppWindow) {
             filego::platform::windows::window_focus::bring_to_front_bits(win32.hwnd.get(), true);
     }
     let weak = app.as_weak();
-    let redraw = slint::Timer::default();
-    redraw.start(
-        slint::TimerMode::SingleShot,
-        std::time::Duration::from_millis(40),
-        move || {
-            if let Some(app) = weak.upgrade() {
-                app.window().request_redraw();
-                let owned = app.window().window_handle();
-                if let Ok(handle) = owned.window_handle()
-                    && let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw()
-                {
-                    let _ = filego::platform::windows::window_focus::bring_to_front_bits(
-                        win32.hwnd.get(),
-                        true,
-                    );
-                }
+    slint::Timer::single_shot(std::time::Duration::from_millis(40), move || {
+        if let Some(app) = weak.upgrade() {
+            app.window().request_redraw();
+            let owned = app.window().window_handle();
+            if let Ok(handle) = owned.window_handle()
+                && let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw()
+            {
+                let _ = filego::platform::windows::window_focus::bring_to_front_bits(
+                    win32.hwnd.get(),
+                    true,
+                );
             }
-        },
-    );
+        }
+    });
 }
 
 /// Show the settings window and bring it to the foreground (tray "设置" and any
@@ -195,8 +191,8 @@ fn open_settings_window(settings: &std::rc::Rc<std::cell::RefCell<SettingsWindow
         adapter
             .settings
             .set_launch_at_login_os(filego::platform::windows::tray_open::launch_at_login().ok());
-        adapter.sync_settings_ui();
         adapter.sync_ui();
+        adapter.sync_settings_ui();
     }
     // Invalidate after synchronizing models as well as after showing so the
     // software renderer paints the first frame without requiring a resize.
@@ -218,20 +214,29 @@ fn open_settings_window(settings: &std::rc::Rc<std::cell::RefCell<SettingsWindow
     // winit can defer its first layout pass until the next event-loop turn;
     // invalidate once more after mapping instead of relying on a user resize.
     let weak_window = window.as_weak();
-    let redraw = slint::Timer::default();
-    redraw.start(
-        slint::TimerMode::SingleShot,
-        std::time::Duration::from_millis(40),
-        move || {
-            if let Some(window) = weak_window.upgrade() {
-                window.window().request_redraw();
-            }
-        },
-    );
+    slint::Timer::single_shot(std::time::Duration::from_millis(40), move || {
+        if let Some(window) = weak_window.upgrade() {
+            window.window().request_redraw();
+        }
+    });
 }
 
 fn event_loop_error_as_platform_error(error: slint::EventLoopError) -> slint::PlatformError {
     slint::PlatformError::from(error.to_string())
+}
+
+struct SystemRunRegistration;
+
+impl RunRegistration for SystemRunRegistration {
+    type Error = filego::platform::windows::tray_open::RegistryError;
+
+    fn read_enabled(&mut self) -> Result<bool, Self::Error> {
+        filego::platform::windows::tray_open::launch_at_login()
+    }
+
+    fn write_enabled(&mut self, enabled: bool) -> Result<(), Self::Error> {
+        filego::platform::windows::tray_open::set_launch_at_login(enabled)
+    }
 }
 
 fn picker_should_open_settings(
@@ -736,6 +741,30 @@ impl SettingsWindowController {
         self.sync_ui();
     }
 
+    fn change_launch_at_login(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), filego::presentation::startup_registration::RegistrationError> {
+        // A recovered document cannot be saved until the user explicitly
+        // repairs its corrupt main. Even a no-op OS toggle must not claim that
+        // the persisted setting is writable in this state.
+        let result = if self.repo.borrow().recovery_pending() {
+            Err(filego::presentation::startup_registration::RegistrationError::DataUnavailable)
+        } else {
+            filego::presentation::startup_registration::set_launch_at_login(
+                &mut self.settings,
+                &mut SystemRunRegistration,
+                enabled,
+            )
+        };
+        if let Err(error) = result {
+            self.settings.set_notice(error.notice());
+        }
+        self.sync_ui();
+        self.sync_settings_ui();
+        result
+    }
+
     /// Apply one M06 settings command; the pure controller persists, then the
     /// adapter performs platform side effects (registry/hotkey/theme/locale).
     /// Side effects for a given command run AFTER the controller accepted it
@@ -743,8 +772,8 @@ impl SettingsWindowController {
     fn handle_settings(&mut self, command: SCommand) {
         self.settings.handle(command.clone());
         self.apply_settings_side_effects(&command);
-        self.sync_settings_ui();
         self.sync_ui();
+        self.sync_settings_ui();
     }
 
     /// Platform side effects that must happen after the controller persisted.
@@ -981,10 +1010,17 @@ impl SettingsWindowController {
         window.set_s_about_license("MIT".into());
         window.set_s_about_privacy(Msg::MonoAboutPrivacy.tr(locale).into());
 
-        // Notice (localized; anonymous).
+        // Settings notices take precedence, but an empty settings notice must
+        // not wipe an active folder-management notice during the next sync.
         let notice = view
             .notice
             .map(|notice| snotice_text(notice, locale))
+            .or_else(|| {
+                self.manager
+                    .view()
+                    .notice
+                    .map(|notice| settings_notice_text(notice, locale))
+            })
             .unwrap_or_default();
         window.set_notice_text(notice.into());
     }
@@ -1282,15 +1318,15 @@ impl SettingsWindowController {
                 self.settings.set_notice(notice);
             }
         }
-        self.sync_settings_ui();
         self.refresh_search_settings();
         // The manager's folder list re-reads the shared doc on next sync.
         self.manager.reload_from_store();
         self.sync_ui();
+        self.sync_settings_ui();
     }
 
-    /// Restore a listed backup: decode it, validate, replace the working copy
-    /// and save atomically. Never touches a real directory.
+    /// Restore a listed backup without silently overwriting a corrupt main.
+    /// Never touches a real folder or any of its contents.
     fn restore_backup(&mut self, index: i32) {
         use filego::storage::backup;
         let backups = self.settings.view().backups.clone();
@@ -1307,23 +1343,60 @@ impl SettingsWindowController {
                 return;
             }
         };
-        let revision = {
+        // Explicit recovery must retain a corrupt main as a separate evidence
+        // file. A normal save_at would refuse pending recovery (or overwrite a
+        // corrupt main when no internal backup is available).
+        let result = {
             let mut repo = self.repo.borrow_mut();
-            if repo.set_data(decoded.data).is_err() {
-                self.settings.set_notice(SNotice::BackupRestoreFailed);
-                self.sync_settings_ui();
-                return;
+            if repo.recovery_pending() || repo.document().is_none() {
+                repo.restore_named_backup(&decoded).map(|_| ())
+            } else {
+                let previous = repo
+                    .document()
+                    .expect("healthy loaded document")
+                    .data
+                    .clone();
+                let outcome = repo.set_data(decoded.data).and_then(|_| repo.save_at());
+                if outcome.is_err() {
+                    let _ = repo.set_data(previous);
+                }
+                outcome.map(|_| ())
             }
-            repo.save_at()
         };
-        match revision {
-            Ok(_) => self.settings.set_notice(SNotice::BackupRestoreApplied),
+        if result.is_ok() {
+            self.settings.reload();
+            self.manager.reload_from_store();
+            self.refresh_search_settings();
+            self.main.borrow_mut().refresh_from_repository(&self.repo);
+            self.settings.set_notice(SNotice::BackupRestoreApplied);
+        } else {
+            self.settings.set_notice(SNotice::BackupRestoreFailed);
+        }
+        self.sync_ui();
+        self.sync_settings_ui();
+    }
+
+    /// Repair an internal `data.json.bak` recovery explicitly. The repository
+    /// locks the directory and preserves the corrupt original before promoting
+    /// the backup; a failed attempt does not turn an unreadable document into
+    /// a silently empty one.
+    fn repair_internal_backup(&mut self) {
+        let result = self.repo.borrow_mut().repair_from_backup();
+        match result {
+            Ok(filego::storage::repository::RepairOutcome::Repaired { .. }) => {
+                self.settings.reload();
+                self.manager.reload_from_store();
+                self.settings.set_notice(SNotice::BackupRestoreApplied);
+                self.refresh_search_settings();
+                self.main.borrow_mut().refresh_from_repository(&self.repo);
+            }
+            Ok(filego::storage::repository::RepairOutcome::HadNoCorruptMain) => {
+                self.settings.set_notice(SNotice::BackupRestoreFailed);
+            }
             Err(_) => self.settings.set_notice(SNotice::BackupRestoreFailed),
         }
-        self.sync_settings_ui();
-        self.refresh_search_settings();
-        self.manager.reload_from_store();
         self.sync_ui();
+        self.sync_settings_ui();
     }
 
     /// Create a user-facing backup snapshot (a new `backup-*.json` sibling).
@@ -1389,9 +1462,9 @@ impl SettingsWindowController {
         }
         drop(repo);
         self.settings.set_notice(SNotice::Saved);
-        self.sync_settings_ui();
         self.refresh_search_settings();
         self.sync_ui();
+        self.sync_settings_ui();
     }
 
     /// "重置全部设置": restore the default settings snapshot WITHOUT touching
@@ -1403,8 +1476,8 @@ impl SettingsWindowController {
         self.settings.handle(SCommand::RestoreDefaultSettings);
         self.refresh_settings_appearance();
         self.refresh_search_settings();
-        self.sync_settings_ui();
         self.sync_ui();
+        self.sync_settings_ui();
     }
 
     /// "删除全部文件夹记录": two-step-confirmed clear of EVERY folder RECORD.
@@ -1424,10 +1497,10 @@ impl SettingsWindowController {
             }
         }
         self.settings.set_notice(SNotice::ClearAllApplied);
-        self.sync_settings_ui();
         self.refresh_search_settings();
         self.manager.reload_from_store();
         self.sync_ui();
+        self.sync_settings_ui();
     }
 
     /// Drive a recorded hotkey key (from the Hotkey page FocusScope) through
@@ -1604,12 +1677,17 @@ impl SettingsWindowController {
 
         // Notice.
         let locale = filego::presentation::i18n::Locale::default();
-        window.set_notice_text(
-            view.notice
-                .map(|notice| settings_notice_text(notice, locale))
-                .unwrap_or_default()
-                .into(),
-        );
+        // Data/settings notices outrank folder-management notices. Syncing
+        // the manager must never clear the unreadable-data recovery message.
+        let settings_notice = self.settings.view().notice;
+        if let Some(notice) = settings_notice {
+            let locale = locale_for(self.settings.view().settings.language_preference);
+            window.set_notice_text(snotice_text(notice, locale).into());
+        } else if let Some(notice) = view.notice {
+            window.set_notice_text(settings_notice_text(notice, locale).into());
+        } else {
+            window.set_notice_text("".into());
+        }
 
         // Pending remove banner.
         if let Some(pending) = &view.pending_remove {
@@ -2342,6 +2420,10 @@ fn apply_settings_localization(
         ("settings_data_backup_create", Msg::MonoBackupCreate),
         ("settings_data_backup_list", Msg::MonoBackupList),
         ("settings_data_backup_restore", Msg::MonoBackupRestore),
+        (
+            "settings_data_repair_internal",
+            Msg::MonoBackupRepairInternal,
+        ),
         ("settings_data_backup_none", Msg::MonoBackupNone),
         ("settings_data_clear_recent", Msg::MonoClearRecentlyUsed),
         (
@@ -2665,6 +2747,7 @@ fn call_string_setter(window: &SettingsWindow, field: &str, value: String) {
         "settings_data_backup_create" => strings.set_settings_data_backup_create(value),
         "settings_data_backup_list" => strings.set_settings_data_backup_list(value),
         "settings_data_backup_restore" => strings.set_settings_data_backup_restore(value),
+        "settings_data_repair_internal" => strings.set_settings_data_repair_internal(value),
         "settings_data_backup_none" => strings.set_settings_data_backup_none(value),
         "settings_data_clear_recent" => strings.set_settings_data_clear_recent(value),
         "settings_data_clear_recent_note" => strings.set_settings_data_clear_recent_note(value),
@@ -3189,36 +3272,6 @@ fn run() -> Result<(), slint::PlatformError> {
     // window when search settings change; `main` only needs `context_tx`.
     {
         let tray_weak = tray.as_weak();
-        let repo = Rc::clone(&repo);
-        tray.on_toggle_launch_at_login(move || {
-            let Ok(current) = filego::platform::windows::tray_open::launch_at_login() else {
-                // A failed read must not be interpreted as OFF and toggled ON.
-                return;
-            };
-            let desired = !current;
-            // The registry is authoritative. A failed registry write must not
-            // change the checkbox glyph or persist a state that never took effect.
-            if filego::platform::windows::tray_open::set_launch_at_login(desired).is_err() {
-                return;
-            }
-            let mut repo = repo.borrow_mut();
-            if let Some(previous) = repo.document().map(|doc| doc.data.settings.clone()) {
-                let mut settings = previous.clone();
-                settings.launch_at_login = desired;
-                if repo.set_settings(settings).is_err() || repo.save_at().is_err() {
-                    let _ = repo.set_settings(previous);
-                    // Best effort to restore the OS registration as well.
-                    let _ = filego::platform::windows::tray_open::set_launch_at_login(current);
-                    return;
-                }
-            }
-            if let Some(tray) = tray_weak.upgrade() {
-                tray.set_launch_at_login_glyph(if desired { "✓ " } else { "" }.into());
-            }
-        });
-    }
-    {
-        let tray_weak = tray.as_weak();
         let native = Rc::clone(&native);
         tray.on_toggle_pause_hotkeys(move || {
             let paused = native.borrow().toggle_pause();
@@ -3398,6 +3451,26 @@ fn run() -> Result<(), slint::PlatformError> {
         Rc::clone(&main),
         tray.as_weak(),
     )));
+    {
+        let settings = Rc::clone(&settings_adapter);
+        let tray_weak = tray.as_weak();
+        tray.on_toggle_launch_at_login(move || {
+            let mut adapter = settings.borrow_mut();
+            let current = match filego::platform::windows::tray_open::launch_at_login() {
+                Ok(current) => current,
+                Err(_) => {
+                    adapter.settings.set_notice(SNotice::StartupReadFailed);
+                    adapter.sync_settings_ui();
+                    return;
+                }
+            };
+            if adapter.change_launch_at_login(!current).is_ok()
+                && let Some(tray) = tray_weak.upgrade()
+            {
+                tray.set_launch_at_login_glyph(if current { "" } else { "✓ " }.into());
+            }
+        });
+    }
     // Push the initial settings view + apply persisted startup appearance.
     {
         let mut adapter = settings_adapter.borrow_mut();
@@ -3943,37 +4016,13 @@ fn run() -> Result<(), slint::PlatformError> {
     // 常规
     {
         let settings = Rc::clone(&settings_adapter);
+        let tray_weak = tray.as_weak();
         settings_window.on_s_command_launch_at_login(move |on| {
-            // HKCU first; only a successful registry write persists + confirms
-            // (no fake success). On failure the toggle snaps back to the old.
-            let previous = filego::platform::windows::tray_open::launch_at_login();
-            let mut adapter = settings.borrow_mut();
-            match previous {
-                Ok(was_enabled) => {
-                    if filego::platform::windows::tray_open::set_launch_at_login(on).is_ok() {
-                        adapter.settings.handle(SCommand::SetLaunchAtLogin(on));
-                        if adapter.settings.view().settings.launch_at_login == on {
-                            adapter.settings.set_launch_at_login_os(Some(on));
-                            if let Some(tray) = tray.as_weak().upgrade() {
-                                tray.set_launch_at_login_glyph(if on { "✓ " } else { "" }.into());
-                            }
-                        } else {
-                            // Save failed: don't present an OS-only registration
-                            // as a successfully persisted setting.
-                            let _ = filego::platform::windows::tray_open::set_launch_at_login(
-                                was_enabled,
-                            );
-                            adapter.settings.set_launch_at_login_os(Some(was_enabled));
-                            adapter.settings.set_notice(SNotice::StartupWriteFailed);
-                        }
-                    } else {
-                        adapter.settings.set_launch_at_login_os(Some(was_enabled));
-                        adapter.settings.set_notice(SNotice::StartupWriteFailed);
-                    }
-                }
-                Err(_) => adapter.settings.set_notice(SNotice::StartupReadFailed),
+            if settings.borrow_mut().change_launch_at_login(on).is_ok()
+                && let Some(tray) = tray_weak.upgrade()
+            {
+                tray.set_launch_at_login_glyph(if on { "✓ " } else { "" }.into());
             }
-            adapter.sync_settings_ui();
         });
     }
     {
@@ -4379,6 +4428,12 @@ fn run() -> Result<(), slint::PlatformError> {
     }
     {
         let settings = Rc::clone(&settings_adapter);
+        settings_window.on_s_command_repair_internal_backup(move || {
+            settings.borrow_mut().repair_internal_backup();
+        });
+    }
+    {
+        let settings = Rc::clone(&settings_adapter);
         settings_window.on_s_command_clear_recent(move || {
             settings.borrow_mut().clear_recent();
         });
@@ -4616,6 +4671,40 @@ mod tests {
     }
 
     #[test]
+    fn first_run_empty_note_draft_saves_and_survives_restart() {
+        use filego::presentation::manager::{
+            AddFlowView, MCommand, ManagementController, SharedStore,
+        };
+        let root = tempfile::tempdir().expect("temporary data root");
+        let base = root.path().join("FileGo");
+        let real_folder = root.path().join("真实 文件夹");
+        std::fs::create_dir(&real_folder).expect("create canary folder");
+        let (repo, status) = open_repository_at(&base);
+        assert_eq!(status, StartupDataStatus::Ok);
+        let shared = Rc::new(RefCell::new(repo));
+        let mut manager = ManagementController::new(SharedStore::new(Rc::clone(&shared)), false);
+        manager.handle(MCommand::OpenManual);
+        manager.handle(MCommand::EditPath(
+            real_folder.to_string_lossy().into_owned(),
+        ));
+        manager.handle(MCommand::EditName("测试文件夹".into()));
+        manager.handle(MCommand::SaveDraft);
+        assert!(matches!(manager.view().add_flow, AddFlowView::Closed));
+        drop(manager);
+        drop(shared);
+        let (repo, status) = open_repository_at(&base);
+        assert_eq!(status, StartupDataStatus::Ok);
+        let document = repo.document().expect("saved document after relaunch");
+        assert_eq!(document.data.folders.len(), 1);
+        assert_eq!(document.data.folders[0].note, "");
+        assert_eq!(document.data.folders[0].display_name, "测试文件夹");
+        assert!(
+            real_folder.is_dir(),
+            "saving records never deletes a real folder"
+        );
+    }
+
+    #[test]
     fn corrupt_existing_data_is_preserved_and_not_treated_as_a_fresh_run() {
         let root = tempfile::tempdir().expect("temporary data root");
         let base = root.path().join("FileGo");
@@ -4662,11 +4751,48 @@ mod tests {
         assert!(outer_scroll < draft);
         let folder_page = right.find("// ===== 1 文件夹").expect("folder page");
         assert!(folder_page < draft);
+        assert!(right.contains("if (root.page == 1 && root.draft-visible): Rectangle"));
+        assert!(right.contains("if (root.page == 1 && root.import-offer-visible): Rectangle"));
+        assert!(right.contains("if (root.page == 1 && root.batch-visible): Rectangle"));
+        let folder_list = right
+            .find("for i in root.rows-count: FolderManagementRow")
+            .expect("folder rows");
+        let folder_section = right
+            .split("// ===== 2 分类")
+            .next()
+            .expect("folder section before categories");
+        assert!(folder_list < draft);
+        assert!(
+            !folder_section[folder_page..].contains("height: 400px;"),
+            "folder list must not trap scrolling"
+        );
         let add_button = right
             .find("text: UiStrings.action-add")
             .expect("add button");
         let general_page = right.find("// ===== 0 常规").expect("general page");
         assert!(general_page < folder_page && folder_page < add_button);
+    }
+
+    #[test]
+    fn single_shot_callback_survives_scheduling_function_return() {
+        let fired = Rc::new(std::cell::Cell::new(false));
+        fn schedule(fired: Rc<std::cell::Cell<bool>>) {
+            slint::Timer::single_shot(std::time::Duration::from_millis(10), move || {
+                fired.set(true);
+                let _ = slint::quit_event_loop();
+            });
+        }
+        schedule(Rc::clone(&fired));
+        let watchdog = slint::Timer::default();
+        watchdog.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_secs(2),
+            || {
+                let _ = slint::quit_event_loop();
+            },
+        );
+        slint::run_event_loop_until_quit().expect("event loop runs scheduled callback");
+        assert!(fired.get(), "the delayed callback must survive its creator");
     }
 
     #[test]

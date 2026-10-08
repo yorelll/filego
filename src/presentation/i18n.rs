@@ -303,6 +303,7 @@ pub enum Msg {
     MonoBackupCreate,
     MonoBackupList,
     MonoBackupRestore,
+    MonoBackupRepairInternal,
     MonoBackupNone,
     MonoClearRecentlyUsed,
     MonoClearRecentlyUsedNote,
@@ -572,6 +573,7 @@ impl Msg {
             Msg::MonoBackupCreate => "settings.data.backup_create",
             Msg::MonoBackupList => "settings.data.backup_list",
             Msg::MonoBackupRestore => "settings.data.backup_restore",
+            Msg::MonoBackupRepairInternal => "settings.data.repair_internal",
             Msg::MonoBackupNone => "settings.data.backup_none",
             Msg::MonoClearRecentlyUsed => "settings.data.clear_recent",
             Msg::MonoClearRecentlyUsedNote => "settings.data.clear_recent_note",
@@ -851,6 +853,7 @@ pub const ALL_KEYS: &[&str] = &[
     "settings.data.backup_create",
     "settings.data.backup_list",
     "settings.data.backup_restore",
+    "settings.data.repair_internal",
     "settings.data.backup_none",
     "settings.data.clear_recent",
     "settings.data.clear_recent_note",
@@ -1178,6 +1181,10 @@ mod zh_cn {
         ("settings.data.backup_create", "创建备份"),
         ("settings.data.backup_list", "刷新备份列表"),
         ("settings.data.backup_restore", "恢复"),
+        (
+            "settings.data.repair_internal",
+            "修复主数据（使用内部备份）",
+        ),
         ("settings.data.backup_none", "暂无备份"),
         ("settings.data.clear_recent", "清除最近使用"),
         (
@@ -1605,6 +1612,10 @@ mod en_us {
         ("settings.data.backup_create", "Create backup"),
         ("settings.data.backup_list", "Refresh backup list"),
         ("settings.data.backup_restore", "Restore"),
+        (
+            "settings.data.repair_internal",
+            "Repair data using internal backup",
+        ),
         ("settings.data.backup_none", "No backups yet"),
         ("settings.data.clear_recent", "Clear recently used"),
         (

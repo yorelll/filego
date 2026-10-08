@@ -449,9 +449,8 @@ impl DocumentRepository {
         Ok(codec::decode(&backup_bytes).ok())
     }
 
-    /// Explicit recovery: resolve the pending-repair state by preserving the
-    /// corrupt main as durable evidence and promoting the valid backup onto
-    /// the main.
+    /// Explicit recovery from the internal backup: preserve a corrupt main as
+    /// durable evidence, then promote a valid backup onto the main.
     ///
     /// Contract:
     /// 1. re-read the main; if it now decodes (external repair), clear the
@@ -534,8 +533,48 @@ impl DocumentRepository {
         Ok(RepairOutcome::Repaired { evidence })
     }
 
+    /// Restore a validated user-selected backup without erasing a corrupt
+    /// main. This is an explicit Data-page action, not a normal `save`: it
+    /// preserves the original corrupt bytes as durable evidence before
+    /// atomically promoting the selected document. Both re-read and promotion
+    /// run under the same write lock as ordinary saves.
+    pub fn restore_named_backup(
+        &mut self,
+        document: &StoredDocumentV1,
+    ) -> Result<RepairOutcome, RepositoryError> {
+        let bytes = codec::encode(document)?;
+        let _lock = self.acquire_write_lock()?;
+        let main = self.main();
+        let main_bytes = match self.io.read(&main) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(RepositoryError::Io),
+        };
+        // Never let a named-backup restore overwrite healthy data behind the
+        // user's back; a normal import with revision checking handles that case.
+        if main_bytes
+            .as_deref()
+            .is_some_and(|bytes| codec::decode(bytes).is_ok())
+        {
+            return Err(RepositoryError::ConcurrentModification);
+        }
+        let evidence = match main_bytes {
+            Some(corrupt_bytes) => {
+                let evidence_path = self.corrupt_evidence(&Self::new_temp_token());
+                self.io.write_flush_sync(&evidence_path, &corrupt_bytes)?;
+                Some(evidence_path)
+            }
+            None => None,
+        };
+        self.promote_bytes_to_main(&bytes)?;
+        self.pending_recovery = false;
+        self.latest_loaded_revision = Some(document.data.revision);
+        self.document = Some(document.clone());
+        Ok(RepairOutcome::Repaired { evidence })
+    }
+
     /// Write `bytes` to a fresh main temp and atomically rename it onto the
-    /// main path. Used by `repair_from_backup` to promote the valid backup.
+    /// main path. Used by explicit backup recovery to promote valid bytes.
     fn promote_bytes_to_main(&mut self, bytes: &[u8]) -> Result<(), RepositoryError> {
         let token = Self::new_temp_token();
         let temp = self.temp(&token);
@@ -972,6 +1011,11 @@ impl DocumentRepository {
     /// Document currently held in memory, if a load or save established one.
     pub fn document(&self) -> Option<&StoredDocumentV1> {
         self.document.as_ref()
+    }
+
+    /// Whether the main file needs explicit, evidence-preserving repair.
+    pub const fn recovery_pending(&self) -> bool {
+        self.pending_recovery
     }
 
     /// Revision of the document most recently observed on disk.
